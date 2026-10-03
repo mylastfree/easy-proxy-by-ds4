@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.1.1]
+// background.js —— MV3 Service Worker  [v2.1.2]
 importScripts("settings.js");
 
 var S = self.EasyProxy;
@@ -7,7 +7,10 @@ var CONFIG_KEYS = Object.keys(S.DEFAULTS);
 // 旧版可能残留的其它作用域，启用时一并清理，避免其继续压制流量
 var LEGACY_SCOPES = ['regular_only', 'incognito_persistent', 'incognito_session_only'];
 
-// 图标按尺寸分别提供，Chrome 按显示场景挑选合适的一档，避免缩放模糊
+// 图标按尺寸分别提供，Chrome 按显示场景挑选合适的一档，避免缩放模糊。
+// 两态用不同字形区分，使状态在去掉颜色后依然可辨：
+//   红 + 直  = 直连（未启用代理）
+//   绿 + 代  = 走代理（已启用）
 var ICON_RED = {
   "16": "icon-red-16.png",
   "32": "icon-red-32.png",
