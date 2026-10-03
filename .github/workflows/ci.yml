@@ -55,6 +55,9 @@ jobs:
       - name: 修复安全性测试
         run: node tests/fix-safety.test.js
 
+      - name: 并发护栏测试（N1/N2：暂停计数与测试互斥）
+        run: node tests/concurrency.test.js
+
       - name: 变异测试（验证护栏测试真的会拦截回归）
         run: node tests/mutation-check.js
 

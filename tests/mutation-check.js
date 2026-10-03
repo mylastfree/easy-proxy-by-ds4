@@ -10,18 +10,32 @@ const targets = {
   bg: path.join(rootDir, "background.js"),
   set: path.join(rootDir, "settings.js")
 };
-const testFile = path.join(__dirname, "background.test.js");
+// 变异后必须运行【全部】测试：只跑其中一个会漏掉护栏。
+// 曾经踩过的坑：护栏写在 concurrency.test.js，而这里只跑 background.test.js，
+// 导致「去掉暂停计数器递减」（即 N1 的形态）变异后没有任何用例失败。
+const testFiles = [
+  "manifest.test.js",
+  "settings.test.js",
+  "background.test.js",
+  "fix-safety.test.js",
+  "concurrency.test.js"
+].map(function (f) { return path.join(__dirname, f); });
 
 const originals = {
   bg: fs.readFileSync(targets.bg, "utf8"),
   set: fs.readFileSync(targets.set, "utf8")
 };
 
+// 只要有一个测试文件失败，就认为变异被拦截
 function runTest() {
-  const r = spawnSync(process.execPath, [testFile], {
-    stdio: ["ignore", "ignore", "ignore"]
-  });
-  return r.status === null ? -1 : r.status;
+  for (const f of testFiles) {
+    const r = spawnSync(process.execPath, [f], {
+      stdio: ["ignore", "ignore", "ignore"]
+    });
+    const code = r.status === null ? -1 : r.status;
+    if (code !== 0) return code;
+  }
+  return 0;
 }
 
 const mutations = [
@@ -40,10 +54,26 @@ const mutations = [
     expectFail: true
   },
   {
-    name: "M3 关闭测试期暂停（applySuspended = true 改为 false）",
+    name: "M3 关闭测试期暂停（suspendDepth++ 改为不递增）",
     target: "bg",
-    from: "applySuspended = true;",
-    to: "applySuspended = false;",
+    from: "    suspendDepth++;\n",
+    to: "",
+    expectFail: true
+  },
+  {
+    // 这条对应上一轮的 N1 缺陷：暂停标志退出时未递减，导致下发被永久跳过。
+    // 若并发测试用例有效，去掉递减后它必须变红。
+    name: "M7 暂停计数器退出时不递减（模拟 N1 泄漏）",
+    target: "bg",
+    from: "      suspendDepth--;\n",
+    to: "",
+    expectFail: true
+  },
+  {
+    name: "M8 去掉测试并发互斥（testInFlight 判断失效）",
+    target: "bg",
+    from: "  if (testInFlight) {\n",
+    to: "  if (false) {\n",
     expectFail: true
   },
   {

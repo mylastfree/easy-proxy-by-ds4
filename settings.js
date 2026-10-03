@@ -1,4 +1,4 @@
-// settings.js —— 设置模型的唯一来源  [v2.1.2]
+// settings.js —— 设置模型的唯一来源  [v2.2.0]
 // 刻意不依赖任何 chrome.* API，使 popup 与 Service Worker 可共用同一套逻辑。
 (function (root) {
   'use strict';
@@ -63,7 +63,11 @@
     var seen = Object.create(null);
     var out = [];
     str(text)
-      .replace(/[,;]/g, '\n')
+      // 除半角 , 与 ; 外，也识别常见全角标点：，；、
+      // 中文输入法与从网页复制的内容很容易带入全角标点；
+      // 若不识别，整串会被当成一个条目下发，Chrome 视为无效而忽略，
+      // 表现为「配了多条规则却一条都没生效」的静默失效。
+      .replace(/[,;\uff0c\uff1b\u3001]/g, '\n')
       .split('\n')
       .forEach(function (piece) {
         var item = piece.trim();
@@ -145,6 +149,32 @@
     return true;
   }
 
+  // 判断是否为「主机:端口」的误写（如 1.2.3.4:8080）。
+  //
+  // 不能用「含冒号即拒绝」来判断 —— IPv6 地址本身就含冒号，
+  // ::1、fe80::1、[::1] 都会被误判为「写了端口」而拒收。
+  // 这里只识别真正形如 host:port 的写法：
+  //   · 恰好一个冒号（IPv6 有多个）
+  //   · 不以 [ 开头（那是 [::1] 这类 IPv6 字面量）
+  //   · 冒号之后全是数字（端口）
+  var COLON = String.fromCharCode(58);
+  function looksLikeHostPort(s) {
+    var first = s.indexOf(COLON);
+    if (first < 0) return false;
+    if (first !== s.lastIndexOf(COLON)) return false;
+    if (s.charAt(0) === '[') return false;
+    var tail = s.slice(first + 1);
+    return tail.length > 0 && isAllDigits(tail);
+  }
+
+  // IPv6 字面量下发给 chrome.proxy 时不应带方括号（host 字段直接用 ::1 形式）
+  function stripBrackets(host) {
+    if (host.length >= 2 && host.charAt(0) === '[' && host.charAt(host.length - 1) === ']') {
+      return host.slice(1, -1);
+    }
+    return host;
+  }
+
   function validateSettings(s) {
     var errors = [];
     if (!s.enableProxy) return errors;
@@ -155,7 +185,7 @@
       errors.push('代理地址不能包含空格');
     } else if (s.proxyHost.indexOf('://') >= 0 || s.proxyHost.indexOf('/') >= 0) {
       errors.push('代理地址只填主机名或 IP，不要带协议或路径');
-    } else if (s.proxyHost.indexOf(':') >= 0) {
+    } else if (looksLikeHostPort(s.proxyHost)) {
       errors.push('端口请填在独立的端口输入框中');
     }
 
@@ -195,6 +225,7 @@
     parseBypassList: parseBypassList,
     resolveBypassList: resolveBypassList,
     validateSettings: validateSettings,
+    stripBrackets: stripBrackets,
     estimateBytes: estimateBytes
   };
 })(typeof globalThis !== 'undefined' ? globalThis : self);

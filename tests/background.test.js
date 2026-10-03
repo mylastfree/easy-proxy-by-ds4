@@ -279,6 +279,38 @@ function t(name, cond, extra) {
     t("999.1.1.1/8（段值超 255）不误判为网段",
       S.parseBypassList("999.1.1.1/8")[0] === "999.1.1.1",
       "实际 = " + S.parseBypassList("999.1.1.1/8")[0]);
+
+    console.log("");
+    console.log("== N3：IPv6 代理地址不应被误判为「写了端口」==");
+    const base6 = S.normalizeSettings({ enableProxy: true });
+    const v6cases = ["::1", "fe80::1", "2001:db8::1", "[::1]", "[fe80::1]"];
+    for (const h of v6cases) {
+      const errs = S.validateSettings(Object.assign({}, base6, { proxyHost: h }));
+      t("IPv6 地址 " + h + " 被接受", errs.length === 0, JSON.stringify(errs));
+    }
+    // 反向：真正的 host:port 误写仍要拦住
+    const hp = ["1.2.3.4:8080", "localhost:8080", "example.com:3128"];
+    for (const h of hp) {
+      const errs = S.validateSettings(Object.assign({}, base6, { proxyHost: h }));
+      t("host:port 误写 " + h + " 仍被拦住", errs.length > 0);
+    }
+    t("stripBrackets([::1]) -> ::1", S.stripBrackets("[::1]") === "::1",
+      "实际 " + S.stripBrackets("[::1]"));
+    t("stripBrackets(::1) 保持不变", S.stripBrackets("::1") === "::1");
+    t("stripBrackets(127.0.0.1) 保持不变", S.stripBrackets("127.0.0.1") === "127.0.0.1");
+
+    console.log("");
+    console.log("== N4：全角分隔符应被识别 ==");
+    t("全角逗号 分割为两项", S.parseBypassList("a.com\uff0cb.com").length === 2,
+      JSON.stringify(S.parseBypassList("a.com\uff0cb.com")));
+    t("全角分号 分割为两项", S.parseBypassList("a.com\uff1bb.com").length === 2,
+      JSON.stringify(S.parseBypassList("a.com\uff1bb.com")));
+    t("中文顿号 分割为两项", S.parseBypassList("a.com\u3001b.com").length === 2,
+      JSON.stringify(S.parseBypassList("a.com\u3001b.com")));
+    t("全角逗号分隔的网段被正确解析",
+      JSON.stringify(S.parseBypassList("192.168.0.0/16\uff0c10.0.0.0/8")) ===
+        JSON.stringify(["192.168.0.0/16", "10.0.0.0/8"]),
+      JSON.stringify(S.parseBypassList("192.168.0.0/16\uff0c10.0.0.0/8")));
   }
 
   console.log("");

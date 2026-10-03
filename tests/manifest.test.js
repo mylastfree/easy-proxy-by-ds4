@@ -81,6 +81,15 @@ for (const i of imports) t("importScripts 引用的 " + i + " 存在", exists(i)
 const settingsJs = read("settings.js");
 t("settings.js 暴露 EasyProxy 命名空间", /root\.EasyProxy\s*=/.test(settingsJs));
 
+// background.js 会在运行时 setIcon，其引用的图标也必须真实存在。
+// 这类图标不必出现在 manifest 的 icons 里（setIcon 可指定任意已打包文件），
+// 但文件缺失会导致状态切换时图标不更新，因此单独校验。
+const bgIconRefs = [...new Set((bg.match(/icon-(?:red|green)-\d+\.png/g) || []))];
+t("background.js 至少引用一个图标", bgIconRefs.length > 0);
+for (const f of bgIconRefs) {
+  t("background.js 引用的 " + f + " 存在", exists(f), f);
+}
+
 console.log("");
 console.log("== popup.js 引用的元素 ID 都存在于 popup.html ==");
 const popupJs = read("popup.js");

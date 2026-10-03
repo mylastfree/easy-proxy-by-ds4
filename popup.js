@@ -1,4 +1,4 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.1.2]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.2.0]
 var S = window.EasyProxy;
 
 var el = {
@@ -21,6 +21,9 @@ var STATUS_TEXT = {
   direct: ["未启用代理（直连）", "muted"],
   saved_not_applied: ["已保存，但尚未生效", "warn"],
   overridden: ["设置被企业策略或其它扩展接管", "warn"],
+  // suspended 是「连接测试进行中，暂时跳过下发」的临时状态，
+  // 补上文案以免落入兜底的「状态未知」而让用户困惑。
+  suspended: ["连接测试进行中，暂缓下发（结束后自动恢复）", "warn"],
   error: ["代理异常，流量可能已回退直连", "error"]
 };
 

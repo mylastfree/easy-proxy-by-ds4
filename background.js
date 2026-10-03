@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.1.2]
+// background.js —— MV3 Service Worker  [v2.2.0]
 importScripts("settings.js");
 
 var S = self.EasyProxy;
@@ -154,10 +154,15 @@ var applyGeneration = 0;
 //   测试的「取直连出口」步骤需要代理确实处于清除状态；
 //   若此时有 storage 变化触发重新下发，直连出口会被代理出口污染，
 //   导致测试误报「代理很可能未生效」。
-var applySuspended = false;
+//
+// 用【计数器】而非布尔标志。原因：布尔标志必须靠「保存前值再恢复」来还原，
+// 而该模式在两个测试并发时会失配 —— 后一个测试读到的是前一个已置位的值，
+// 恢复后仍然为 true，导致下发被永久跳过（v2.1.2 的 N1 缺陷）。
+// 计数器则天然可重入：进入 +1、退出 -1，无论怎样交错，最终必然归零。
+var suspendDepth = 0;
 
 async function applyProxy() {
-  if (applySuspended) return { ok: true, status: "suspended" };
+  if (suspendDepth > 0) return { ok: true, status: "suspended" };
 
   var settings = await readSettings();
   settings.bypassList = await readBypassText();
@@ -189,7 +194,8 @@ async function applyProxy() {
     rules: {
       singleProxy: {
         scheme: settings.proxyType,
-        host: settings.proxyHost,
+        // IPv6 字面量若写成 [::1] 形式，下发给 chrome.proxy 时要按 ::1 形式给出
+        host: S.stripBrackets(settings.proxyHost),
         port: Number(settings.proxyPort)
       },
       bypassList: S.parseBypassList(settings.bypassList)
@@ -234,10 +240,29 @@ function applyProxySerial() {
 
 /* ==================== 连接测试 ==================== */
 
+// 连接测试的并发互斥：
+//   两个测试同时跑没有意义（第二次的结果与第一次等价），却会互相干扰：
+//   一个测试在恢复代理、另一个正在取直连出口，导致直连出口被代理出口污染，
+//   从而给出错误结论。因此直接拒绝并发的第二次。
+var testInFlight = false;
+
 // compare=true 时额外做一次直连对比：临时清除代理取直连出口，再恢复原配置。
 // 该对比是判断"代理是否真的生效"最可靠的方法，但会短暂切换直连，
 // 因此仅在用户明确点击"对比直连"时才执行，并用 try/finally 保证恢复。
 async function testConnection(compare) {
+  if (testInFlight) {
+    return { ok: false, skipped: "in_flight", message: "已有测试在进行中，请稍候再试" };
+  }
+  testInFlight = true;
+  try {
+    return await runConnectionTest(compare);
+  } finally {
+    testInFlight = false;
+  }
+}
+
+// 实际的测试实现（由 testConnection 包裹互斥后调用）
+async function runConnectionTest(compare) {
   var settings = await readSettings();
   settings.bypassList = await readBypassText();
 
@@ -275,14 +300,17 @@ async function testConnection(compare) {
 
     // 暂停自动下发：否则测试期间任何 storage 变化都会把代理重新写回，
     // 使下面这次「直连出口」实际测到代理出口，导致 ipChanged 误判。
-    // 用 try/finally 保证一定会复位，避免下发被永久暂停。
-    var prevSuspended = applySuspended;
-    applySuspended = true;
+    //
+    // 用计数器（进入 +1 / 退出 -1）而非布尔保存-恢复：
+    // 布尔模式在并发下会失配并永久卡住，计数器无论怎样交错都必然归零。
+    // try/finally 保证即使中途抛错也一定递减。
+    suspendDepth++;
     try {
       await clearProxyScope("regular");
       result.direct = await fetchExit();
     } finally {
-      applySuspended = prevSuspended;
+      suspendDepth--;
+      if (suspendDepth < 0) suspendDepth = 0;   // 防御性归零，避免异常路径下变负
       try {
         if (backup) await setProxy(backup);
         else await clearProxyScope("regular");
