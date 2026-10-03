@@ -26,10 +26,20 @@ var ICON_GREEN = {
 
 /* ==================== 存储读写 ==================== */
 
+// 【R7-01】读取失败必须是【显式失败】，绝不能归一成默认配置。
+//   此前只写一句 `void chrome.runtime.lastError;` 把告警抑制掉，却不产生任何分支：
+//     · normalizeSettings(undefined) 会填出 enableProxy:false，
+//       而 applyProxyCore 的「未启用」分支在【校验之前】就执行 clearProxyScope("regular")，
+//       于是「读不到设置」被当成「用户关掉了代理」—— 仍在生效的代理被真清除，
+//       状态还写成 direct、图标转红，界面宣称「未启用代理（直连）」；
+//     · 绕过列表读不到时则 resolve("")，被静默下发为空列表。
+//   chrome.storage 的失败契约是「回调里置 runtime.lastError」，因此必须在这里分支。
+//   失败通过 reject 上抛，由调用方转为「状态未知」，全过程不产生任何写操作。
 function readSettings() {
-  return new Promise(function (resolve) {
+  return new Promise(function (resolve, reject) {
     chrome.storage.sync.get(CONFIG_KEYS, function (items) {
-      void chrome.runtime.lastError;
+      var err = chrome.runtime.lastError;
+      if (err) { reject(new Error("读取设置失败：" + err.message)); return; }
       resolve(S.normalizeSettings(items));
     });
   });
@@ -37,10 +47,17 @@ function readSettings() {
 
 // 绕过列表可能因超长被降级到 local，这里统一取回。
 // 取值规则集中在 settings.js 的 resolveBypassList，确保 popup 显示与实际下发一致。
+// 【R7-01】两层读取都必须检查 lastError：sync 里的空串是「已降级到 local」的正常
+//   状态（不是失败），但 local 读取失败若被当成空串，就会把绕过列表静默清空下发 ——
+//   用户配的内网直连规则凭空消失，且没有任何提示。
 function readBypassText() {
-  return new Promise(function (resolve) {
+  return new Promise(function (resolve, reject) {
     chrome.storage.sync.get(['bypassList'], function (syncItems) {
+      var syncErr = chrome.runtime.lastError;
+      if (syncErr) { reject(new Error("读取绕过列表失败：" + syncErr.message)); return; }
       chrome.storage.local.get(['bypassList'], function (localItems) {
+        var localErr = chrome.runtime.lastError;
+        if (localErr) { reject(new Error("读取绕过列表失败：" + localErr.message)); return; }
         resolve(S.resolveBypassList(
           syncItems && syncItems.bypassList,
           localItems && localItems.bypassList
@@ -206,8 +223,25 @@ async function applyProxy() {
 // 对比窗口的恢复阶段必须直接用它：窗口期间 suspendDepth 仍然 > 0（暂停贯穿收尾），
 // 但恢复本身就是要按最新 settings 提交，不能被自己的暂停挡掉（R3-01）。
 async function applyProxyCore() {
-  var settings = await readSettings();
-  settings.bypassList = await readBypassText();
+  // 【R7-01】读取失败即终止，绝不进入下面的任何写分支：
+  //   把「读不到」当成「读到了空」会同时造成两类破坏性后果 ——
+  //   清除仍在生效的代理（enableProxy 被归一为 false），
+  //   或把绕过列表静默下发为空。此时我们唯一能如实陈述的是「状态未知」。
+  var settings;
+  try {
+    settings = await readSettings();
+    settings.bypassList = await readBypassText();
+  } catch (readErr) {
+    var rmsg = (readErr && readErr.message) || String(readErr);
+    console.warn("读取设置失败，本次既不下发也不清除代理:", rmsg);
+    updateIcon("error");
+    writeState({
+      status: "error",
+      message: "读取设置失败，未能确认当前配置，本次未改动代理：" + rmsg,
+      at: Date.now()
+    });
+    return { ok: false, status: "error", errors: [rmsg] };
+  }
 
   // 1) 未启用：清除常规作用域
   if (!settings.enableProxy) {
@@ -627,7 +661,16 @@ chrome.runtime.onInstalled.addListener(function (details) {
   if (reason === 'update') {
     // 升级：只补空缺，不覆盖用户已填内容，不改动启用状态
     chrome.storage.sync.get(CONFIG_KEYS, function (items) {
-      void chrome.runtime.lastError;
+      // 【R7-01】补空缺必须建立在【读到的真实内容】之上：读取失败时 items 为空，
+      //   归一化后 proxyHost/proxyPort 全为空，会把「读不到」当成「用户没配」，
+      //   用默认值把用户已填的地址与端口覆盖掉。此时直接交给下发路径，
+      //   由它把读取失败如实报成状态未知，不做任何补写。
+      var updateReadErr = chrome.runtime.lastError;
+      if (updateReadErr) {
+        console.warn("升级补空缺时读取设置失败，跳过补写:", updateReadErr.message);
+        applyProxySerial();
+        return;
+      }
       var cur = S.normalizeSettings(items);
       var patch = {};
 
@@ -704,6 +747,10 @@ chrome.proxy.settings.onChange.addListener(function (details) {
     //   若这里只看 actualMode === "fixed_servers" 就写 applied，
     //   界面会宣称「本扩展的代理已生效」——那是与 R6-04 同类的新可见性错误。
     //   因此必须把实际 host/port 与我方 settings 比对。
+    // 【R7-01】readSettings 现在会 reject，这里必须给出失败分支，
+    //   否则「外部变化 + 我方配置读不到」会变成一次静默无操作：
+    //   界面继续停留在过时结论上，用户看不到任何提示。
+    //   同样只写状态、不写回（本回调的硬约束见上）。
     readSettings().then(function (st) {
       var isFixed = actualMode === "fixed_servers";
       var mineIsFixed = !!st.enableProxy;
@@ -729,6 +776,14 @@ chrome.proxy.settings.onChange.addListener(function (details) {
         ? "本扩展已启用代理，但当前生效的代理配置不是本扩展下发的（可能被外部释放或覆盖）"
         : "本扩展未启用代理，但当前存在非本扩展下发的代理配置";
       writeState({ status: "error", message: msg, levelOfControl: level, at: Date.now() });
+      updateIcon("error");
+    }, function (readErr) {
+      var emsg = (readErr && readErr.message) || String(readErr);
+      writeState({
+        status: "error",
+        message: "代理设置已变化，但读取本扩展配置失败，无法确认当前状态：" + emsg,
+        at: Date.now()
+      });
       updateIcon("error");
     });
   });

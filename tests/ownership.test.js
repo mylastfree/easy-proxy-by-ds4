@@ -24,6 +24,7 @@ function buildEnv(opts) {
   const syncStore = {}, localStore = {}, sessionStore = {};
   const listeners = { changed: [], message: [], onChange: [] };
   const setCalls = [];       // setProxy 的发起序列
+  const setConfigs = [];     // R7-01：每次下发给 chrome.proxy 的完整配置对象
   const clearCalls = [];     // clear 的作用域序列
   const timeline = [];       // 窗口内每次 set/clear 【完成】时刻的真实生效配置
   const fetchLog = [];       // 每次 fetch 时刻的 proxyActive
@@ -34,6 +35,8 @@ function buildEnv(opts) {
   let directPhaseSeen = false, restoreSetSeen = false;
   let onRestoreSet = null, onClearDuringDirect = null;
   let getHook = null, getCount = 0;
+  // R7-01：存储读取故障注入（null = 不干预）。签名 (areaName, keys, items) => null | { error, items }
+  let storageHook = null;
   // R6-04：模拟外部扩展 / 企业策略的控制等级（null 表示仍由本扩展控制）。
   let externalLevel = null;
   let setHook = null, clearHook = null;
@@ -43,7 +46,19 @@ function buildEnv(opts) {
       get(keys, cb) {
         const out = {}; const ks = Array.isArray(keys) ? keys : Object.keys(keys || {});
         for (const k of ks) if (k in store) out[k] = store[k];
-        setTimeout(() => cb(out), 0);
+        setTimeout(() => {
+          // R7-01：按真实 chrome.storage 的失败契约注入 —— 先置 runtime.lastError，
+          //   再以空结果回调（items 可为 undefined，也可为 {}），回调返回后清除。
+          //   不挂钩子时完全走原路径，既有用例的行为一字不变。
+          const inj = storageHook ? storageHook(areaName, keys, out) : null;
+          if (inj) {
+            sandbox.chrome.runtime.lastError = inj.error || { message: "storage read failed (injected)" };
+            cb(inj.items);
+            sandbox.chrome.runtime.lastError = undefined;
+            return;
+          }
+          cb(out);
+        }, 0);
       },
       set(obj, cb) {
         if (areaName === "session" && obj && obj.lastState) stateWrites.push(obj.lastState);
@@ -102,6 +117,9 @@ function buildEnv(opts) {
     proxy: {
       settings: {
         set(o, cb) {
+          // R7-01：记录真实下发给 chrome.proxy 的【完整配置对象】（不只 host:port）——
+          //   绕过列表有没有被静默清空，只能从这份配置里看出来。
+          setConfigs.push(o && o.value);
           if (setHook) return setHook(o, cb, sandbox);
           const sp = (o.value && o.value.rules && o.value.rules.singleProxy) || {};
           const label = (sp.host === undefined ? "?" : sp.host) + ":" + (sp.port === undefined ? "?" : sp.port);
@@ -148,7 +166,7 @@ function buildEnv(opts) {
 
   vm.createContext(sandbox);
   vm.runInContext(bgSrc, sandbox);
-  return { sandbox, syncStore, localStore, sessionStore, stateWrites, setCalls, clearCalls, timeline, fetchLog, listeners, iconCalls, titleCalls,
+  return { sandbox, syncStore, localStore, sessionStore, stateWrites, setCalls, setConfigs, clearCalls, timeline, fetchLog, listeners, iconCalls, titleCalls,
     getEffective: () => effective, isProxyActive: () => proxyActive,
     openWindow: () => { windowOpen = true; }, closeWindow: () => { windowOpen = false; },
     onRestoreSet: fn => { onRestoreSet = fn; },
@@ -157,6 +175,8 @@ function buildEnv(opts) {
     resetDirect: () => { directPhaseSeen = false; },
     setGetHook: fn => { getHook = fn; getCount = 0; },
     setSetHook: fn => { setHook = fn; },
+    // R7-01：注入存储读取失败（真实契约：置 lastError 后回调空结果）。
+    setStorageHook: fn => { storageHook = fn; },
     setClearHook: fn => { clearHook = fn; },
     // R6-04：驱动 chrome.proxy.settings.onChange 的真实回调（外部接管 / 释放）。
     fireProxyChange: details => { for (const fn of listeners.onChange.slice()) fn(details); },
@@ -898,6 +918,208 @@ function t(name, cond, extra) {
     const stIdle = env.sessionStore.lastState || {};
     t("无待下发变更时状态不得声称仍有待下发（通道②：误报护栏）",
       stIdle.pendingResubmit !== true, "lastState=" + JSON.stringify(stIdle));
+  }
+
+  console.log("");
+  console.log("== R7-01-A：存储读取失败（items 为 undefined）不得清代理、不得误报「直连」 ==");
+  {
+    // 缺陷链路（R7-01）：sync.get 回调置 lastError 且 items 为 undefined →
+    //   normalizeSettings(undefined) 归一成默认配置（enableProxy:false）→
+    //   applyProxyCore 在【校验之前】就走 clearProxyScope("regular")，
+    //   把仍在生效的代理真清除，并把状态写成 direct、图标转红。
+    // 修复后：读取失败是显式失败，绝不产生任何破坏性写操作，
+    //   状态必须是「未知」而不是「直连」。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    const beforeSet = env.setCalls.length, beforeClear = env.clearCalls.length;
+    t("构造前置事实：浏览器里确实挂着代理 10808",
+      env.getEffective() === "127.0.0.1:10808", "实际=" + env.getEffective());
+
+    env.setStorageHook((area, keys) => {
+      if (area !== "sync") return null;
+      const ks = Array.isArray(keys) ? keys : Object.keys(keys || {});
+      // 只打【主配置读取】；bypassList 的读取由 R7-01-C 单独覆盖，
+      //   保证本用例的判据只指向「主配置读取失败」这一条路径。
+      if (ks.length === 1 && ks[0] === "bypassList") return null;
+      return { error: { message: "QUOTA_BYTES quota exceeded" }, items: undefined };
+    });
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10811" }));
+    await drain(env);
+    await sleep(300);
+    env.closeWindow();
+
+    const st = env.sessionStore.lastState || {};
+    t("存储读取失败时不得清除代理（clearProxy 调用次数为 0）",
+      env.clearCalls.length - beforeClear === 0,
+      "clear 序列=" + JSON.stringify(env.clearCalls.slice(beforeClear)));
+    t("存储读取失败时不得下发代理（setProxy 调用次数为 0）",
+      env.setCalls.length - beforeSet === 0,
+      "set 序列=" + JSON.stringify(env.setCalls.slice(beforeSet)));
+    t("存储读取失败时浏览器里原有代理仍在（未被真清除）",
+      env.getEffective() === "127.0.0.1:10808", "实际=" + env.getEffective());
+    t("存储读取失败时状态不得是 direct",
+      st.status !== "direct", "lastState=" + JSON.stringify(st));
+    t("存储读取失败时状态不得是 applied",
+      st.status !== "applied", "lastState=" + JSON.stringify(st));
+    t("存储读取失败时末次图标不是绿色",
+      env.iconCalls[env.iconCalls.length - 1] !== "icon-green-16.png",
+      "icon=" + env.iconCalls[env.iconCalls.length - 1]);
+    t("存储读取失败时状态如实反映失败且带非空原因",
+      st.status === "error" && typeof st.message === "string" && st.message.length > 0,
+      "lastState=" + JSON.stringify(st));
+  }
+
+  console.log("");
+  console.log("== R7-01-B：存储读取失败（items 为 空对象）同样必须被拦住 ==");
+  {
+    // 同一条失败路径的另一种取值形态：items 为 {}（修复前 normalizeSettings({})
+    //   同样归一成 enableProxy:false，触发面比 undefined 更宽）。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    const beforeSet = env.setCalls.length, beforeClear = env.clearCalls.length;
+    t("构造前置事实：浏览器里确实挂着代理 10808",
+      env.getEffective() === "127.0.0.1:10808", "实际=" + env.getEffective());
+
+    env.setStorageHook((area, keys) => {
+      if (area !== "sync") return null;
+      const ks = Array.isArray(keys) ? keys : Object.keys(keys || {});
+      if (ks.length === 1 && ks[0] === "bypassList") return null;
+      return { error: { message: "QUOTA_BYTES quota exceeded" }, items: {} };
+    });
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10811" }));
+    await drain(env);
+    await sleep(300);
+    env.closeWindow();
+
+    const st = env.sessionStore.lastState || {};
+    t("items 为空对象时同样不得清除代理",
+      env.clearCalls.length - beforeClear === 0,
+      "clear 序列=" + JSON.stringify(env.clearCalls.slice(beforeClear)));
+    t("items 为空对象时同样不得下发代理",
+      env.setCalls.length - beforeSet === 0,
+      "set 序列=" + JSON.stringify(env.setCalls.slice(beforeSet)));
+    t("items 为空对象时浏览器里原有代理仍在",
+      env.getEffective() === "127.0.0.1:10808", "实际=" + env.getEffective());
+    t("items 为空对象时状态既不是 direct 也不是 applied",
+      st.status !== "direct" && st.status !== "applied",
+      "lastState=" + JSON.stringify(st));
+    t("items 为空对象时末次图标不是绿色",
+      env.iconCalls[env.iconCalls.length - 1] !== "icon-green-16.png",
+      "icon=" + env.iconCalls[env.iconCalls.length - 1]);
+  }
+
+  console.log("");
+  console.log("== R7-01-C：绕过列表读取失败不得被静默清空下发给 chrome.proxy ==");
+  {
+    // 缺陷链路：绕过列表因超长已降级到 local（sync 里为空串），
+    //   readBypassText 在 local.get 失败时 resolve("")，
+    //   于是【绕过列表被静默下发为空】—— 原本的内网直连规则凭空消失。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    const LOCAL_BYPASS = "192.168.0.0/16\n10.0.0.0/8";
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10808", bypassList: "" }));
+    await new Promise(r => env.sandbox.chrome.storage.local.set({ bypassList: LOCAL_BYPASS }, r));
+    await drain(env);
+    const normalCfg = env.setConfigs[env.setConfigs.length - 1];
+    t("构造前置事实：正常路径下确实下发了非空的绕过列表",
+      !!(normalCfg && normalCfg.rules &&
+         JSON.stringify(normalCfg.rules.bypassList) === JSON.stringify(["192.168.0.0/16", "10.0.0.0/8"])),
+      "下发的 bypassList=" + JSON.stringify(normalCfg && normalCfg.rules && normalCfg.rules.bypassList));
+    env.setCalls.length = 0; env.setConfigs.length = 0; env.clearCalls.length = 0;
+
+    env.setStorageHook((area, keys) => {
+      if (area !== "local") return null;
+      const ks = Array.isArray(keys) ? keys : Object.keys(keys || {});
+      if (ks.indexOf("bypassList") < 0) return null;
+      return { error: { message: "local read failed (injected)" }, items: {} };
+    });
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10811", bypassList: "" }));
+    await drain(env);
+    await sleep(300);
+    env.closeWindow();
+
+    const lastCfg = env.setConfigs[env.setConfigs.length - 1];
+    const bypass = lastCfg && lastCfg.rules && lastCfg.rules.bypassList;
+    t("绕过列表读取失败时，下发给 chrome.proxy 的 bypassList 不得是空数组",
+      !(Array.isArray(bypass) && bypass.length === 0),
+      "下发的 bypassList=" + JSON.stringify(bypass) +
+      "；setConfigs=" + JSON.stringify(env.setConfigs));
+    t("绕过列表读取失败时不得改用直连清除来「兜底」",
+      env.clearCalls.length === 0,
+      "clear 序列=" + JSON.stringify(env.clearCalls));
+    const stC = env.sessionStore.lastState || {};
+    t("绕过列表读取失败时不得判 applied",
+      stC.status !== "applied", "lastState=" + JSON.stringify(stC));
+  }
+
+  console.log("");
+  console.log("== R7-01-D：读取正常时，有效配置仍照常下发并判 applied、图标为绿（防回归） ==");
+  {
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    env.setStorageHook(() => null);   // 显式声明：本用例不注入任何读取失败
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10813" }));
+    await drain(env);
+    await sleep(200);
+    env.closeWindow();
+
+    const st = env.sessionStore.lastState || {};
+    const lastCfg = env.setConfigs[env.setConfigs.length - 1];
+    t("读取正常时配置照常下发到 chrome.proxy",
+      env.getEffective() === "127.0.0.1:10813", "实际=" + env.getEffective());
+    t("读取正常时判 applied 且与实际生效一致",
+      st.status === "applied", "lastState=" + JSON.stringify(st));
+    t("读取正常时末次图标为绿色",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-green-16.png",
+      "icon=" + env.iconCalls[env.iconCalls.length - 1]);
+    t("读取正常时绕过列表按原语义下发（正常路径未被误伤）",
+      !!(lastCfg && lastCfg.rules &&
+         JSON.stringify(lastCfg.rules.bypassList) === JSON.stringify(["x"])),
+      "下发的 bypassList=" + JSON.stringify(lastCfg && lastCfg.rules && lastCfg.rules.bypassList));
+  }
+
+  console.log("");
+  console.log("== R7-01-E：对比窗口收尾读取失败时，恢复必须如实判失败且不得清脏（要求4） ==");
+  {
+    // 要求 4：runCompareWindow 收尾调用 applyProxyCore 时若因读取失败而未能恢复，
+    //   必须如实置 result.restoreFailed = true 且有非空原因，不得清掉 suspendDirty。
+    // 修复前的链路：读取失败 → 归一成默认配置（enableProxy:false）→ 窗口收尾
+    //   反而把「未启用」当成结论、clearProxyScope("regular") 后返回 {ok:true,status:"direct"}，
+    //   于是恢复被当成成功、脏标记被清掉 —— 用户在窗口期间保存的配置就此永久消失。
+    const env = buildEnv({ fetchDelay: 40 });
+    await ready(env, "10808");
+    t("构造前置事实：浏览器里挂着代理 10808",
+      env.getEffective() === "127.0.0.1:10808", "实际=" + env.getEffective());
+
+    env.onClearDuringDirect(sb => {
+      // 窗口期间保存新端口：该请求被暂停挡下 → 记脏（真实来源，不靠直接置位）
+      sb.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "6666" }), () => {});
+      // 自直连取样起，主配置读取全部失败 → 收尾「按最新 settings 恢复」必然读不到配置
+      env.setStorageHook((area, keys) => {
+        if (area !== "sync") return null;
+        const ks = Array.isArray(keys) ? keys : Object.keys(keys || {});
+        if (ks.length === 1 && ks[0] === "bypassList") return null;
+        return { error: { message: "读取设置失败（注入）" }, items: undefined };
+      });
+    });
+
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(400); env.closeWindow();
+
+    t("收尾因读取失败而未恢复时，如实置 restoreFailed 为 true（要求4）",
+      !!(resp && resp.result && resp.result.restoreFailed === true),
+      "restoreFailed=" + (resp && resp.result && resp.result.restoreFailed));
+    t("收尾读取失败时不得清掉脏标记（否则这次变更被永久丢弃）",
+      env.sandbox.suspendDirty === true, "dirty=" + env.sandbox.suspendDirty);
+    const stE = env.sessionStore.lastState || {};
+    t("收尾读取失败时状态不是 applied 且带非空原因",
+      stE.status !== "applied" && typeof stE.message === "string" && stE.message.length > 0,
+      "lastState=" + JSON.stringify(stE));
+    t("收尾读取失败时绝不把状态写成 direct（读不到 ≠ 用户关掉了代理）",
+      stE.status !== "direct", "lastState=" + JSON.stringify(stE));
+    t("收尾读取失败时末次图标不是绿色",
+      env.iconCalls[env.iconCalls.length - 1] !== "icon-green-16.png",
+      "icon=" + env.iconCalls[env.iconCalls.length - 1]);
   }
   console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
