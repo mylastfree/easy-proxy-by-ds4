@@ -72,6 +72,40 @@ t("端口 80.5 报错", S.validateSettings(Object.assign({}, ok, { proxyPort: "8
 t("端口 65535 合法", S.validateSettings(Object.assign({}, ok, { proxyPort: "65535" })).length === 0);
 t("端口 1 合法", S.validateSettings(Object.assign({}, ok, { proxyPort: "1" })).length === 0);
 
+console.log("== 代理地址 ASCII / Punycode 校验（R7-07）==");
+// Chromium extensions/common/api/proxy.json 对 host 的要求原文：
+//   "Hostnames must be in ASCII (in Punycode format). IDNA is not supported, yet."
+// 非 ASCII 主机名会被 chrome.proxy.settings.set 拒绝，代理下发失败并落 error 状态。
+const NON_ASCII_HOSTS = ["例子.中国", "münchen.de", "Пример.рф", "foo\u3000bar.com"];
+NON_ASCII_HOSTS.forEach(function (h) {
+  const errs = S.validateSettings(Object.assign({}, ok, { proxyHost: h }));
+  t("R7-07-1 非 ASCII 地址被拒：" + h, errs.length > 0, JSON.stringify(errs));
+});
+const punyErrs = S.validateSettings(Object.assign({}, ok, { proxyHost: "例子.中国" }));
+t("R7-07-1 拒绝文案含 Punycode 转换指引",
+  punyErrs.some(function (m) { return m.indexOf("Punycode") >= 0; }), JSON.stringify(punyErrs));
+
+// 防误伤：以下主机名必须继续零错误（IPv4 / 主机名 / IPv6 字面量 / 已是 Punycode）
+const ASCII_HOSTS = ["127.0.0.1", "localhost", "192.168.1.1", "::1", "[::1]", "fe80::1",
+  "proxy.example.com", "xn--fsqu00a.xn--fiqs8s"];
+ASCII_HOSTS.forEach(function (h) {
+  const errs = S.validateSettings(Object.assign({}, ok, { proxyHost: h }));
+  t("R7-07-2 合法地址零错误：" + h, errs.length === 0, JSON.stringify(errs));
+});
+
+// 防回归：既有拒绝项的行为与文案不得改变或放宽
+const REGRESS = [
+  ["", "请填写代理地址"],
+  ["1.2 3.4", "代理地址不能包含空格"],
+  ["http://1.2.3.4", "代理地址只填主机名或 IP，不要带协议或路径"],
+  ["example.com/path", "代理地址只填主机名或 IP，不要带协议或路径"],
+  ["1.2.3.4:8080", "端口请填在独立的端口输入框中"]
+];
+REGRESS.forEach(function (c) {
+  const errs = S.validateSettings(Object.assign({}, ok, { proxyHost: c[0] }));
+  t("R7-07-3 既有拒绝项文案不变：" + JSON.stringify(c[0]), errs.indexOf(c[1]) >= 0, JSON.stringify(errs));
+});
+
 console.log("== 容量估算 ==");
 t("估算值为正", S.estimateBytes({ bypassList: "abc" }) > 0);
 t("超 8192 可被识别", S.estimateBytes({ bypassList: "x".repeat(9000) }) > S.MAX_SYNC_BYTES_PER_ITEM);

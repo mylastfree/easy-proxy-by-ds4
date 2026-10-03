@@ -110,6 +110,22 @@
     return false;
   }
 
+  // Chrome 要求代理主机名必须是 ASCII（Punycode 形式）。Chromium
+  // extensions/common/api/proxy.json 对 host 字段的原文说明：
+  //   "Hostnames must be in ASCII (in Punycode format). IDNA is not supported, yet."
+  // 非 ASCII 主机名（中文、带音标、Cyrillic 域名，以及 U+3000 全角空格这类
+  // Unicode 空白）能通过旧校验并保存成功，但下发 chrome.proxy.settings.set 时
+  // 会被直接拒绝，代理下发失败、状态最终落 error。
+  //
+  // 判据：host 中每个 UTF-16 码元都 ≤ 0x7F。Punycode（xn--…）本身即 ASCII，
+  // 不受影响；IPv6 字面量（::1、[::1]、fe80::1）也全部落在 ASCII 区间。
+  function isAsciiHost(s) {
+    for (var i = 0; i < s.length; i++) {
+      if (s.charCodeAt(i) > 127) return false;
+    }
+    return true;
+  }
+
   function isAllDigits(s) {
     if (!s.length) return false;
     for (var i = 0; i < s.length; i++) {
@@ -187,6 +203,8 @@
       errors.push('代理地址只填主机名或 IP，不要带协议或路径');
     } else if (looksLikeHostPort(s.proxyHost)) {
       errors.push('端口请填在独立的端口输入框中');
+    } else if (!isAsciiHost(s.proxyHost)) {
+      errors.push('代理地址只能使用 ASCII 字符；中文等非 ASCII 域名请先转换为 Punycode（如 例子.中国 → xn--fsqu00a.xn--fiqs8s）再填写');
     }
 
     var portNum = Number(s.proxyPort);
