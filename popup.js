@@ -24,7 +24,10 @@ var STATUS_TEXT = {
   // suspended 是「连接测试进行中，暂时跳过下发」的临时状态，
   // 补上文案以免落入兜底的「状态未知」而让用户困惑。
   suspended: ["连接测试进行中，暂缓下发（结束后自动恢复）", "warn"],
-  error: ["代理异常，流量可能已回退直连", "error"]
+  error: ["代理异常，流量可能已回退直连", "error"],
+  // 【R7-01-F】error 档的第二种来源：读取配置失败。此时我们什么都没做，
+  //   代理未被改动，因此绝不能沿用上面那条「可能已回退直连」的断言。
+  error_read_failed: ["无法读取配置，本次未改动代理", "warn"]
 };
 
 function setStorage(area, obj) {
@@ -80,7 +83,12 @@ function showHint(message, kind) {
 
 function renderStatus(state) {
   if (!state) state = { status: "direct" };
-  var row = STATUS_TEXT[state.status] || ["状态未知", "muted"];
+  // 【R7-01-F】读取失败不是「代理坏了」：单独取文案，避免状态条自相矛盾
+  //   （前半句说代理可能已回退直连、后半句说本次未改动代理）。
+  var key = (state.status === "error" && state.reason === "read_failed")
+    ? "error_read_failed"
+    : state.status;
+  var row = STATUS_TEXT[key] || ["状态未知", "muted"];
   var text = row[0];
   if (state.errors && state.errors.length) text += "：" + state.errors.join("；");
   else if (state.message) text += "：" + state.message;

@@ -22,7 +22,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function buildEnv(opts) {
   opts = opts || {};
   const syncStore = {}, localStore = {}, sessionStore = {};
-  const listeners = { changed: [], message: [], onChange: [] };
+  const listeners = { changed: [], message: [], onChange: [], installed: [] };
   const setCalls = [];       // setProxy 的发起序列
   const setConfigs = [];     // R7-01：每次下发给 chrome.proxy 的完整配置对象
   const clearCalls = [];     // clear 的作用域序列
@@ -110,7 +110,7 @@ function buildEnv(opts) {
   }
   sandbox.chrome = {
     runtime: { lastError: undefined, id: SENDER_ID,
-      onInstalled: { addListener() {} }, onStartup: { addListener() {} },
+      onInstalled: { addListener(f) { listeners.installed.push(f); } }, onStartup: { addListener() {} },
       onMessage: { addListener(f) { listeners.message.push(f); } } },
     storage: { sync: makeArea(syncStore, "sync"), local: makeArea(localStore, "local"),
       session: makeArea(sessionStore, "session"), onChanged: { addListener(f) { listeners.changed.push(f); } } },
@@ -1357,6 +1357,94 @@ function t(name, cond, extra) {
     t("R7-02-E not_controlled_by_this_extension 文案保持原样",
       pctx.el.testResult.innerHTML.indexOf("已跳过直连对比以免影响它") >= 0,
       pctx.el.testResult.innerHTML);
+  }
+
+
+  {
+    // R7-01-F（本条为独立验证会话补充的可见性断言）：读取失败时，
+    //   前台与图标标题都不得断言「代理已被回退/可能已回退直连」。
+    //
+    //   缺陷背景：b133597 把底层语义修成「读不到 ≠ 用户关掉了代理」，
+    //   但同一次失败写下的 status:"error" 会命中两处既有文案：
+    //     · popup.js  STATUS_TEXT.error = "代理异常，流量可能已回退直连"
+    //     · background.js updateIcon 的 error 标题 = "代理异常，可能已回退直连"
+    //   两者都与同一条 message 里的「本次未改动代理」直接矛盾 —— 修复的语义
+    //   从 UI 层泄露了回去。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    env.setStorageHook((area, keys) => {
+      if (area !== "sync") return null;
+      const ks = Array.isArray(keys) ? keys : Object.keys(keys || {});
+      if (ks.length === 1 && ks[0] === "bypassList") return null;
+      return { error: { message: "QUOTA_BYTES quota exceeded" }, items: undefined };
+    });
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10811" }));
+    await drain(env);
+    await sleep(300);
+    env.closeWindow();
+
+    const stF = env.sessionStore.lastState || {};
+    const lastTitleF = env.titleCalls[env.titleCalls.length - 1];
+
+    t("R7-01-F 前置事实：读取失败确实写下了带非空 message 的 error 状态",
+      stF.status === "error" && typeof stF.message === "string" && stF.message.length > 0,
+      "lastState=" + JSON.stringify(stF));
+
+    // 断言一：图标标题不得断言代理已失效。
+    t("R7-01-F 图标标题不得声称代理可能已回退直连（读不到 ≠ 代理没了）",
+      !(typeof lastTitleF === "string" && /回退直连|流量可能/.test(lastTitleF)),
+      "最后一个标题=" + JSON.stringify(lastTitleF));
+
+    // 断言二：前台状态条文案同样不得断言代理已失效。
+    const popupSrcF = fs.readFileSync(path.join(__dirname, "..", "popup.js"), "utf8");
+    const pctxF = { el: { statusBar: { textContent: "", className: "" } }, console: { log: function () {} } };
+    vm.createContext(pctxF);
+    vm.runInContext(
+      popupSrcF.slice(popupSrcF.indexOf("var STATUS_TEXT"), popupSrcF.indexOf("function setStorage")),
+      pctxF
+    );
+    vm.runInContext(
+      popupSrcF.slice(popupSrcF.indexOf("function renderStatus"), popupSrcF.indexOf("/* ==================== 连接测试渲染")),
+      pctxF
+    );
+    pctxF.renderStatus(JSON.parse(JSON.stringify(stF)));
+    const shownF = pctxF.el.statusBar.textContent;
+
+    t("R7-01-F 前台状态条不得声称代理可能已回退直连",
+      !/回退直连|流量可能/.test(shownF),
+      "状态条=" + JSON.stringify(shownF));
+
+    // 断言三：文案必须表达「未改动代理」这一真实事实。
+    t("R7-01-F 前台状态条须明确说明本次未改动代理",
+      /未改动代理|未改动现有代理/.test(shownF),
+      "状态条=" + JSON.stringify(shownF));
+
+    // 断言四：真实代理故障路径的既有文案必须保持不变（防误伤）。
+    const realFailEnv = buildEnv({ fetchDelay: 20 });
+    await ready(realFailEnv, "10808");
+    const titlesBeforeReal = realFailEnv.titleCalls.length;
+    realFailEnv.setSetHook((cfg, cb) => {
+      // 真实下发失败：不是读取失败，而是 set 被 Chrome 拒绝。
+      realFailEnv.sandbox.chrome.runtime.lastError = { message: "set 被拒绝（注入）" };
+      setTimeout(() => { cb && cb(); realFailEnv.sandbox.chrome.runtime.lastError = null; }, 0);
+    });
+    await setSync(realFailEnv, Object.assign({}, BASE, { proxyPort: "10988" }));
+    await drain(realFailEnv);
+    await sleep(300);
+    realFailEnv.closeWindow();
+    const stReal = realFailEnv.sessionStore.lastState || {};
+    t("R7-01-F 防御性确认：真实下发失败路径与读取失败路径是不同现场",
+      stReal.status === "error",
+      "lastState=" + JSON.stringify(stReal));
+    // 反向锁：真实故障路径【必须保留】原有如实文案，防止本次修复把文案改得过宽
+    //   （若这里也变成"未改动代理"，就会掩盖真实的代理已失效事实）。
+    t("R7-01-F 反向锁：真实故障路径不得被误标为 read_failed",
+      stReal.reason !== "read_failed",
+      "reason=" + JSON.stringify(stReal.reason));
+    const titlesAfterReal = realFailEnv.titleCalls.slice(titlesBeforeReal);
+    t("R7-01-F 反向锁：真实故障路径的 error 标题不得声称未改动代理",
+      !titlesAfterReal.some(x => typeof x === "string" && /未改动代理/.test(x)),
+      "标题序列=" + JSON.stringify(titlesAfterReal));
   }
 
   console.log("");

@@ -110,7 +110,7 @@ function readProxyDetails() {
   });
 }
 
-function updateIcon(status) {
+function updateIcon(status, reason) {
   // 只有真正下发成功才显示绿色，避免"绿着但直连"的误导
   var ok = status === 'applied';
   chrome.action.setIcon({ path: ok ? ICON_GREEN : ICON_RED }, function () {
@@ -125,6 +125,14 @@ function updateIcon(status) {
     suspended: '连接测试进行中，暂缓下发（结束后自动恢复）',
     error: '代理异常，可能已回退直连'
   };
+  // 【R7-01-F】error 档有两个语义完全不同的来源，必须分开陈述：
+  //   · 真实代理故障（下发失败 / 被外部接管）→「可能已回退直连」成立；
+  //   · 读取配置失败 → 我们【什么都没做】，代理根本没被动过，
+  //     此时沿用「可能已回退直连」就是与同一条 message 里的
+  //     「本次未改动代理」直接矛盾（读不到 ≠ 代理没了）。
+  if (status === 'error' && reason === 'read_failed') {
+    titles.error = '无法读取配置，本次未改动代理';
+  }
   chrome.action.setTitle({ title: titles[status] || "代理设置" }, function () {
     void chrome.runtime.lastError;
   });
@@ -234,10 +242,13 @@ async function applyProxyCore() {
   } catch (readErr) {
     var rmsg = (readErr && readErr.message) || String(readErr);
     console.warn("读取设置失败，本次既不下发也不清除代理:", rmsg);
-    updateIcon("error");
+    // 【R7-01-F】reason 让前台能把「读不到配置」与「代理真的坏了」分开陈述。
+    //   status 仍是 "error"（R7-01 的既有契约与断言不变），只增加子类型。
+    updateIcon("error", "read_failed");
     writeState({
       status: "error",
-      message: "读取设置失败，未能确认当前配置，本次未改动代理：" + rmsg,
+      reason: "read_failed",
+      message: "未能确认当前配置，本次未改动代理：" + rmsg,
       at: Date.now()
     });
     return { ok: false, status: "error", errors: [rmsg] };
@@ -809,12 +820,14 @@ chrome.proxy.settings.onChange.addListener(function (details) {
       updateIcon("error");
     }, function (readErr) {
       var emsg = (readErr && readErr.message) || String(readErr);
+      // 【R7-01-F】同一条「读取失败 ≠ 代理没了」的语义，这里同样不能声称已回退直连。
       writeState({
         status: "error",
+        reason: "read_failed",
         message: "代理设置已变化，但读取本扩展配置失败，无法确认当前状态：" + emsg,
         at: Date.now()
       });
-      updateIcon("error");
+      updateIcon("error", "read_failed");
     });
   });
 });
