@@ -287,6 +287,9 @@ function t(name, cond, extra) {
     t("接管期间我方没有再把 7777 写下去夺权（外部配置仍生效）",
       env.getEffective() === "external:9090" && env.setCalls.indexOf("127.0.0.1:7777") < 0,
       "实际 = " + env.getEffective() + "；set 序列 = " + JSON.stringify(env.setCalls));
+    t("接管时如实标记仍有待下发的配置",
+      resp && resp.result && resp.result.pendingResubmit === true,
+      "pendingResubmit=" + (resp && resp.result && resp.result.pendingResubmit));
   }
 
   console.log("");
@@ -481,6 +484,33 @@ function t(name, cond, extra) {
       "icon=" + env.iconCalls[env.iconCalls.length - 1]);
     t("测试结果仍记录出口未变化",
       resp && resp.result && resp.result.ipChanged === false);
+  }
+
+  console.log("");
+  console.log("== R5-04：收尾提交失败后，脏标记不能一直留着 ==");
+  {
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    let calls = 0;
+    const orig = env.sandbox.applyProxyCore;
+    env.sandbox.applyProxyCore = async function () {
+      calls++;
+      if (calls === 1) throw new Error("injected restore fail");
+      return orig.apply(this, arguments);
+    };
+    env.onClearDuringDirect(sb => {
+      sb.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "6666" }), () => {});
+    });
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await drain(env);
+    t("第一次提交失败被记入测试结果",
+      resp && resp.result && resp.result.restoreFailed === true);
+    t("暂停已结束", env.sandbox.suspendDepth === 0, "depth=" + env.sandbox.suspendDepth);
+    t("后续成功下发清掉脏标记",
+      env.sandbox.suspendDirty === false, "dirty=" + env.sandbox.suspendDirty);
+    t("最终生效的是失败期间保存的 6666",
+      env.getEffective() === "127.0.0.1:6666",
+      "effective=" + env.getEffective());
   }
 
   console.log("");

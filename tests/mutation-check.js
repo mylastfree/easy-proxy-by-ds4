@@ -113,12 +113,19 @@ const mutations = [
     expectFail: true
   },
   {
+    name: "M9 暂停期间的存储变化不再记脏（接管时丢失待下发标记）",
+    target: "bg",
+    from: "  if (touched) {\n    if (suspendDepth > 0) suspendDirty = true;\n    applyProxySerial();\n  }",
+    to: "  if (touched) {\n    applyProxySerial();\n  }",
+    expectFail: true
+  },
+  {
     // 第四轮 R3-01 根因之一：对比窗口必须整体排入同一条串行队列。
     // 去掉排他入队后，窗口会与普通下发交错，ownership 用例必须变红。
     name: "M10 对比窗口不再排他入队（R3-01 回归：双所有权）",
     target: "bg",
-    from: "    await applyProxyExclusive(function () {\n      return runCompareWindow(result, settings);\n    });",
-    to: "    await runCompareWindow(result, settings);",
+    from: "    await applyProxyExclusive(function () {\n      return runCompareWindow(result);\n    });",
+    to: "    await runCompareWindow(result);",
     expectFail: true
   },
   {

@@ -599,7 +599,10 @@ chrome.storage.onChanged.addListener(function (changes, areaName) {
   var touched = Object.keys(changes).some(function (k) {
     return CONFIG_KEYS.indexOf(k) >= 0;
   });
-  if (touched) applyProxySerial();
+  if (touched) {
+    if (suspendDepth > 0) suspendDirty = true;
+    applyProxySerial();
+  }
 });
 
 chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
