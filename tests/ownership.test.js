@@ -854,6 +854,15 @@ function t(name, cond, extra) {
       overriddenRestore.length >= 1 && overriddenRestore[0].pendingResubmit === true,
       JSON.stringify(overriddenRestore));
 
+    // 【R7-02 之后的必要前置构造】R7-02 给对比入口增加了"当前【实际生效】的配置必须是
+    //   我方 fixed_servers"的判据（否则宁可不测，也不许动代理）。而第一次窗口的清除
+    //   并没有被恢复（收尾提交被判为外部接管、按设计放弃写回），所以此刻 chrome.proxy
+    //   里实际是直连；若不先把配置挂回我方形态，第二次窗口会止步于该入口判据，
+    //   根本走不到本用例真正要验证的【清除前接管】分支。
+    //   这里直接调用测试桩的真实落地函数（语义等价于"配置确实还挂在我方"），
+    //   不经过我方 set 序列，因此不污染任何计数与断言。
+    env.sandbox.chrome.proxy.settings._apply("127.0.0.1:8080");
+
     // 第二次窗口：入口复核仍属我方（才允许进入对比），窗口开头复核即为外部接管
     //   → 命中【清除前接管】早退分支，全程不执行清除、也不下发任何配置。
     env.setGetHook((n, o, cb, defaultGet) => {
@@ -1121,6 +1130,235 @@ function t(name, cond, extra) {
       env.iconCalls[env.iconCalls.length - 1] !== "icon-green-16.png",
       "icon=" + env.iconCalls[env.iconCalls.length - 1]);
   }
+  console.log("");
+  console.log("== R7-02：配置无效或生效配置不符时，对比入口不得清除仍在工作的旧代理 ==");
+
+  // 构造 R7-02 的现场：先前成功下发过有效代理 127.0.0.1:10808（chrome.proxy 里挂着它），
+  //   随后存储被改成【无效配置】。此时点「对比直连出口」正是缺陷链路的起点。
+  async function staleInvalidEnv(invalidPort) {
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    await setSync(env, Object.assign({}, BASE, { proxyPort: invalidPort }));
+    await sleep(400);            // 让"存储变化 → 校验失败 → saved_not_applied"完整跑完
+    env.setCalls.length = 0; env.setConfigs.length = 0;
+    env.clearCalls.length = 0; env.timeline.length = 0;
+    env.resetDirect();
+    return env;
+  }
+
+  {
+    // R7-02-A（核心）：无效端口 + 代理仍有效 + compare=true。
+    //   缺陷链路：入口只看 enableProxy && controlledByUs，不校验配置有效性 →
+    //   窗口先 clearProxyScope("regular") 把仍在工作的 10808 清掉 →
+    //   收尾 applyProxyCore 因校验失败返回 saved_not_applied（set 次数为 0）→
+    //   测试结束后浏览器里代理为 null，代理丢失且不恢复。
+    const env = await staleInvalidEnv("not-a-port");
+    const writesBefore = env.stateWrites.length;
+    const iconsBefore = env.iconCalls.length, titlesBefore = env.titleCalls.length;
+    const stBefore = JSON.parse(JSON.stringify(env.sessionStore.lastState || {}));
+
+    t("R7-02-A 前置事实：浏览器里仍挂着先前成功下发的代理 10808",
+      env.getEffective() === "127.0.0.1:10808", "实际=" + env.getEffective());
+    t("R7-02-A 前置事实：存储里是无效端口，测试前的真实结论是 saved_not_applied",
+      env.syncStore.proxyPort === "not-a-port" && stBefore.status === "saved_not_applied",
+      "proxyPort=" + env.syncStore.proxyPort + "；lastState=" + JSON.stringify(stBefore));
+
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(400); env.closeWindow();
+
+    const regularClears = env.clearCalls.filter(s => s === "regular").length;
+    t("R7-02-A 无效配置下不得清除 regular 作用域（clear 次数为 0）",
+      regularClears === 0, "clear 序列=" + JSON.stringify(env.clearCalls));
+    t("R7-02-A 无效配置下不得下发任何代理配置（set 次数为 0）",
+      env.setCalls.length === 0, "set 序列=" + JSON.stringify(env.setCalls));
+    t("R7-02-A 核心事实：测试结束后浏览器里仍挂着原代理 127.0.0.1:10808（代理没有丢失）",
+      env.getEffective() === "127.0.0.1:10808", "实际=" + env.getEffective());
+    t("R7-02-A 测试期间没有写任何状态（现场未被污染）",
+      env.stateWrites.length === writesBefore,
+      "新写入=" + JSON.stringify(env.stateWrites.slice(writesBefore)));
+    t("R7-02-A 未改动图标与标题（现场未被破坏）",
+      env.iconCalls.length === iconsBefore && env.titleCalls.length === titlesBefore,
+      "新增图标=" + JSON.stringify(env.iconCalls.slice(iconsBefore)) +
+      "；新增标题=" + JSON.stringify(env.titleCalls.slice(titlesBefore)));
+    const stA = env.sessionStore.lastState || {};
+    t("R7-02-A 状态未被写成 suspended 或 error，仍是测试前的结论",
+      stA.status === "saved_not_applied", "lastState=" + JSON.stringify(stA));
+    t("R7-02-A 结果如实标记 invalid_settings、带上非空原因，且不误报 restoreFailed",
+      !!(resp && resp.result && resp.result.compareSkipped === "invalid_settings") &&
+      !!(resp && resp.result && typeof resp.result.compareSkippedReason === "string" &&
+         resp.result.compareSkippedReason.length > 0) &&
+      !(resp && resp.result && resp.result.restoreFailed === true),
+      "result=" + JSON.stringify(resp && resp.result && {
+        compareSkipped: resp.result.compareSkipped,
+        compareSkippedReason: resp.result.compareSkippedReason,
+        restoreFailed: resp.result.restoreFailed
+      }));
+    t("R7-02-A 未取直连出口（根本没有进入对比窗口）",
+      !(resp && resp.result && resp.result.direct),
+      "direct=" + JSON.stringify(resp && resp.result && resp.result.direct));
+  }
+
+  {
+    // R7-02-B：同一现场，但两次出口恰好相同（代理不改变出口）。
+    //   出口是否相同与"该不该清代理"无关，早退必须同样成立。
+    const env = await staleInvalidEnv("not-a-port");
+    env.sandbox.fetch = function () {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ ip: DIRECT_IP, org: "", city: "", region: "", country: "" })
+      });
+    };
+    const writesBefore = env.stateWrites.length;
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(400); env.closeWindow();
+
+    const regularClears = env.clearCalls.filter(s => s === "regular").length;
+    t("R7-02-B 出口相同的情形下同样不得清除 regular（clear 次数为 0）",
+      regularClears === 0, "clear 序列=" + JSON.stringify(env.clearCalls));
+    t("R7-02-B 出口相同的情形下不得下发代理（set 次数为 0）",
+      env.setCalls.length === 0, "set 序列=" + JSON.stringify(env.setCalls));
+    t("R7-02-B 核心事实：测试结束后代理仍生效且仍是原值",
+      env.getEffective() === "127.0.0.1:10808", "实际=" + env.getEffective());
+    t("R7-02-B 出口相同时同样不写任何状态",
+      env.stateWrites.length === writesBefore,
+      "新写入=" + JSON.stringify(env.stateWrites.slice(writesBefore)));
+    t("R7-02-B 出口相同时状态不得是 suspended / error",
+      (env.sessionStore.lastState || {}).status === "saved_not_applied",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState));
+    t("R7-02-B 出口相同时同样判 invalid_settings 早退",
+      !!(resp && resp.result && resp.result.compareSkipped === "invalid_settings"),
+      "compareSkipped=" + (resp && resp.result && resp.result.compareSkipped));
+  }
+
+  {
+    // R7-02-C（防回归，最重要）：有效配置下，正常对比必须完全照旧 ——
+    //   证明这次修复没有把正常对比一起关掉。
+    const env = buildEnv({ fetchDelay: 40 });
+    await ready(env, "10808");
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10999" }));
+    await drain(env);
+    await sleep(200);
+    t("R7-02-C 前置事实：有效配置已下发并生效",
+      env.getEffective() === "127.0.0.1:10999", "实际=" + env.getEffective());
+    env.setCalls.length = 0; env.setConfigs.length = 0;
+    env.clearCalls.length = 0; env.timeline.length = 0;
+    env.iconCalls.length = 0; env.resetDirect();
+
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(500); env.closeWindow();
+
+    const regularClears = env.clearCalls.filter(s => s === "regular").length;
+    t("R7-02-C 有效配置下仍照旧进入对比：clear(regular) 恰 1 次",
+      regularClears === 1, "clear 序列=" + JSON.stringify(env.clearCalls));
+    t("R7-02-C 有效配置下仍照旧收尾恢复：setProxy 恰 1 次",
+      env.setCalls.length === 1, "set 序列=" + JSON.stringify(env.setCalls));
+    t("R7-02-C 测试结束后代理恢复为有效配置",
+      env.getEffective() === "127.0.0.1:10999", "实际=" + env.getEffective());
+    const stC = env.sessionStore.lastState || {};
+    const lastIconC = env.iconCalls[env.iconCalls.length - 1];
+    t("R7-02-C 状态 applied 且图标为绿色",
+      stC.status === "applied" && lastIconC === "icon-green-16.png",
+      "lastState=" + JSON.stringify(stC) + "；icon=" + lastIconC);
+    t("R7-02-C 对比仍然有效：直连出口取到了，且未被入口误拦",
+      !!(resp && resp.result && resp.result.direct && resp.result.direct.ok) &&
+      resp.result.direct.ip === DIRECT_IP &&
+      !(resp.result.compareSkipped),
+      "direct=" + JSON.stringify(resp && resp.result && resp.result.direct) +
+      "；compareSkipped=" + (resp && resp.result && resp.result.compareSkipped));
+  }
+
+  {
+    // R7-02-D：控制权属我方、存储配置有效，但 chrome.proxy 里【实际生效的模式】
+    //   不是 fixed_servers（此处为直连）→ 同样不得 clear。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    env.setGetHook((n, o, cb) => {
+      setTimeout(() => cb({
+        value: { mode: "direct" },
+        levelOfControl: "controllable_by_this_extension"
+      }), 0);
+    });
+    const writesBefore = env.stateWrites.length;
+    const clearsBefore = env.clearCalls.length;
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(400); env.closeWindow();
+
+    // 计数基线取"本用例期间"：ready() 之前的冷启动（未启用配置）本身就会清一次
+    //   regular 并顺带清理三个遗留作用域，那是既有语义，不属于本用例的断言对象。
+    const clearsDuringTest = env.clearCalls.length - clearsBefore;
+    t("R7-02-D 实际模式不是 fixed_servers 时不得清除 regular（clear 次数为 0）",
+      clearsDuringTest === 0,
+      "本用例期间 clear=" + JSON.stringify(env.clearCalls.slice(clearsBefore)) +
+      "；测试前已有 " + clearsBefore + " 次=" + JSON.stringify(env.clearCalls.slice(0, clearsBefore)));
+    t("R7-02-D 实际模式不是 fixed_servers 时不得下发代理（set 次数为 0）",
+      env.setCalls.length === 0, "set 序列=" + JSON.stringify(env.setCalls));
+    t("R7-02-D 实际模式不是 fixed_servers 时不得写任何状态",
+      env.stateWrites.length === writesBefore,
+      "新写入=" + JSON.stringify(env.stateWrites.slice(writesBefore)));
+    const stD = env.sessionStore.lastState || {};
+    t("R7-02-D 状态不得是 suspended / error",
+      stD.status !== "suspended" && stD.status !== "error", "lastState=" + JSON.stringify(stD));
+    t("R7-02-D 结果如实标记跳过对比，且不误报 restoreFailed",
+      !!(resp && resp.result && resp.result.compareSkipped === "not_fixed_servers") &&
+      !(resp && resp.result && resp.result.restoreFailed === true),
+      "compareSkipped=" + (resp && resp.result && resp.result.compareSkipped) +
+      "；restoreFailed=" + (resp && resp.result && resp.result.restoreFailed));
+  }
+
+  {
+    // R7-02-E：前台文案 —— 直接执行 popup.js 的真实渲染函数片段，而不是复述它的逻辑。
+    const popupSrc = fs.readFileSync(path.join(__dirname, "..", "popup.js"), "utf8");
+    const pctx = { el: { testResult: {} }, console: { log: function () {} } };
+    vm.createContext(pctx);
+    vm.runInContext(
+      popupSrc.slice(popupSrc.indexOf("function fmtExit"), popupSrc.indexOf("async function runTest")),
+      pctx
+    );
+    pctx.renderTest({
+      ok: true,
+      compareSkipped: "invalid_settings",
+      compareSkippedReason: "端口须为 1 至 65535 之间的整数",
+      exit: { ok: true, ip: DIRECT_IP },
+      settings: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "not-a-port" }
+    });
+    const htmlInvalid = pctx.el.testResult.innerHTML;
+    t("R7-02-E invalid_settings 文案明确告知未改动现有代理",
+      htmlInvalid.indexOf("未改动现有代理") >= 0, htmlInvalid);
+    t("R7-02-E invalid_settings 文案要求用户先修正设置",
+      htmlInvalid.indexOf("请先修正设置") >= 0, htmlInvalid);
+    t("R7-02-E invalid_settings 文案带出具体原因",
+      htmlInvalid.indexOf("端口须为 1 至 65535") >= 0, htmlInvalid);
+    t("R7-02-E invalid_settings 不渲染成恢复失败（现场未被破坏）",
+      htmlInvalid.indexOf("恢复原代理配置失败") < 0, htmlInvalid);
+    t("R7-02-E invalid_settings 不渲染成出口可疑",
+      htmlInvalid.indexOf("很可能未生效") < 0, htmlInvalid);
+
+    pctx.renderTest({
+      ok: true,
+      compareSkipped: "not_fixed_servers",
+      compareSkippedReason: "当前实际生效的代理模式是 direct，不是本扩展下发的 fixed_servers",
+      exit: { ok: true, ip: DIRECT_IP }
+    });
+    const htmlNotFixed = pctx.el.testResult.innerHTML;
+    t("R7-02-E not_fixed_servers 文案同样声明已跳过对比且未改动现有代理",
+      htmlNotFixed.indexOf("已跳过直连对比") >= 0 && htmlNotFixed.indexOf("未改动现有代理") >= 0,
+      htmlNotFixed);
+
+    // 防回归：三个既有 skip 取值的文案一字不变。
+    pctx.renderTest({ ok: true, compareSkipped: "unknown_control", exit: { ok: true, ip: DIRECT_IP } });
+    t("R7-02-E unknown_control 文案保持原样",
+      pctx.el.testResult.innerHTML.indexOf("无法确认当前代理控制权") >= 0,
+      pctx.el.testResult.innerHTML);
+    pctx.renderTest({ ok: true, compareSkipped: "control_changed_before_clear", exit: { ok: true, ip: DIRECT_IP } });
+    t("R7-02-E control_changed_before_clear 文案保持原样",
+      pctx.el.testResult.innerHTML.indexOf("未清除当前代理") >= 0,
+      pctx.el.testResult.innerHTML);
+    pctx.renderTest({ ok: true, compareSkipped: "not_controlled_by_this_extension", exit: { ok: true, ip: DIRECT_IP } });
+    t("R7-02-E not_controlled_by_this_extension 文案保持原样",
+      pctx.el.testResult.innerHTML.indexOf("已跳过直连对比以免影响它") >= 0,
+      pctx.el.testResult.innerHTML);
+  }
+
   console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);

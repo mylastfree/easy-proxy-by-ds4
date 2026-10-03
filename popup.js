@@ -161,6 +161,19 @@ function renderTest(result) {
   } else if (result.compareSkipped === "not_controlled_by_this_extension") {
     verdict = "ℹ 当前代理设置不由本扩展控制（被策略或其它扩展接管），已跳过直连对比以免影响它。";
     kind = "warn";
+  } else if (result.compareSkipped === "invalid_settings") {
+    // R7-02：配置无效时后台【根本没有进入对比窗口】，因此现有代理没有被清掉也不存在恢复问题。
+    //   文案必须说清"未改动现有代理"，否则用户会以为代理被这次测试搞坏了。
+    verdict = "ℹ 当前保存的代理配置不完整或无效，已跳过直连对比，未改动现有代理；请先修正设置。";
+    if (result.compareSkippedReason) verdict += "（" + result.compareSkippedReason + "）";
+    kind = "warn";
+  } else if (result.compareSkipped === "not_fixed_servers") {
+    verdict = "ℹ 当前实际生效的代理不是本扩展下发的配置，已跳过直连对比，未改动现有代理。";
+    if (result.compareSkippedReason) verdict += "（" + result.compareSkippedReason + "）";
+    kind = "warn";
+  } else if (result.compareSkipped === "unknown_active_mode") {
+    verdict = "ℹ 无法确认当前实际生效的代理配置，已跳过直连对比，未改动现有代理。";
+    kind = "warn";
   } else if (!result.exit || !result.exit.ok) {
     verdict = "✗ 出口检测失败。若已启用代理，说明流量可能无法出去——请检查代理地址与端口，或代理软件是否在运行。";
     kind = "error";

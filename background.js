@@ -441,7 +441,8 @@ async function runConnectionTest(compare) {
     exit: currentExit,
     direct: null,
     restoreFailed: false,
-    compareSkipped: null
+    compareSkipped: null,
+    compareSkippedReason: null
   };
 
   // 与窗口、下发前检查共用 isControllableByUs。
@@ -454,7 +455,36 @@ async function runConnectionTest(compare) {
       : "unknown_control";
   }
 
+  // 【R7-02】进入对比窗口之前的前置判据（核心原则：配置无效时，宁可不测，也不许动代理）。
+  //   窗口的第一步就是 clearProxyScope("regular")，而收尾的 applyProxyCore 会因为
+  //   validateSettings 失败直接返回 saved_not_applied —— 一次 set 都不会发出去。
+  //   于是"清除"与"恢复"严重不对称：仍在工作的旧代理被清掉，且永远不会被写回，
+  //   测试结束后浏览器里的代理变成 null（代理丢失且不恢复）。
+  //   因此进入对比之前必须同时确认两件事，任一不满足都直接早退：
+  //     (a) 存储里的配置本身有效 —— 否则收尾根本写不回去；
+  //     (b) chrome.proxy 里【当前实际生效】的配置确实是我方下发的 fixed_servers
+  //         —— 回读失败（value 缺失）同样是未知，未知不得清除。
+  //   before 正是"清除之前"对实际生效配置的那一次真实回读，因此这里的判据
+  //   恰好落在 clear 之前；窗口内原有的控制权复核继续承担 TOCTOU 防护。
+  //   这条早退【不写状态、不改图标、不清脏】：现场并没有被破坏，
+  //   状态应当保持测试前的真实结论，而不是被一次"什么都没做"的测试改写。
   if (compare && settings.enableProxy && controlledByUs) {
+    var entryErrors = S.validateSettings(settings);
+    var activeMode = before && before.value ? before.value.mode : null;
+    if (entryErrors.length) {
+      result.compareSkipped = "invalid_settings";
+      result.compareSkippedReason = entryErrors.join("；");
+    } else if (!activeMode) {
+      result.compareSkipped = "unknown_active_mode";
+      result.compareSkippedReason = "无法回读当前实际生效的代理配置";
+    } else if (activeMode !== "fixed_servers") {
+      result.compareSkipped = "not_fixed_servers";
+      result.compareSkippedReason = "当前实际生效的代理模式是 " + activeMode +
+        "，不是本扩展下发的 fixed_servers";
+    }
+  }
+
+  if (compare && settings.enableProxy && controlledByUs && !result.compareSkipped) {
     // 整个对比窗口作为一个【排他任务】排入与普通下发相同的串行队列（R3-01）。
     //   · 此前窗口内的 clear / 恢复都直接调用，与普通下发构成两条并行写路径；
     //     窗口期间保存的新端口会被恢复写回的旧 backup 反向覆盖，且此后没有任何
