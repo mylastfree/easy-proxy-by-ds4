@@ -14,6 +14,10 @@ const bgSrc = fs.readFileSync(path.join(__dirname, '..', 'background.js'), 'utf8
 const PROXY_EXIT_IP = "203.0.113.9";   // 走代理时的出口
 const DIRECT_EXIT_IP = "192.0.2.1";    // 直连时的出口
 
+// R3-05：background 会校验 sender.id === chrome.runtime.id，
+// 测试必须用真实形态的 sender（含 id），不能再用空对象。
+const SENDER_ID = "test-extension-id";
+
 function buildEnv(opts) {
   opts = opts || {};
   const slowPort = opts.slowPort || 0;       // 该端口的下发被刻意放慢
@@ -103,6 +107,9 @@ function buildEnv(opts) {
   sandbox.chrome = {
     runtime: {
       lastError: undefined,
+      // R3-05 起 background 会校验 sender.id；测试模拟必须提供真实形态的 sender，
+      // 否则内部消息会被拒绝（用 {} 当 sender 属于欠保真的模拟）。
+      id: SENDER_ID,
       onInstalled: { addListener: f => listeners.installed.push(f) },
       onStartup: { addListener: f => listeners.startup.push(f) },
       onMessage: { addListener: f => listeners.message.push(f) }
@@ -211,7 +218,7 @@ function t(name, cond, extra) {
     // 直接调用 testConnection（compare = true）
     const handler = env.listeners.message[0];
     const resp = await new Promise(resolve => {
-      handler({ action: "testConnection", compare: true }, {}, resolve);
+      handler({ action: "testConnection", compare: true }, { id: SENDER_ID }, resolve);
     });
 
     const directIp = resp && resp.result && resp.result.direct && resp.result.direct.ip;

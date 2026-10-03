@@ -10,6 +10,10 @@ const vm = require("node:vm");
 const path = require("node:path");
 
 const ROOT = path.join(__dirname, "..");
+
+// R3-05：background 会校验 sender.id === chrome.runtime.id，
+// 测试必须用真实形态的 sender（含 id），不能再用空对象。
+const SENDER_ID = "test-extension-id";
 const settingsSrc = fs.readFileSync(path.join(ROOT, "settings.js"), "utf8");
 const bgSrc = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
 
@@ -19,6 +23,12 @@ function buildEnv(opts) {
   const listeners = { changed: [], message: [] };
   const setCalls = [];          // 每次 setProxy 的主机:端口
   let proxyActive = false;
+  // 记录「当前实际生效的代理配置」，供 R3-01 的行为断言使用。
+  // 断言对象必须是【下发给 chrome.proxy 的配置】，而不是存储值或内部变量 ——
+  // 本项目 A1、N1 两次缺陷都是「存储一直正确、浏览器实际失效」，查存储永远发现不了。
+  let effective = null;         // null 表示当前无代理（直连）
+  const iconCalls = [];         // setIcon 收到的图标路径
+  const titleCalls = [];        // setTitle 收到的标题
   const fetchDelay = opts.fetchDelay || 120;
 
   function makeArea(store, areaName) {
@@ -62,7 +72,7 @@ function buildEnv(opts) {
     });
   };
 sandbox.chrome = {
-    runtime: { lastError: undefined,
+    runtime: { lastError: undefined, id: SENDER_ID,
       onInstalled: { addListener: function(){} }, onStartup: { addListener: function(){} },
       onMessage: { addListener: function (f) { listeners.message.push(f); } } },
     storage: { sync: makeArea(syncStore, "sync"), local: makeArea(localStore, "local"),
@@ -73,24 +83,60 @@ sandbox.chrome = {
         set: function (o, cb) {
           const sp = (o.value.rules || {}).singleProxy || {};
           setCalls.push(sp.host + ":" + sp.port);
-          setTimeout(function () { proxyActive = true; sandbox.chrome.runtime.lastError = undefined; if (cb) cb(); }, 0);
+          setTimeout(function () {
+            proxyActive = true;
+            effective = sp.host + ":" + sp.port;
+            sandbox.chrome.runtime.lastError = undefined; if (cb) cb();
+          }, 0);
         },
         clear: function (o, cb) {
-          setTimeout(function () { if (o.scope === "regular") proxyActive = false; sandbox.chrome.runtime.lastError = undefined; if (cb) cb(); }, 0);
+          setTimeout(function () {
+            if (opts.clearFails) {
+              sandbox.chrome.runtime.lastError = { message: "clear failed (injected)" };
+              if (cb) cb();
+              sandbox.chrome.runtime.lastError = undefined;
+              return;
+            }
+            if (o.scope === "regular") { proxyActive = false; effective = null; }
+            sandbox.chrome.runtime.lastError = undefined; if (cb) cb();
+          }, 0);
         },
         get: function (o, cb) {
-          setTimeout(function () { cb({ value: { mode: "fixed_servers" }, levelOfControl: "controlled_by_this_extension" }); }, 0);
+          if (opts.getFails) {
+            // 故障注入：回读控制权失败（lastError 置位 + 回调 undefined）
+            setTimeout(function () {
+              sandbox.chrome.runtime.lastError = { message: "get failed (injected)" };
+              cb(undefined);
+              sandbox.chrome.runtime.lastError = undefined;
+            }, 0);
+            return;
+          }
+          // 返回「当前真实生效」的完整配置，而不是只返回 mode。
+          // 只返回 mode 会让测试里的 backup 丢失 rules，恢复阶段写回一个
+          // 没有 singleProxy 的配置 —— 那属于 mock 欠保真，会掩盖真实的端口差异。
+          var value;
+          if (effective !== null) {
+            var parts = effective.split(":");
+            value = { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: parts[0], port: parts[1] } } };
+          } else {
+            value = { mode: "direct" };
+          }
+          setTimeout(function () { cb({ value: value, levelOfControl: "controlled_by_this_extension" }); }, 0);
         }
       },
       onProxyError: { addListener: function(){} }
     },
-    action: { setIcon: function (o, cb) { setTimeout(function(){ if(cb) cb(); }, 0); },
-              setTitle: function (o, cb) { setTimeout(function(){ if(cb) cb(); }, 0); } }
+    action: {
+      setIcon: function (o, cb) { iconCalls.push(o.path && o.path["16"]); setTimeout(function(){ if(cb) cb(); }, 0); },
+      setTitle: function (o, cb) { titleCalls.push(o.title); setTimeout(function(){ if(cb) cb(); }, 0); }
+    }
   };
 
   vm.createContext(sandbox);
   vm.runInContext(bgSrc, sandbox);
-  return { sandbox: sandbox, syncStore: syncStore, setCalls: setCalls, listeners: listeners };
+  return { sandbox: sandbox, syncStore: syncStore, sessionStore: sessionStore,
+           setCalls: setCalls, listeners: listeners, iconCalls: iconCalls, titleCalls: titleCalls,
+           getEffective: function () { return effective; } };
 }
 
 const sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
@@ -103,7 +149,8 @@ function t(name, cond, extra) {
 const BASE = { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", bypassList: "x" };
 
 function ask(handler, msg) {
-  return new Promise(function (r) { handler(msg, {}, r); });
+  // 真实形态的 sender：R3-05 后 background 会校验 sender.id。
+  return new Promise(function (r) { handler(msg, { id: SENDER_ID }, r); });
 }
 
 (async function main() {
@@ -170,6 +217,205 @@ function ask(handler, msg) {
     await sleep(400);
     t("单个测试后下发正常", env.setCalls.indexOf("127.0.0.1:6666") >= 0,
       JSON.stringify(env.setCalls));
+  }
+
+  // ---- R3-01：直连对比测试期间保存的新配置被静默丢弃 ----
+  // 断言对象是【实际下发给 chrome.proxy 的配置】(env.getEffective)，
+  // 而不是存储值 —— 存储值在这种缺陷下一直是正确的。
+  console.log("");
+  console.log("== R3-01: 对比测试期间保存的新端口，测试结束后必须真正下发到浏览器 ==");
+  {
+    const env = buildEnv({ fetchDelay: 200 });
+    await sleep(60);
+    env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
+    await sleep(300);
+    env.setCalls.length = 0;
+
+    const handler = env.listeners.message[0];
+    // 在第 2 次 fetch（取「直连出口」）进行中保存新端口：这正是被丢弃的窗口
+    let n = 0;
+    const origFetch = env.sandbox.fetch;
+    env.sandbox.fetch = function () {
+      n++;
+      if (n === 2) {
+        setTimeout(function () {
+          env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "7777" }), function () {});
+        }, 0);
+      }
+      return origFetch.apply(this, arguments);
+    };
+
+    await ask(handler, { action: "testConnection", compare: true });
+    await sleep(400);
+
+    t("测试期间保存 7777 后，存储中确实是 7777（前置条件）",
+      env.syncStore.proxyPort === "7777", String(env.syncStore.proxyPort));
+    t("测试期间保存 7777 后，浏览器实际生效的配置也是 7777",
+      env.getEffective() === "127.0.0.1:7777",
+      "实际生效 = " + env.getEffective() + "；setProxy 调用序列 = " + JSON.stringify(env.setCalls));
+  }
+
+  console.log("");
+  console.log("== R3-01b: 对比测试期间【关闭代理】，测试结束后必须真的回到直连 ==");
+  {
+    const env = buildEnv({ fetchDelay: 200 });
+    await sleep(60);
+    env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
+    await sleep(300);
+    env.setCalls.length = 0;
+
+    const handler = env.listeners.message[0];
+    let n = 0;
+    const origFetch = env.sandbox.fetch;
+    env.sandbox.fetch = function () {
+      n++;
+      if (n === 2) {
+        setTimeout(function () {
+          env.sandbox.chrome.storage.sync.set({ enableProxy: false }, function () {});
+        }, 0);
+      }
+      return origFetch.apply(this, arguments);
+    };
+
+    await ask(handler, { action: "testConnection", compare: true });
+    await sleep(400);
+
+    t("测试期间关闭代理后，存储中 enableProxy 为 false（前置条件）",
+      env.syncStore.enableProxy === false, String(env.syncStore.enableProxy));
+    t("测试期间关闭代理后，浏览器已不再走代理（不得被旧 backup 反向恢复）",
+      env.getEffective() === null,
+      "实际生效 = " + env.getEffective() + "（null 表示已直连）；setProxy 调用序列 = " + JSON.stringify(env.setCalls));
+  }
+
+  // ---- R3-04/R3-07：故障注入与状态链路（断言状态与图标，而非内部变量）----
+  console.log("");
+  console.log("== R3-04a: 控制权回读失败时，不得显示 applied 绿灯 ==");
+  {
+    const env = buildEnv({ getFails: true });
+    await sleep(60);
+    env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
+    await sleep(300);
+
+    var st = env.sessionStore.lastState || {};
+    t("回读失败时状态不是 applied",
+      st.status !== "applied",
+      "lastState = " + JSON.stringify(st));
+    t("回读失败时状态为 error 且有说明",
+      st.status === "error" && !!st.message,
+      "lastState = " + JSON.stringify(st));
+    t("回读失败时图标不是绿色",
+      env.iconCalls[env.iconCalls.length - 1] !== "icon-green-16.png",
+      "最后图标 = " + env.iconCalls[env.iconCalls.length - 1]);
+  }
+
+  console.log("");
+  console.log("== R3-04b: 关闭代理时 clear 失败，必须返回明确错误而不是假装成功 ==");
+  {
+    const env = buildEnv({ clearFails: true });
+    await sleep(60);
+    env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
+    await sleep(250);
+    env.sessionStore.lastState = undefined;
+
+    env.sandbox.chrome.storage.sync.set({ enableProxy: false }, function () {});
+    await sleep(300);
+
+    var st2 = env.sessionStore.lastState || {};
+    t("clear 失败时状态不是 direct（不得假装已直连）",
+      st2.status !== "direct",
+      "lastState = " + JSON.stringify(st2));
+    t("clear 失败时状态为 error 且有说明",
+      st2.status === "error" && !!st2.message,
+      "lastState = " + JSON.stringify(st2));
+    t("clear 失败时图标不是绿色",
+      env.iconCalls[env.iconCalls.length - 1] !== "icon-green-16.png",
+      "最后图标 = " + env.iconCalls[env.iconCalls.length - 1]);
+  }
+
+  console.log("");
+  console.log("== R3-07: 测试暂停期间必须产生可观测的 suspended 状态与标题 ==");
+  {
+    const env = buildEnv({ fetchDelay: 250 });
+    await sleep(60);
+    env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
+    await sleep(250);
+    env.sessionStore.lastState = undefined;
+    env.titleCalls.length = 0;
+
+    const handler = env.listeners.message[0];
+    const p1 = ask(handler, { action: "testConnection", compare: true });
+    // 暂停窗口 = 第 [1] 次 fetch 结束（约 +250ms）到第 [2] 次 fetch 结束（约 +500ms）。
+    // 必须落在这个窗口内，否则 storage 变化会走正常下发而不是 suspended 分支。
+    await sleep(320);
+    env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10810" }), function () {});
+    await sleep(80);
+
+    var during = env.sessionStore.lastState || {};
+    t("暂停期间写入了 suspended 状态",
+      during.status === "suspended",
+      "暂停期间 lastState = " + JSON.stringify(during));
+    t("暂停期间 setTitle 收到 suspended 文案（不是兜底的“代理设置”）",
+      env.titleCalls.indexOf("代理设置") < 0 &&
+      env.titleCalls.some(function (x) { return /暂缓下发/.test(String(x)); }),
+      "setTitle 序列 = " + JSON.stringify(env.titleCalls));
+    await p1;
+  }
+
+  console.log("");
+  console.log("== R3-05: 非本扩展来源的消息必须被拒绝（不得触发下发）==");
+  {
+    const env = buildEnv({});
+    await sleep(60);
+    env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
+    await sleep(250);
+    env.setCalls.length = 0;
+
+    const handler = env.listeners.message[0];
+    const foreign = await new Promise(function (r) {
+      handler({ action: "reapply" }, { id: "some-other-extension" }, r);
+    });
+    await sleep(200);
+
+    t("外部来源的 reapply 被拒绝",
+      !!(foreign && foreign.ok === false),
+      "响应 = " + JSON.stringify(foreign));
+    t("外部来源的消息没有触发任何下发",
+      env.setCalls.length === 0,
+      "setProxy 序列 = " + JSON.stringify(env.setCalls));
+
+    const missing = await new Promise(function (r) { handler({ action: "reapply" }, {}, r); });
+    t("缺失 sender 的消息被拒绝",
+      !!(missing && missing.ok === false),
+      "响应 = " + JSON.stringify(missing));
+
+    const own = await new Promise(function (r) { handler({ action: "reapply" }, { id: SENDER_ID }, r); });
+    t("本扩展自己的消息仍被正常处理",
+      !!(own && own.ok === true),
+      "响应 = " + JSON.stringify(own));
+  }
+
+  console.log("");
+  console.log("== R3-03: 并发拒绝必须渲染成“已有测试在进行中”，不是“出口检测失败” ==");
+  {
+    // 直接执行 popup.js 的真实渲染函数片段，而不是复述它的逻辑。
+    const popupSrc = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
+    const p = { el: { testResult: {} }, console: { log: function () {} } };
+    vm.createContext(p);
+    vm.runInContext(
+      popupSrc.slice(popupSrc.indexOf("function fmtExit"), popupSrc.indexOf("async function runTest")),
+      p
+    );
+
+    p.renderTest({ ok: false, skipped: "in_flight", message: "已有测试在进行中，请稍候再试" });
+    const html = p.el.testResult.innerHTML;
+    t("并发拒绝渲染含“已有测试”提示", html.indexOf("已有测试") >= 0, html);
+    t("并发拒绝不再渲染成“出口检测失败”", html.indexOf("出口检测失败") < 0, html);
+
+    // 对照组：真正的出口失败仍必须显示网络故障文案，不能被这次修复顺手改掉。
+    p.renderTest({ ok: true, exit: { ok: false, error: "timeout" } });
+    const html2 = p.el.testResult.innerHTML;
+    t("真正的出口失败仍显示“出口检测失败”（未被误改）",
+      html2.indexOf("出口检测失败") >= 0, html2);
   }
 
   console.log("");

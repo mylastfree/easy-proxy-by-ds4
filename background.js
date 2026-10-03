@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.2.0]
+// background.js —— MV3 Service Worker  [v2.3.0]
 importScripts("settings.js");
 
 var S = self.EasyProxy;
@@ -73,11 +73,13 @@ function setProxy(config) {
   });
 }
 
+// 清除失败必须让调用者知道：此前无论成功失败都 resolve，
+// 导致"清除没生效"被当成"已清干净"，后续判断全部建立在错误前提上（R3-04）。
 function clearProxyScope(scope) {
-  return new Promise(function (resolve) {
+  return new Promise(function (resolve, reject) {
     chrome.proxy.settings.clear({ scope: scope }, function () {
-      void chrome.runtime.lastError;
-      resolve();
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve();
     });
   });
 }
@@ -102,6 +104,8 @@ function updateIcon(status) {
     direct: '未启用代理（直连）',
     saved_not_applied: '已保存，尚未生效',
     overridden: '代理设置被外部接管',
+    // 缺少该键时，标题会退化为兜底的「代理设置」，用户看不出正在暂停下发。
+    suspended: '连接测试进行中，暂缓下发（结束后自动恢复）',
     error: '代理异常，可能已回退直连'
   };
   chrome.action.setTitle({ title: titles[status] || "代理设置" }, function () {
@@ -161,15 +165,36 @@ var applyGeneration = 0;
 // 计数器则天然可重入：进入 +1、退出 -1，无论怎样交错，最终必然归零。
 var suspendDepth = 0;
 
+// 暂停期间是否发生过「被跳过的下发请求」。
+// 计数器只保证"以后还能下发"，不保证"暂停期间被跳过的更新会被补上"；
+// 因此必须单独记脏，退出暂停后按最新 settings 重放（R3-01）。
+var suspendDirty = false;
+
 async function applyProxy() {
-  if (suspendDepth > 0) return { ok: true, status: "suspended" };
+  // 暂停期间不得静默丢弃本次请求：
+  // 只 return 会让「测试期间保存的新配置」永远不下发 —— 界面与存储显示新端口，
+  // 浏览器却仍在用旧配置，且没有任何报错（R3-01）。
+  // 这里记脏，由测试的恢复阶段结束后按【最新 settings】重新下发一次。
+  if (suspendDepth > 0) {
+    suspendDirty = true;
+    updateIcon("suspended");
+    writeState({ status: "suspended", at: Date.now() });
+    return { ok: true, status: "suspended" };
+  }
 
   var settings = await readSettings();
   settings.bypassList = await readBypassText();
 
   // 1) 未启用：清除常规作用域
   if (!settings.enableProxy) {
-    await clearProxyScope("regular");
+    try {
+      await clearProxyScope("regular");
+    } catch (clearErr) {
+      var cmsg = (clearErr && clearErr.message) || String(clearErr);
+      updateIcon("error");
+      writeState({ status: "error", message: "清除代理设置失败：" + cmsg, at: Date.now() });
+      return { ok: false, status: "error", errors: [cmsg] };
+    }
     updateIcon("direct");
     writeState({ status: "direct", at: Date.now() });
     return { ok: true, status: "direct" };
@@ -183,9 +208,14 @@ async function applyProxy() {
     return { ok: false, status: "saved_not_applied", errors: errors };
   }
 
-  // 3) 清理旧版遗留作用域
+  // 3) 清理旧版遗留作用域。
+  //    这一步是尽力而为的降级清理：失败不影响本次下发，但必须有记录，不能静默吞掉。
   for (var i = 0; i < LEGACY_SCOPES.length; i++) {
-    await clearProxyScope(LEGACY_SCOPES[i]);
+    try {
+      await clearProxyScope(LEGACY_SCOPES[i]);
+    } catch (legacyErr) {
+      console.warn("清理遗留作用域失败（不影响本次下发）:", LEGACY_SCOPES[i], legacyErr);
+    }
   }
 
   // 4) 原生 fixed_servers 下发（不生成 PAC 脚本）
@@ -213,7 +243,18 @@ async function applyProxy() {
 
   // 5) 回读控制等级，识别被策略或其它扩展接管的场景
   var details = await readProxyDetails();
-  var level = details ? details.levelOfControl : null;
+
+  // 回读失败（details 为 null）意味着"下发调用返回了成功，但我们无法确认控制权"。
+  // 这种情况下显示绿色 applied 是在宣称一个未经证实的结论（R3-04）：
+  // 必须判为 error，让用户看到"状态未知"而不是"已生效"。
+  if (!details) {
+    var rmsg = "无法回读代理设置，不能确认代理是否已生效";
+    updateIcon("error");
+    writeState({ status: "error", message: rmsg, at: Date.now() });
+    return { ok: false, status: "error", errors: [rmsg] };
+  }
+
+  var level = details.levelOfControl;
   if (level && level !== 'controlled_by_this_extension') {
     updateIcon("overridden");
     writeState({ status: "overridden", levelOfControl: level, at: Date.now() });
@@ -306,18 +347,53 @@ async function runConnectionTest(compare) {
     // try/finally 保证即使中途抛错也一定递减。
     suspendDepth++;
     try {
-      await clearProxyScope("regular");
+      try {
+        await clearProxyScope("regular");
+      } catch (directClearErr) {
+        // 清除失败就无法取得可信的直连出口，必须如实标记，不能假装测过直连。
+        result.directClearFailed = (directClearErr && directClearErr.message) || String(directClearErr);
+      }
       result.direct = await fetchExit();
     } finally {
       suspendDepth--;
       if (suspendDepth < 0) suspendDepth = 0;   // 防御性归零，避免异常路径下变负
-      try {
-        if (backup) await setProxy(backup);
-        else await clearProxyScope("regular");
-      } catch (restoreErr) {
-        result.restoreFailed = true;
-        // 尽力恢复：按当前设置重新下发一次（绕过串行队列，确保立即执行）
-        try { await applyProxy(); } catch (e2) {}
+
+      // 恢复阶段第一步：复核控制权。
+      // 若对比期间代理已被企业策略或其它扩展接管，写回旧 backup 等同于夺权，
+      // 必须直接放弃写回，只如实记录状态。
+      var controlNow = await readProxyDetails();
+      var levelNow = controlNow ? controlNow.levelOfControl : null;
+      var takenExternally = !!(levelNow &&
+        levelNow !== "controlled_by_this_extension" &&
+        levelNow !== "controllable_by_this_extension");
+
+      if (takenExternally) {
+        suspendDirty = false;
+        result.overriddenDuringTest = levelNow;
+        writeState({ status: "overridden", levelOfControl: levelNow, at: Date.now() });
+        updateIcon("overridden");
+      } else {
+        try {
+          if (backup) await setProxy(backup);
+          else await clearProxyScope("regular");
+        } catch (restoreErr) {
+          result.restoreFailed = true;
+          // 尽力恢复：按当前设置重新下发一次（绕过串行队列，确保立即执行）
+          try { await applyProxy(); } catch (e2) {}
+        }
+
+        // 恢复阶段第二步：重放暂停期间被跳过的更新（R3-01）。
+        // 上面的恢复写回的是【测试前的旧配置】；若用户在这期间改过端口或关闭了代理，
+        // 旧备份会把它反向覆盖，且此后不再有 storage 变化事件来纠正，
+        // 于是界面/存储与实际长期不一致且无任何报错。这里按最新 settings 重新下发。
+        if (suspendDirty && suspendDepth === 0) {
+          suspendDirty = false;
+          try {
+            await applyProxy();
+          } catch (e3) {
+            console.warn("重放暂停期间的设置变更失败:", e3);
+          }
+        }
       }
     }
 
@@ -410,6 +486,15 @@ chrome.storage.onChanged.addListener(function (changes, areaName) {
 
 chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
   if (!request) return;
+
+  // 来源校验（R3-05）：只处理本扩展自身发出的消息。
+  // 说明：跨扩展通信走 chrome.runtime.onMessageExternal（本项目未注册），
+  // 普通网页也无法进入内部通道，因此这里不存在已证的利用链 —— 它是有意为之的
+  // 纵深防御：内部通道不该因为"目前没人能打通"就完全不校验来源。
+  if (!sender || sender.id !== chrome.runtime.id) {
+    sendResponse({ ok: false, error: "unauthorized_sender" });
+    return;
+  }
 
   if (request.action === "getStatus") {
     chrome.storage.session.get(["lastState", "lastTest"], function (items) {

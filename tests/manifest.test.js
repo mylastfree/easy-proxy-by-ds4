@@ -36,6 +36,20 @@ t("description 非空且不超过 132 字符",
 t("声明了 minimum_chrome_version", typeof mf.minimum_chrome_version === "string");
 
 console.log("");
+console.log("== 发布一致性：manifest.version 与 CHANGELOG 首条必须对齐 ==");
+{
+  // R3-02：tag v2.2.1 与 manifest 2.2.0 错位的教训 —— 发布标签、清单版本与
+  // 变更记录三者不一致时，追溯和"用户到底装到哪个版本"都会失真。
+  // 这里只校验可机读的两端（清单 vs 变更记录）；Git tag 语义由发布流程把关。
+  const changelog = read("CHANGELOG.md");
+  const firstEntry = (changelog.match(/^## \[([^\]]+)\]/m) || [])[1] || "";
+  t("CHANGELOG 首条版本号符合 X.Y.Z 格式",
+    /^\d+\.\d+\.\d+$/.test(firstEntry), "首条 = " + JSON.stringify(firstEntry));
+  t("manifest.version 与 CHANGELOG 首条版本一致",
+    firstEntry === mf.version, "manifest=" + mf.version + " / CHANGELOG=" + firstEntry);
+}
+
+console.log("");
 console.log("== 权限最小化 ==");
 const perms = (mf.permissions || []).slice().sort();
 t("权限恰为 proxy + storage",

@@ -1,4 +1,4 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.2.0]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.3.0]
 var S = window.EasyProxy;
 
 var el = {
@@ -130,8 +130,24 @@ function renderTest(result) {
   var verdict = "";
   var kind = "warn";
 
-  if (result.restoreFailed) {
+  // 后台返回的 {ok:false} 有两类含义完全不同的情况，必须分开渲染：
+  //   1) 带 skipped 的并发互斥拒绝 —— 功能本身正常，只是"已有测试在跑"，
+  //      此前被渲染成"出口检测失败"，把用户引去排查代理（R3-03）；
+  //   2) 真正的错误 —— 需要如实显示原因。
+  if (result.ok === false && result.skipped) {
+    verdict = "ℹ " + (result.message || "已有测试在进行中，请稍候再试。");
+    kind = "warn";
+  } else if (result.ok === false) {
+    verdict = "✗ " + (result.message || "出口检测未能完成，请稍后重试。");
+    kind = "error";
+  } else if (result.restoreFailed) {
     verdict = "⚠ 对比后恢复原代理配置失败，请重新保存一次设置以恢复。";
+    kind = "error";
+  } else if (result.overriddenDuringTest) {
+    verdict = "⚠ 对比期间代理设置被外部接管（" + result.overriddenDuringTest + "），已放弃写回以免夺权，请检查企业策略或其它扩展。";
+    kind = "warn";
+  } else if (result.directClearFailed) {
+    verdict = "⚠ 对比时清除代理失败，本次「直连出口」不可信：" + result.directClearFailed;
     kind = "error";
   } else if (result.compareSkipped === "not_controlled_by_this_extension") {
     verdict = "ℹ 当前代理设置不由本扩展控制（被策略或其它扩展接管），已跳过直连对比以免影响它。";

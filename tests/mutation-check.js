@@ -45,12 +45,15 @@ const eol = {
   set: detectEol(originals.set)
 };
 
-// 只要有一个测试文件失败，就认为变异被拦截
+// 只要有一个测试文件失败，就认为变异被拦截。
+// 返回值语义：0 = 全部通过；正数 = 断言失败（该测试文件的退出码）；
+// -1 = 进程启动失败（spawn 失败/被信号杀死），与断言失败必须区分开。
 function runTest() {
   for (const f of testFiles) {
     const r = spawnSync(process.execPath, [f], {
       stdio: ["ignore", "ignore", "ignore"]
     });
+    if (r.error) return -1;
     const code = r.status === null ? -1 : r.status;
     if (code !== 0) return code;
   }
@@ -89,6 +92,15 @@ const mutations = [
     expectFail: true
   },
   {
+    // R3-01 的护栏：暂停期间记脏后必须按最新 settings 重放。
+    // 去掉重放逻辑后，concurrency.test.js 的 R3-01 行为断言必须变红。
+    name: "M9 去掉暂停期脏标记重放（R3-01 回归）",
+    target: "bg",
+    from: "        if (suspendDirty && suspendDepth === 0) {\n",
+    to: "        if (false) {\n",
+    expectFail: true
+  },
+  {
     name: "M8 去掉测试并发互斥（testInFlight 判断失效）",
     target: "bg",
     from: "  if (testInFlight) {\n",
@@ -118,7 +130,22 @@ const mutations = [
   }
 ];
 
-console.log("基线（未变异）：退出码 = " + runTest());
+// 基线校验（R3-06）：
+//   若基线本身已经失败，runTest() 在【每个】变异下都会返回非 0，
+//   于是「所有变异都被拦截」这一结论完全虚假 —— 门禁会静默变成永远放行。
+//   因此基线非 0 必须立即中止，约定退出码 3。
+const baselineCode = runTest();
+if (baselineCode === -1) {
+  console.error("基线（未变异）：测试进程启动失败（退出码 -1），无法执行变异测试。");
+  console.error("请先确认 node 可用且 tests/ 下的测试文件存在。立即中止。");
+  process.exit(3);
+}
+if (baselineCode !== 0) {
+  console.error("基线（未变异）：退出码 = " + baselineCode + "（测试本身已失败）。");
+  console.error("基线失败时每个变异都会呈现为「已被拦截」，变异结果无意义。立即中止。");
+  process.exit(3);
+}
+console.log("基线（未变异）：退出码 = 0（测试全绿，变异结果可信）");
 console.log("");
 
 const rows = [];

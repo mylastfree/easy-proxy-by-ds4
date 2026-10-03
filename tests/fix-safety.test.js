@@ -6,6 +6,10 @@ const path = require('node:path');
 const settingsSrc = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8');
 const bgSrc = fs.readFileSync(path.join(__dirname, '..', 'background.js'), 'utf8');
 
+// R3-05：background 会校验 sender.id === chrome.runtime.id，
+// 测试必须用真实形态的 sender（含 id），不能再用空对象。
+const SENDER_ID = "test-extension-id";
+
 function buildEnv(opts) {
   opts = opts || {};
   const syncStore = {}, localStore = {}, sessionStore = {};
@@ -63,6 +67,8 @@ function buildEnv(opts) {
 
   sandbox.chrome = {
     runtime: { lastError: undefined,
+      // R3-05 起 background 会校验 sender.id；用 {} 当 sender 属于欠保真的模拟。
+      id: SENDER_ID,
       onInstalled: { addListener: f => listeners.installed.push(f) },
       onStartup: { addListener: f => listeners.startup.push(f) },
       onMessage: { addListener: f => listeners.message.push(f) } },
@@ -125,7 +131,7 @@ function t(name, cond, extra) {
     await sleep(200);
 
     const handler = env.listeners.message[0];
-    await new Promise(r => handler({ action: "testConnection", compare: true }, {}, r));
+    await new Promise(r => handler({ action: "testConnection", compare: true }, { id: SENDER_ID }, r));
     await sleep(120);
 
     env.applied.length = 0;
@@ -145,7 +151,7 @@ function t(name, cond, extra) {
       proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "x" }, () => {});
     await sleep(200);
     const handler = env.listeners.message[0];
-    await new Promise(r => handler({ action: "testConnection", compare: true }, {}, r));
+    await new Promise(r => handler({ action: "testConnection", compare: true }, { id: SENDER_ID }, r));
     await sleep(150);
 
     env.applied.length = 0;
