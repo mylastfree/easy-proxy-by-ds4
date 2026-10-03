@@ -182,7 +182,17 @@ async function applyProxy() {
     return { ok: true, status: "suspended" };
   }
 
-  return applyProxyCore();
+  // 【R6-03】普通成功路径也必须消费脏标记。
+  //   此前清脏点只在对比窗口的收尾（以及它内部的兜底重放），普通下发成功时不清 ——
+  //   于是一次"接管期间记脏、接管解除后重放成功"的链条会把 dirty 留给后续窗口，
+  //   使一次用户根本没改配置的对比测试报出"有配置变更待下发"（误报）。
+  //   这里只在【确认成功终态】时清：error / saved_not_applied / overridden 都不算，
+  //   它们要么这次没写下去（overridden），要么写下去也没生效，仍需保留脏标记。
+  var core = await applyProxyCore();
+  if (core && core.ok === true && core.status !== "overridden") {
+    suspendDirty = false;
+  }
+  return core;
 }
 
 // 真正的下发实现，【不含】暂停检查。
@@ -234,7 +244,10 @@ async function applyProxyCore() {
   var preLevel = pre ? pre.levelOfControl : null;
   if (preLevel && !isControllableByUs(preLevel)) {
     updateIcon("overridden");
-    writeState({ status: "overridden", levelOfControl: preLevel, at: Date.now() });
+    // 【R6-03】带上 pendingResubmit：该分支写下的 overridden 会覆盖对比窗口写下的
+    //   带 pending 的状态（session 写入是"先发布后覆盖"）。若这里丢掉该字段，
+    //   用户在暂停期改的配置就彻底不可见，与 R3-01 的"静默丢弃"同型。
+    writeState({ status: "overridden", levelOfControl: preLevel, pendingResubmit: suspendDirty, at: Date.now() });
     return { ok: true, status: "overridden", levelOfControl: preLevel };
   }
 
@@ -287,7 +300,8 @@ async function applyProxyCore() {
       return { ok: false, status: "error", errors: [umsg] };
     }
     updateIcon("overridden");
-    writeState({ status: "overridden", levelOfControl: level, at: Date.now() });
+    // 【R6-03】同 C-5a：回读后才发现被接管，同样必须如实带上"仍有待下发"。
+    writeState({ status: "overridden", levelOfControl: level, pendingResubmit: suspendDirty, at: Date.now() });
     return { ok: true, status: "overridden", levelOfControl: level };
   }
 

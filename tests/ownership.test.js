@@ -601,6 +601,50 @@ function t(name, cond, extra) {
   }
 
   console.log("");
+  console.log("== R6-03：普通成功下发必须消费脏标记，不得跨窗口遗留 ==");
+  {
+    const env = buildEnv({ fetchDelay: 20 });
+    await drain(env);
+    // 制造一个真实的遗留脏标记：直接置位（其可产生性由 02 探针-G3 证明，
+    //   本用例只验证"消费"这一环）。
+    env.sandbox.suspendDirty = true;
+
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "5555" }));
+    await drain(env);
+
+    t("下发确实成功（前置事实）",
+      env.getEffective() === "127.0.0.1:5555", "实际=" + env.getEffective());
+    t("普通成功下发后必须清掉脏标记（否则跨窗口误报待下发）",
+      env.sandbox.suspendDirty === false,
+      "dirty=" + env.sandbox.suspendDirty + "；lastState=" + JSON.stringify(env.sessionStore.lastState));
+    const st = env.sessionStore.lastState || {};
+    t("普通成功下发后状态为 applied（前置事实）", st.status === "applied", JSON.stringify(st));
+  }
+
+  {
+    // 场景：我方已被外部接管，此时普通下发走 overridden 早退分支。
+    //   若该分支写状态时不带 pendingResubmit，会把窗口写下的"有变更待下发"覆盖掉。
+    const env = buildEnv({ fetchDelay: 20 });
+    await drain(env);
+    env.setGetHook((n, o, cb) => {
+      setTimeout(() => cb({
+        value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
+        levelOfControl: "controlled_by_other_extensions"
+      }), 0);
+    });
+    env.sandbox.suspendDirty = true;
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "4444" }));
+    await drain(env);
+
+    const st = env.sessionStore.lastState || {};
+    t("外部接管时状态为 overridden（前置事实）",
+      st.status === "overridden", JSON.stringify(st));
+    t("被接管时不得把待下发标记从状态里抹掉",
+      st.pendingResubmit === true,
+      "lastState=" + JSON.stringify(st));
+  }
+
+  console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);
 })().catch(e => { console.error("EXC: " + (e && e.stack || e)); process.exit(2); });
