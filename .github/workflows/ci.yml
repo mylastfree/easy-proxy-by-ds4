@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 只读权限即可：CI 不写回仓库，也不需要访问 secrets
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 测试与校验
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # 本项目零依赖，无需 npm install —— 直接跑测试
+      - name: 语法校验
+        run: |
+          set -e
+          for f in settings.js background.js popup.js; do
+            node --check "$f"
+            echo "OK   $f"
+          done
+          for f in tests/*.js; do
+            node --check "$f"
+            echo "OK   $f"
+          done
+
+      - name: 清单与文件引用校验
+        run: node tests/manifest.test.js
+
+      - name: 纯函数测试
+        run: node tests/settings.test.js
+
+      - name: 异步逻辑测试（并发竞态护栏）
+        run: node tests/background.test.js
+
+      - name: 修复安全性测试
+        run: node tests/fix-safety.test.js
+
+      - name: 变异测试（验证护栏测试真的会拦截回归）
+        run: node tests/mutation-check.js
+
+      # 变异测试会临时改写源文件；若未正确还原，后续步骤会失败。
+      # 这里显式核验工作区洁净，守住这一约束。
+      - name: 核验变异测试后工作区未被污染
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::变异测试后工作区存在改动，说明测试未正确还原文件"
+            git status --porcelain
+            exit 1
+          fi
+          echo "工作区洁净"
+
+      - name: 汇总
+        if: always()
+        run: echo "Node ${{ matrix.node-version }} 全部检查完成"

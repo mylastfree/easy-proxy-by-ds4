@@ -1,5 +1,8 @@
 # Easy Proxy by DS4
 
+[![CI](https://github.com/mylastfree/easy-proxy-by-ds4/actions/workflows/ci.yml/badge.svg)](https://github.com/mylastfree/easy-proxy-by-ds4/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 一个「装上即用」的 Chrome 代理切换扩展：一键让浏览器走本地代理，局域网自动直连，并内置**出口检测**来验证代理是否真的生效。
 
 ## 特性
@@ -109,17 +112,21 @@
 
 | 测试 | 覆盖内容 |
 | --- | --- |
-| `tests\settings.test.js` | 纯函数：默认值、类型收敛、绕过列表解析、输入校验、容量估算（48 项） |
-| `tests\background.test.js` | 异步逻辑：并发下发的最终一致性、测试期暂停机制、取值一致性、CIDR 判定（23 项） |
-| `tests\fix-safety.test.js` | 修复安全性：暂停标志必然复位、串行队列不累积、收紧判定未误伤合法输入（19 项） |
-| `tests\mutation-check.js` | 变异测试：故意破坏每个修复点，确认护栏测试真的会失败（6 项变异） |
+| `tests/manifest.test.js` | 清单完整性：版本格式、权限最小化、引用文件存在、HTML/JS 元素 ID 一致（28 项） |
+| `tests/settings.test.js` | 纯函数：默认值、类型收敛、绕过列表解析、输入校验、容量估算（48 项） |
+| `tests/background.test.js` | 异步逻辑：并发下发的最终一致性、测试期暂停机制、取值一致性、CIDR 判定（23 项） |
+| `tests/fix-safety.test.js` | 修复安全性：暂停标志必然复位、串行队列不累积、收紧判定未误伤合法输入（19 项） |
+| `tests/mutation-check.js` | 变异测试：故意破坏每个修复点，确认护栏测试真的会失败（6 项变异） |
 
 ```powershell
+node tests\manifest.test.js
 node tests\settings.test.js
 node tests\background.test.js
 node tests\fix-safety.test.js
 node tests\mutation-check.js   # 运行后会自动还原被变异文件
 ```
+
+这些测试在 CI 上自动运行（Node 20 / 22 / 24 三个版本），见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
 **为什么需要后两套**：纯函数好测所以容易覆盖，异步流程难测所以容易被漏掉——而真正难查的问题（并发、时序）恰好都在异步里。`background.test.js` 用 mock 的 `chrome.*` 环境真实驱动 `background.js`，按「完成时刻」而非「发起时刻」判断最终生效的配置。
 
@@ -132,3 +139,7 @@ node tests\mutation-check.js   # 运行后会自动还原被变异文件
 ## 版本历史
 
 详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.1.0`。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 mylastfree
