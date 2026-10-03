@@ -34,6 +34,7 @@ function buildEnv(opts) {
   let directPhaseSeen = false, restoreSetSeen = false;
   let onRestoreSet = null, onClearDuringDirect = null;
   let getHook = null, getCount = 0;
+  let setHook = null, clearHook = null;
 
   function makeArea(store, areaName) {
     return {
@@ -70,6 +71,15 @@ function buildEnv(opts) {
     }, fetchDelay));
   };
   function record(v) { if (windowOpen) timeline.push(v); }
+  // 把"真实 set 落地"的效果（proxyActive / effective / timeline）抽成一处，
+  // 让默认路径与 setHook 注入路径共用同一份保真逻辑，避免两处漂移。
+  function applyEffective(label) {
+    // 传入字符串 = 代理已按该 label 挂上；传入 null = 没有挂上代理
+    //   （真实 Chromium 里 mode:"direct" 的 set 不会挂上代理）。
+    proxyActive = label !== null;
+    effective = proxyActive ? label : null;
+    record(effective);
+  }
   function defaultGet(o, cb) {
     // 忠实还原：真实生效配置就是 effective；直连时 mode 为 "direct"
     const value = effective !== null
@@ -86,6 +96,7 @@ function buildEnv(opts) {
     proxy: {
       settings: {
         set(o, cb) {
+          if (setHook) return setHook(o, cb, sandbox);
           const sp = (o.value && o.value.rules && o.value.rules.singleProxy) || {};
           const label = (sp.host === undefined ? "?" : sp.host) + ":" + (sp.port === undefined ? "?" : sp.port);
           setCalls.push(label);
@@ -93,14 +104,13 @@ function buildEnv(opts) {
           const delay = (Number(sp.port) === slowPort) ? slowMs : 0;
           setTimeout(() => {
             // 关键保真：mode:"direct" 的 set 不会挂上代理（Chromium 语义）
-            proxyActive = (o.value && o.value.mode === "direct") ? false : true;
-            effective = proxyActive ? label : null;
-            record(effective);
+            applyEffective((o.value && o.value.mode === "direct") ? null : label);
             sandbox.chrome.runtime.lastError = undefined;
             if (cb) cb();
           }, delay);
         },
         clear(o, cb) {
+          if (clearHook) return clearHook(o, cb, sandbox);
           // 只有 regular 作用域才代表"代理被真正清掉并进入直连取样"。
           // 遗留作用域（regular_only 等）的清理不属于直连阶段，不能用来置位标记，
           // 否则窗口内的 regular clear 会被误判为"已经过了直连阶段"而漏掉注入点。
@@ -124,6 +134,9 @@ function buildEnv(opts) {
       setTitle(o, cb) { titleCalls.push(o.title); setTimeout(() => cb && cb(), 0); }
     }
   };
+  // 供 setHook 注入路径复用的"真实落地"函数（见上 applyEffective）。
+  sandbox.chrome.proxy.settings._apply = applyEffective;
+
   vm.createContext(sandbox);
   vm.runInContext(bgSrc, sandbox);
   return { sandbox, syncStore, localStore, sessionStore, setCalls, clearCalls, timeline, fetchLog, listeners, iconCalls, titleCalls,
@@ -133,7 +146,9 @@ function buildEnv(opts) {
     onClearDuringDirect: fn => { onClearDuringDirect = fn; },
     // 脚本加载时的"未启用"冷启动会 clear 一次 regular，不能让它算作"已经进入过直连阶段"
     resetDirect: () => { directPhaseSeen = false; },
-    setGetHook: fn => { getHook = fn; getCount = 0; } };
+    setGetHook: fn => { getHook = fn; getCount = 0; },
+    setSetHook: fn => { setHook = fn; },
+    setClearHook: fn => { clearHook = fn; } };
 }
 
 // 排空串行队列：background 的 applyChain 挂在 VM 全局上
@@ -511,6 +526,78 @@ function t(name, cond, extra) {
     t("最终生效的是失败期间保存的 6666",
       env.getEffective() === "127.0.0.1:6666",
       "effective=" + env.getEffective());
+  }
+
+  console.log("");
+  console.log("== R6-01：收尾遇到真实 callback lastError 时必须识别为恢复失败 ==");
+  {
+    // 关键：注入的是【真实 Chrome 的失败契约】—— callback 置 lastError 后回调，
+    //   而不是 throw。setProxy 会因此 reject，applyProxyCore 会 catch 并【返回】
+    //   {ok:false,status:"error"}。收尾若只看 throw，就会把这次失败当成成功。
+    const env = buildEnv({ fetchDelay: 40 });
+    await ready(env, "10808");
+
+    let setCount = 0;
+    env.setSetHook(function (o, cb, sb) {
+      setCount++;
+      const sp = (o.value && o.value.rules && o.value.rules.singleProxy) || {};
+      const label = (sp.host === undefined ? "?" : sp.host) + ":" + (sp.port === undefined ? "?" : sp.port);
+      env.setCalls.push(label);
+      // 【计数必须从 1 开始数】ready() 已经把冷启动与 10808 的下发跑完、
+      //   并清空了 setCalls；窗口内第一次 set 就是收尾提交那一次（清除走的是 clear）。
+      //   若写成 2，钩子永远不注入失败，用例会假绿。
+      //
+      // 【为什么是 >= 1 而不是 === 1】真实场景里 set 失败通常是持续性的
+      //   （代理软件没起、端口被占用、被策略阻断），不是"只失败一次"：
+      //   收尾失败后第四步还会兜底重放一次，重放同样会失败。若只让收尾那一次失败，
+      //   重放成功就会把脏标记清掉，"恢复未完成不得清脏"这条断言就被测空了。
+      if (setCount >= 1) {
+        setTimeout(function () {
+          sb.chrome.runtime.lastError = { message: "set failed (real contract)" };
+          cb();
+          sb.chrome.runtime.lastError = undefined;
+        }, 0);
+        return;
+      }
+      setTimeout(function () {
+        sb.chrome.proxy.settings._apply(label);
+        sb.chrome.runtime.lastError = undefined;
+        cb();
+      }, 0);
+    });
+
+    // 【构造补强】窗口开启后、收尾提交之前保存一次新端口：该请求在暂停期被挡下 → 记脏。
+    //   没有这一步，脏标记在窗口开启前必然是 false（窗口开启即 suspendDepth++，
+    //   被挡下的请求只可能来自窗口内部），"不得清空脏标记"这条断言就永远测不到东西。
+    env.onClearDuringDirect(sb => {
+      sb.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "6666" }), () => {});
+    });
+
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(400); env.closeWindow();
+
+    t("收尾真实 set 失败被记入测试结果（restoreFailed 为 true）",
+      resp && resp.result && resp.result.restoreFailed === true,
+      "restoreFailed=" + (resp && resp.result && resp.result.restoreFailed) +
+      "；set 序列=" + JSON.stringify(env.setCalls));
+    t("收尾真实 set 失败时不得清空脏标记（否则兜底重放恒不可达）",
+      env.sandbox.suspendDirty === true,
+      "dirty=" + env.sandbox.suspendDirty + "；set 序列=" + JSON.stringify(env.setCalls));
+    t("收尾真实 set 失败时实际配置确实没有挂上代理（前置事实）",
+      env.getEffective() !== "127.0.0.1:10808",
+      "实际=" + env.getEffective());
+    const st = env.sessionStore.lastState || {};
+    t("收尾真实 set 失败时状态与事实一致（不是 applied）",
+      st.status !== "applied", "lastState=" + JSON.stringify(st));
+    // R6-01 验收通道③：状态不仅要"不是 applied"，还必须带上非空的失败原因，
+    //   否则用户看到"代理异常"却无从知道原因。
+    t("收尾真实 set 失败时状态附有非空失败原因",
+      typeof st.message === "string" && st.message.length > 0,
+      "lastState=" + JSON.stringify(st));
+    // R6-01 验收通道④：末次图标必须是红色，绝不能在这条失败路径上留下绿色。
+    t("收尾真实 set 失败时末次图标为红色（不是绿色）",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-red-16.png",
+      "icon=" + env.iconCalls[env.iconCalls.length - 1]);
   }
 
   console.log("");

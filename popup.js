@@ -165,13 +165,18 @@ function renderTest(result) {
     verdict = "✗ 出口检测失败。若已启用代理，说明流量可能无法出去——请检查代理地址与端口，或代理软件是否在运行。";
     kind = "error";
   } else if (result.direct && result.direct.ok) {
-    if (result.ipChanged) {
+    // R6-01（防御性冗余）：恢复失败时出口比较的结论没有意义，不得落到成功文案。
+    if (result.ipChanged && !result.restoreFailed) {
       verdict = "✓ 代理确实生效：当前出口与直连出口不同。";
       kind = "ok";
     } else if (result.stateSuperseded) {
       verdict = "ℹ 对比期间控制权已变更，保留接管结论，不用出口比较覆盖它。";
       kind = "warn";
-    } else if (result.activeMode === "fixed_servers") {
+    } else if (result.activeMode === "fixed_servers" && !result.restoreFailed && !result.directClearFailed) {
+      // R6-01：这句在宣称「代理配置仍在」，而 activeMode 是【窗口开始前】的快照。
+      //   若收尾恢复失败，实际配置可能已被清成直连，此句与事实相反。
+      //   因此必须以"恢复确实成功"为前提，不能只凭窗口前的快照。
+      //   同时排除 directClearFailed（直连取样本身失败时，"并未回退直连"同样无依据）。
       verdict = "ℹ 出口 IP 与直连相同，但代理配置仍在，并未回退直连。";
       kind = "warn";
     } else {

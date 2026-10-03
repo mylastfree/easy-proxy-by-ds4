@@ -494,9 +494,14 @@ async function runCompareWindow(result) {
     //   变化事件来纠正。按最新 settings 提交则天然同时满足：
     //     用户改了端口 → 下发新端口；用户关闭代理 → 清除代理；用户没改 → 语义等价。
     //   applyProxyCore 内部会回读控制权并校验实际模式，因此状态与实际保持一致（R3-07）。
+    // 【R6-01】必须消费返回值。背景：真实 chrome.proxy.settings.set 失败走 callback
+    //   lastError，被 setProxy reject 后由 applyProxyCore 的 try/catch 转成
+    //   { ok:false, status:"error" } 【正常 resolve】—— 只 catch 异常（throw）会漏掉
+    //   这条真实故障路径，把"恢复失败"当成"恢复成功"，并顺手清掉脏标记，
+    //   使第四步兜底重放条件恒不成立。
+    var core = null;
     try {
-      await applyProxyCore();
-      suspendDirty = false;
+      core = await applyProxyCore();
     } catch (restoreErr) {
       result.restoreFailed = true;
       var rmsg = (restoreErr && restoreErr.message) || String(restoreErr);
@@ -505,12 +510,49 @@ async function runCompareWindow(result) {
       updateIcon("error");
     }
 
+    // 只有【确认终态】才允许清脏，且必须先按 status 分三类，不能一律当"恢复失败"：
+    //   · applied / direct —— 确认已生效 / 已直连：清脏（这是真正的成功终态）；
+    //   · overridden      —— 确证被外部接管：我方【按最新意图处理完了】（放弃写入以免夺权），
+    //                        所以【不是】恢复失败，但用户的配置确实还有待下发 → 不清脏；
+    //   · error / saved_not_applied —— 恢复未完成：如实标记 restoreFailed，也不清脏。
+    //   把 overridden 报成"恢复失败"，会让前台显示"请重新保存一次设置"，
+    //   把用户引去排查自己的配置，而真正要处理的是企业策略或其它扩展（与 R3-07 同型）。
+    if (!result.restoreFailed && core && core.status === "overridden") {
+      // 两个都可能是原因：窗口内先被接管（L473–490 已 return，走不到这里），
+      // 或复核通过之后、真正下发之前控制权又变了（L235–239 / L282–292）。
+      // 两种情况下都不夺权、如实保留待下发。
+      result.overriddenDuringRestore = core.levelOfControl || "unknown_control";
+      result.pendingResubmit = suspendDirty;
+      writeState({
+        status: "overridden",
+        levelOfControl: core.levelOfControl || null,
+        pendingResubmit: suspendDirty,
+        at: Date.now()
+      });
+      updateIcon("overridden");
+    } else if (!result.restoreFailed && core && core.ok === true) {
+      suspendDirty = false;
+    } else if (!result.restoreFailed) {
+      // applyProxyCore 正常返回但状态不是成功终态（error / saved_not_applied）：
+      //   与"抛异常"同样属于【恢复未完成】，必须如实标记，不能报成功。
+      result.restoreFailed = true;
+      var cmsg2 = (core && core.errors && core.errors[0]) || (core && core.status) || "未知原因";
+      console.warn("对比后按最新设置提交未达成功终态:", cmsg2);
+      writeState({ status: "error", message: "对比后恢复代理设置未生效：" + cmsg2, at: Date.now() });
+      updateIcon("error");
+    }
+
     // 第四步：兜底重放。收尾提交已按最新 settings 执行；若期间还有更新到达而
     //   未被子提交覆盖（理论上被队列保证，此处为纵深防御），再补一次。
     if (suspendDirty) {
       try {
-        await applyProxyCore();
-        suspendDirty = false;
+        // 【R6-01 同型缺陷】重放也必须消费返回值：真实 set 失败是【正常 resolve】的
+        //   （见第三步注释），只 catch 异常会让"重放同样失败"也被当成成功，
+        //   无条件清掉脏标记 —— 于是"暂停期间的配置还有待下发"这一事实被抹掉，
+        //   界面、状态与图标都说恢复完成，实际浏览器里什么也没挂上。
+        //   只有确认终态（applied / direct）才允许清脏。
+        var replay = await applyProxyCore();
+        if (replay && replay.ok === true && replay.status !== "overridden") suspendDirty = false;
       } catch (e3) {
         console.warn("重放暂停期间的设置变更失败:", e3);
       }

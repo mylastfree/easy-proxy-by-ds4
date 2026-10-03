@@ -447,6 +447,24 @@ function ask(handler, msg) {
     const html5 = p.el.testResult.innerHTML;
     t("配置仍在时，不说代理很可能未生效", html5.indexOf("很可能未生效") < 0, html5);
     t("配置仍在时，说明并未回退直连", html5.indexOf("并未回退直连") >= 0, html5);
+
+    // R6-01：恢复失败时，前台绝不能落到"出口变了 → 代理确实生效"这条成功出口。
+    //   真实故障时后端若把 restoreFailed 漏成 false（见 tests/ownership.test.js 的
+    //   R6-01 用例），前台就会显示成功文案。这里守住前端这一层。
+    p.renderTest({
+      ok: true,
+      restoreFailed: true,
+      ipChanged: true,
+      activeMode: "fixed_servers",
+      exit: { ok: true, ip: "203.0.113.9" },
+      direct: { ok: true, ip: "192.0.2.1" },
+      settings: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808" }
+    });
+    const html6 = p.el.testResult.innerHTML;
+    t("恢复失败时不得渲染成功文案", html6.indexOf("代理确实生效") < 0, html6);
+    t("恢复失败时不得渲染「并未回退直连」", html6.indexOf("并未回退直连") < 0, html6);
+    t("恢复失败时渲染恢复失败文案", html6.indexOf("恢复原代理配置失败") >= 0, html6);
+    t("恢复失败时判定为 error 档（不是 ok）", html6.indexOf("verdict error") >= 0, html6);
   }
 
   console.log("");
