@@ -152,6 +152,12 @@ function renderTest(result) {
   } else if (result.directClearFailed) {
     verdict = "⚠ 对比时清除代理失败，本次「直连出口」不可信：" + result.directClearFailed;
     kind = "error";
+  } else if (result.compareSkipped === "unknown_control") {
+    verdict = "ℹ 无法确认当前代理控制权，已跳过直连对比，未清除现有代理。";
+    kind = "warn";
+  } else if (result.compareSkipped === "control_changed_before_clear") {
+    verdict = "ℹ 清除前代理控制权已变更，已放弃对比，未清除当前代理。";
+    kind = "warn";
   } else if (result.compareSkipped === "not_controlled_by_this_extension") {
     verdict = "ℹ 当前代理设置不由本扩展控制（被策略或其它扩展接管），已跳过直连对比以免影响它。";
     kind = "warn";

@@ -416,6 +416,25 @@ function ask(handler, msg) {
     const html2 = p.el.testResult.innerHTML;
     t("真正的出口失败仍显示“出口检测失败”（未被误改）",
       html2.indexOf("出口检测失败") >= 0, html2);
+
+    p.renderTest({
+      ok: true,
+      compareSkipped: "control_changed_before_clear",
+      exit: { ok: true, ip: "203.0.113.9" },
+      direct: { ok: true, ip: "203.0.113.9" },
+      ipChanged: false
+    });
+    const html3 = p.el.testResult.innerHTML;
+    t("放弃清除时说明未清除当前代理", html3.indexOf("未清除当前代理") >= 0, html3);
+    t("放弃清除时不渲染成出口相同", html3.indexOf("出口 IP 与直连相同") < 0, html3);
+
+    p.renderTest({
+      ok: true,
+      compareSkipped: "unknown_control",
+      exit: { ok: true, ip: "203.0.113.9" }
+    });
+    const html4 = p.el.testResult.innerHTML;
+    t("控制权未知时说明已跳过对比", html4.indexOf("无法确认当前代理控制权") >= 0, html4);
   }
 
   console.log("");

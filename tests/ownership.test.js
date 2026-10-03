@@ -24,6 +24,7 @@ function buildEnv(opts) {
   const syncStore = {}, localStore = {}, sessionStore = {};
   const listeners = { changed: [], message: [] };
   const setCalls = [];       // setProxy 的发起序列
+  const clearCalls = [];     // clear 的作用域序列
   const timeline = [];       // 窗口内每次 set/clear 【完成】时刻的真实生效配置
   const fetchLog = [];       // 每次 fetch 时刻的 proxyActive
   const iconCalls = [], titleCalls = [];
@@ -103,6 +104,7 @@ function buildEnv(opts) {
           // 只有 regular 作用域才代表"代理被真正清掉并进入直连取样"。
           // 遗留作用域（regular_only 等）的清理不属于直连阶段，不能用来置位标记，
           // 否则窗口内的 regular clear 会被误判为"已经过了直连阶段"而漏掉注入点。
+          clearCalls.push(o.scope);
           const isRegular = o.scope === "regular";
           if (isRegular && onClearDuringDirect && !directPhaseSeen) setTimeout(() => onClearDuringDirect(sandbox), 0);
           setTimeout(() => {
@@ -124,7 +126,7 @@ function buildEnv(opts) {
   };
   vm.createContext(sandbox);
   vm.runInContext(bgSrc, sandbox);
-  return { sandbox, syncStore, localStore, sessionStore, setCalls, timeline, fetchLog, listeners, iconCalls, titleCalls,
+  return { sandbox, syncStore, localStore, sessionStore, setCalls, clearCalls, timeline, fetchLog, listeners, iconCalls, titleCalls,
     getEffective: () => effective, isProxyActive: () => proxyActive,
     openWindow: () => { windowOpen = true; }, closeWindow: () => { windowOpen = false; },
     onRestoreSet: fn => { onRestoreSet = fn; },
@@ -414,6 +416,45 @@ function t(name, cond, extra) {
       env.titleCalls.indexOf("代理设置") < 0,
       "setTitle 序列 = " + JSON.stringify(env.titleCalls));
     await p1;
+  }
+
+  console.log("");
+  console.log("== R5-01：入口与窗口使用同一个控制权谓词 ==");
+  {
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    env.clearCalls.length = 0;
+    env.setGetHook((n, o, cb, dflt) => {
+      if (n === 1) {
+        setTimeout(() => cb({ value: { mode: "fixed_servers" } }), 0);
+        return;
+      }
+      return dflt(o, cb);
+    });
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(200);
+    const skipped = resp && resp.result && resp.result.compareSkipped;
+    t("缺 levelOfControl 时不进入对比",
+      skipped === "unknown_control", "compareSkipped=" + skipped);
+    t("缺 levelOfControl 时不清除 regular",
+      env.clearCalls.indexOf("regular") < 0,
+      "clears=" + JSON.stringify(env.clearCalls));
+  }
+  {
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    env.setGetHook((n, o, cb, dflt) => {
+      setTimeout(() => cb({
+        value: { mode: "direct" },
+        levelOfControl: "controllable_by_this_extension"
+      }), 0);
+    });
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(200);
+    const skipped = resp && resp.result && resp.result.compareSkipped;
+    t("无人控制但可由本扩展接管时，入口不再拒绝",
+      skipped !== "not_controlled_by_this_extension",
+      "compareSkipped=" + skipped);
   }
 
   console.log("");

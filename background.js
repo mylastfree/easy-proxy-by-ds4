@@ -393,13 +393,14 @@ async function runConnectionTest(compare) {
     compareSkipped: null
   };
 
-  // 仅当代理设置确实由本扩展控制时，才执行「清除→测直连→恢复」的对比流程。
-  // 否则 backup 可能属于其它扩展或企业策略，把它写回相当于越权改变控制权归属。
-  var controlledByUs = !result.levelOfControl ||
-    result.levelOfControl === "controlled_by_this_extension";
+  // 与窗口、下发前检查共用 isControllableByUs。
+  // 缺字段不是“可以由本扩展控制”。
+  var controlledByUs = isControllableByUs(result.levelOfControl);
 
   if (compare && settings.enableProxy && !controlledByUs) {
-    result.compareSkipped = "not_controlled_by_this_extension";
+    result.compareSkipped = result.levelOfControl
+      ? "not_controlled_by_this_extension"
+      : "unknown_control";
   }
 
   if (compare && settings.enableProxy && controlledByUs) {
@@ -410,7 +411,7 @@ async function runConnectionTest(compare) {
     //   · 入队后：窗口之前排队的旧请求会在任务开始时过期；窗口期间到达的更新请求
     //     只排队不执行；窗口收尾按【最新 settings】提交，排队请求随后幂等重放。
     await applyProxyExclusive(function () {
-      return runCompareWindow(result, settings);
+      return runCompareWindow(result);
     });
 
     result.ipChanged = !!(result.exit.ok && result.direct && result.direct.ok &&
@@ -443,7 +444,7 @@ async function runConnectionTest(compare) {
 // 对比窗口的排他任务体（R3-01 / R3-04 / R3-07）。
 // 调用前提：已经在 applyChain 内部执行，因此这里是 chrome.proxy 的唯一写入者。
 // 顺序：复核控制权 → 清除 → 取直连出口 → 按最新 settings 收尾提交。
-async function runCompareWindow(result, settingsAtStart) {
+async function runCompareWindow(result) {
   // 暂停标记贯穿整个窗口（含收尾提交）：窗口期间到达的下发请求就此记脏，
   //   收尾提交之后再递减，保证"暂停"不会在恢复之前失效（R3-01 根因之二）。
   suspendDepth++;
