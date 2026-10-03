@@ -44,6 +44,7 @@ function buildEnv(opts) {
         setTimeout(() => cb(out), 0);
       },
       set(obj, cb) {
+        if (areaName === "session" && obj && obj.lastState) stateWrites.push(obj.lastState);
         const changes = {};
         for (const k of Object.keys(obj)) {
           if (JSON.stringify(store[k]) !== JSON.stringify(obj[k])) changes[k] = { newValue: obj[k] };
@@ -56,6 +57,7 @@ function buildEnv(opts) {
       }
     };
   }
+  const stateWrites = [];   // session lastState 的每次写入（按写入顺序）
   const sandbox = {
     console: { log() {}, warn() {}, error() {} },
     TextEncoder, setTimeout, clearTimeout, Date, Promise, Object, Array, JSON,
@@ -139,7 +141,7 @@ function buildEnv(opts) {
 
   vm.createContext(sandbox);
   vm.runInContext(bgSrc, sandbox);
-  return { sandbox, syncStore, localStore, sessionStore, setCalls, clearCalls, timeline, fetchLog, listeners, iconCalls, titleCalls,
+  return { sandbox, syncStore, localStore, sessionStore, stateWrites, setCalls, clearCalls, timeline, fetchLog, listeners, iconCalls, titleCalls,
     getEffective: () => effective, isProxyActive: () => proxyActive,
     openWindow: () => { windowOpen = true; }, closeWindow: () => { windowOpen = false; },
     onRestoreSet: fn => { onRestoreSet = fn; },
@@ -644,6 +646,115 @@ function t(name, cond, extra) {
       "lastState=" + JSON.stringify(st));
   }
 
+  console.log("");
+  console.log("== R6-03 fix-round-1：清除前接管路径也必须保留待下发标记 ==");
+  {
+    // 场景：【清除前接管】早退分支（runCompareWindow 第一步的控制权复核）。
+    //   背景（评审 I-1）：该分支写下的 status:"overridden" 是唯一【不带】
+    //   pendingResubmit 的一处，会覆盖窗口期间记下的「有配置变更待下发」，
+    //   前台（popup.js:89）因此看不到提示 —— 与 R6-03 / R3-01 同型，只是路径更窄。
+    //   命中该分支需要两个条件同时成立：①窗口打开前的入口复核仍属我方（否则
+    //   连对比窗口都进不去）；②窗口一开始复核就已变为外部接管；③此时已有脏标记。
+    //   因此用两次窗口：第一次真正打开窗口并留下真实脏标记，第二次命中早退分支。
+    const env = buildEnv({ fetchDelay: 120 });
+    await ready(env, "10808");
+
+    // 第一次窗口：入口、窗口开头复核与收尾复核（前 3 次回读）都属我方，
+    //   清除与收尾提交都真实执行；真正的接管发生在【收尾提交内部】
+    //   （applyProxyCore 下发前的控制权复核）→ 按设计放弃写入、且【不清脏】。
+    env.setGetHook((n, o, cb, defaultGet) => {
+      if (n <= 3) return defaultGet(o, cb);
+      return cb({
+        value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
+        levelOfControl: "controlled_by_other_extensions"
+      });
+    });
+    // 脏标记的真实来源：窗口期间保存设置。suspendDepth > 0 时 onChanged 监听器
+    //   先记脏、再排入串行队列；排队任务随后被 applyProxy 的暂停检查挡下，不触碰 chrome.proxy。
+    env.onClearDuringDirect(() => {
+      env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "8080" }), () => {});
+    });
+    const resp1 = await ask(env, { action: "testConnection", compare: true });
+    await drain(env);
+    env.closeWindow();
+
+    t("第一次窗口在收尾提交内部发现外部接管并放弃写回（构造前置事实）",
+      !!(resp1 && resp1.result && resp1.result.overriddenDuringRestore === "controlled_by_other_extensions"),
+      "overriddenDuringRestore=" + (resp1 && resp1.result && resp1.result.overriddenDuringRestore));
+    t("窗口期间保存的设置确实记下了脏标记，且被接管时不得清掉（构造前置事实）",
+      env.sandbox.suspendDirty === true, "dirty=" + env.sandbox.suspendDirty);
+    // 收尾提交返回 overridden 时的分类分支同样必须保留待下发标记
+    //   （任务书 C-6 要求的三分类结构：被接管 ≠ 恢复失败，但也不清脏）。
+    const overriddenRestore = env.stateWrites.filter(w => w && w.status === "overridden");
+    t("收尾提交被接管时写下的状态必须保留待下发标记",
+      overriddenRestore.length >= 1 && overriddenRestore[0].pendingResubmit === true,
+      JSON.stringify(overriddenRestore));
+
+    // 第二次窗口：入口复核仍属我方（才允许进入对比），窗口开头复核即为外部接管
+    //   → 命中【清除前接管】早退分支，全程不执行清除、也不下发任何配置。
+    env.setGetHook((n, o, cb, defaultGet) => {
+      if (n === 1) return defaultGet(o, cb);
+      return cb({
+        value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
+        levelOfControl: "controlled_by_other_extensions"
+      });
+    });
+    const writesBefore2 = env.stateWrites.length;
+    const setsBefore2 = env.setCalls.length;
+    const resp2 = await ask(env, { action: "testConnection", compare: true });
+    await drain(env);
+    env.closeWindow();
+
+    t("第二次窗口在【清除之前】就发现外部接管并跳过对比（构造前置事实）",
+      !!(resp2 && resp2.result && resp2.result.compareSkipped === "control_changed_before_clear"),
+      "compareSkipped=" + (resp2 && resp2.result && resp2.result.compareSkipped) +
+      "；controlChangedBeforeClear=" + (resp2 && resp2.result && resp2.result.controlChangedBeforeClear));
+    t("清除前接管时全程没有下发过代理配置（未夺权的前置事实）",
+      env.setCalls.length === setsBefore2,
+      "set 序列=" + JSON.stringify(env.setCalls.slice(setsBefore2)));
+    t("清除前接管前脏标记确实还在（构造前置事实）",
+      env.sandbox.suspendDirty === true, "dirty=" + env.sandbox.suspendDirty);
+
+    // 只取【第二次窗口期间】写下、且状态为 overridden 的那一条，避免被其他写入干扰。
+    const overriddenThisWindow = env.stateWrites.slice(writesBefore2)
+      .filter(w => w && w.status === "overridden");
+    t("清除前接管确实写下了 overridden 状态（构造前置事实）",
+      overriddenThisWindow.length >= 1,
+      "本条窗口内的 overridden 写入=" + JSON.stringify(overriddenThisWindow));
+    // 通道④：前台状态条由 lastState.pendingResubmit 单行驱动（popup.js:89），
+    //   这里断言的正是它读取的那个真实状态对象，而不是内部控制变量。
+    t("清除前接管写下的状态必须保留待下发标记（通道④：前台才显示得出来）",
+      overriddenThisWindow.length >= 1 && overriddenThisWindow[0].pendingResubmit === true,
+      "lastState=" + JSON.stringify(overriddenThisWindow[0]));
+    // 通道②：配置确实还有待下发，测试结果必须如实上报。
+    t("清除前接管时测试结果如实上报仍有待下发的配置（通道②）",
+      !!(resp2 && resp2.result && resp2.result.pendingResubmit === true),
+      "pendingResubmit=" + (resp2 && resp2.result && resp2.result.pendingResubmit));
+    // 汇总护栏：任何一处 overridden 状态写入都不得丢掉待下发标记（覆盖全部三条路径）。
+    const overriddenAll = env.stateWrites.filter(w => w && w.status === "overridden");
+    t("每一处 overridden 状态写入都必须保留待下发标记（通道②/④ 汇总）",
+      overriddenAll.length >= 2 && overriddenAll.every(w => w.pendingResubmit === true),
+      JSON.stringify(overriddenAll));
+  }
+
+  {
+    // 通道② 反向断言：没有脏标记时，任何路径都不得声称「有配置变更待下发」。
+    //   这是防「把 pendingResubmit 硬编码为 true」的常驻护栏。
+    const env = buildEnv({ fetchDelay: 20 });
+    await drain(env);
+    env.setGetHook((n, o, cb) => cb({
+      value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
+        levelOfControl: "controlled_by_other_extensions"
+    }));
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "4445" }));
+    await drain(env);
+
+    t("构造前置事实：此时并无待下发的配置变更",
+      env.sandbox.suspendDirty === false, "dirty=" + env.sandbox.suspendDirty);
+    const stIdle = env.sessionStore.lastState || {};
+    t("无待下发变更时状态不得声称仍有待下发（通道②：误报护栏）",
+      stIdle.pendingResubmit !== true, "lastState=" + JSON.stringify(stIdle));
+  }
   console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);

@@ -463,7 +463,10 @@ async function runCompareWindow(result) {
       result.compareSkipped = "control_changed_before_clear";
       // 即时读取脏标记：此刻暂停窗口可能已经打开了记脏（清除前复核与清除之间的变化）
       result.pendingResubmit = suspendDirty;
-      writeState({ status: "overridden", levelOfControl: levelBeforeClear || null, at: Date.now() });
+      // 【R6-03】写状态时也必须带上 pendingResubmit（与另两处 overridden 早退同型）：
+      //   这一条会覆盖窗口开头写下的状态。若在这里丢掉该字段，暂停期用户保存的配置
+      //   就彻底不可见（前台状态条不显示「有配置变更待下发」），与 R3-01 的静默丢弃同型。
+      writeState({ status: "overridden", levelOfControl: levelBeforeClear || null, pendingResubmit: suspendDirty, at: Date.now() });
       updateIcon("overridden");
       return result;
     }
@@ -544,7 +547,10 @@ async function runCompareWindow(result) {
         at: Date.now()
       });
       updateIcon("overridden");
-    } else if (!result.restoreFailed && core && core.ok === true) {
+    //   判据与入口（applyProxy）和兜底重放保持同一种写法：显式排除 overridden，
+    //   不依赖上面 if 分支的先后顺序 —— 否则一旦有人重排分支或前置插入新分支，
+    //   这里会静默消费掉被接管时的脏标记，退化为 R3-01 同型缺陷。
+    } else if (!result.restoreFailed && core && core.ok === true && core.status !== "overridden") {
       suspendDirty = false;
     } else if (!result.restoreFailed) {
       // applyProxyCore 正常返回但状态不是成功终态（error / saved_not_applied）：
