@@ -1448,6 +1448,178 @@ function t(name, cond, extra) {
   }
 
   console.log("");
+  console.log("== R7-03：升级补缺必须按【有效来源】判断绕过列表，不得遮蔽 local 用户列表 ==");
+  {
+    // 缺陷链路（三段，全部只作用于升级补缺这一处判断）：
+    //   ① 遮蔽：超长列表保存时 popup 先写 local.bypassList（用户规则），
+    //      再把 sync.bypassList 写成【空串】占位。此后一次升级触发
+    //      onInstalled({reason:"update"})，旧实现只看 sync 的
+    //      normalizeSettings 结果，把占位空串当成「用户没配」，
+    //      于是把默认 6 条写进 sync —— 下发给 chrome.proxy 的绕过列表
+    //      变成默认值，用户长列表不再生效。
+    //   ② 误改：用户【主动清空】绕过列表（sync 写空串）后升级，同样被改回默认。
+    //   ③ 永久删除：sync 被写成默认后，用户打开 popup 看到默认 6 条、
+    //      自己的规则不可见；点一次「保存」走短列表分支 →
+    //      clearLocalBypassIfAny() 把 local.bypassList 写成空串，
+    //      local 无第二份副本，长列表彻底丢失。
+    //
+    // 断言对象一律是【下发给 chrome.proxy 的真实生效配置】(setConfigs)
+    //   与【真实的 chrome.storage.sync / local 内容】，不看内部变量。
+    const LONG = Array.from({ length: 450 }, (_, i) => "rule-" + (i + 1) + ".internal.example").join("\n");
+    // DEFAULTS 从 settings.js 在独立 vm 中取一次，避免与 env 的状态耦合。
+    const sbox = { TextEncoder: TextEncoder };
+    sbox.self = sbox; sbox.globalThis = sbox;
+    vm.createContext(sbox);
+    vm.runInContext(settingsSrc, sbox);
+    const DEFAULTS = sbox.EasyProxy.DEFAULTS;
+
+    function fireUpdate(env) {
+      for (const fn of env.listeners.installed.slice()) fn({ reason: "update" });
+    }
+    function lastBypass(env) {
+      const cfg = env.setConfigs[env.setConfigs.length - 1];
+      return (cfg && cfg.rules && cfg.rules.bypassList) || [];
+    }
+    function put(env, area, obj) {
+      return new Promise(r => env.sandbox.chrome.storage[area].set(obj, r));
+    }
+    // 降级现场的统一构造：sync 有完整配置，bypassList 取 syncBypass 给定值。
+    async function degradedEnv(syncBypass, withKey) {
+      const env = buildEnv({ fetchDelay: 20 });
+      await drain(env);
+      const cfg = { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808" };
+      if (withKey) cfg.bypassList = syncBypass;
+      await put(env, "sync", cfg);
+      if (typeof syncBypass === "string" && syncBypass) await put(env, "local", { bypassList: syncBypass });
+      await drain(env);
+      return env;
+    }
+
+    // ---- R7-03-A（核心）：降级占位空串 + local 有用户长列表 ----
+    {
+      const envA = buildEnv({ fetchDelay: 20 });
+      await drain(envA);
+      await put(envA, "sync", { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "" });
+      await put(envA, "local", { bypassList: LONG });
+      await drain(envA);
+      await sleep(60);
+      const beforeA = lastBypass(envA);
+      t("R7-03-A 前置事实：降级现场下发的绕过列表是用户的 450 条规则（取值规则本身正常）",
+        beforeA.length === 450 && beforeA.indexOf("rule-1.internal.example") >= 0,
+        "下发的 bypassList 条数=" + beforeA.length);
+      t("R7-03-A 前置事实：sync 里确实是降级占位空串，local 里是用户长列表",
+        envA.syncStore.bypassList === "" && envA.localStore.bypassList === LONG,
+        "sync=" + JSON.stringify(envA.syncStore.bypassList) + "；local 长度=" + String(envA.localStore.bypassList && envA.localStore.bypassList.length));
+
+      const setsBeforeA = envA.setConfigs.length;
+      fireUpdate(envA);
+      await drain(envA);
+      await sleep(80);
+      const afterA = lastBypass(envA);
+      t("R7-03-A 升级确实触发了新的下发（否则下面的断言会假阳性）",
+        envA.setConfigs.length > setsBeforeA,
+        "setConfigs " + setsBeforeA + " -> " + envA.setConfigs.length);
+      t("R7-03-A 核心：升级后下发给 chrome.proxy 的 bypassList 仍是用户的 450 条规则（不是默认 6 条）",
+        afterA.length === 450 && afterA.indexOf("rule-1.internal.example") >= 0 &&
+        afterA.indexOf("192.168.0.0/16") < 0,
+        "下发的 bypassList 条数=" + afterA.length + "；前 3 条=" + JSON.stringify(afterA.slice(0, 3)));
+      t("R7-03-A 升级后 sync.bypassList 不得被写成默认列表",
+        envA.syncStore.bypassList !== DEFAULTS.bypassList,
+        "sync.bypassList 长度=" + String(envA.syncStore.bypassList && envA.syncStore.bypassList.length));
+      t("R7-03-A 升级后 local.bypassList 必须原封不动（永久丢失的源头）",
+        envA.localStore.bypassList === LONG,
+        "local 长度=" + String(envA.localStore.bypassList && envA.localStore.bypassList.length));
+      envA.closeWindow();
+    }
+
+    // ---- R7-03-B：用户【主动清空】（sync 空串、local 也无值） ----
+    {
+      const envB = await degradedEnv("", true);
+      t("R7-03-B 前置事实：sync 为空串且 local 无 bypassList 键（用户主动清空的现场）",
+        envB.syncStore.bypassList === "" && !("bypassList" in envB.localStore),
+        "sync=" + JSON.stringify(envB.syncStore.bypassList) + "；local=" + JSON.stringify(envB.localStore));
+      fireUpdate(envB);
+      await drain(envB);
+      await sleep(80);
+      t("R7-03-B 用户主动清空后，升级不得把默认列表塞回 sync",
+        envB.syncStore.bypassList === "",
+        "sync.bypassList=" + JSON.stringify(envB.syncStore.bypassList));
+      const bypassB = lastBypass(envB);
+      t("R7-03-B 用户主动清空后，升级不得把默认列表下发给 chrome.proxy",
+        bypassB.length === 0,
+        "下发的 bypassList=" + JSON.stringify(bypassB));
+      envB.closeWindow();
+    }
+
+    // ---- R7-03-C（对照）：sync 键【完全缺失】+ local 有用户长列表 ----
+    {
+      const envC = buildEnv({ fetchDelay: 20 });
+      await drain(envC);
+      await put(envC, "sync", { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808" });
+      await put(envC, "local", { bypassList: LONG });
+      await drain(envC);
+      await sleep(60);
+      t("R7-03-C 前置事实：sync 里确实没有 bypassList 键，local 里有用户长列表",
+        !("bypassList" in envC.syncStore) && envC.localStore.bypassList === LONG,
+        "sync 键=" + JSON.stringify(Object.keys(envC.syncStore)) + "；local 长度=" + String(envC.localStore.bypassList && envC.localStore.bypassList.length));
+      fireUpdate(envC);
+      await drain(envC);
+      await sleep(80);
+      const bypassC = lastBypass(envC);
+      t("R7-03-C 对照：sync 键缺失但 local 有用户列表时，升级后下发的仍是用户列表",
+        bypassC.length === 450 && bypassC.indexOf("rule-1.internal.example") >= 0,
+        "下发的 bypassList 条数=" + bypassC.length);
+      t("R7-03-C 对照：sync 键缺失且 local 有值时不得把默认列表写进 sync",
+        envC.syncStore.bypassList !== DEFAULTS.bypassList,
+        "sync.bypassList=" + JSON.stringify(envC.syncStore.bypassList));
+      envC.closeWindow();
+    }
+
+    // ---- R7-03-D（防回归）：真正从未配置（sync 与 local 都无）→ 仍要补默认值 ----
+    {
+      const envD = buildEnv({ fetchDelay: 20 });
+      await drain(envD);
+      await put(envD, "sync", { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808" });
+      await drain(envD);
+      t("R7-03-D 前置事实：从未配置过 —— sync 无 bypassList 键且 local 也无该键",
+        !("bypassList" in envD.syncStore) && !("bypassList" in envD.localStore),
+        "sync=" + JSON.stringify(envD.syncStore) + "；local=" + JSON.stringify(envD.localStore));
+      fireUpdate(envD);
+      await drain(envD);
+      await sleep(80);
+      t("R7-03-D 从未配置过时，升级补默认值的既有语义仍要生效（防回归）",
+        envD.syncStore.bypassList === DEFAULTS.bypassList,
+        "sync.bypassList 长度=" + String(envD.syncStore.bypassList && envD.syncStore.bypassList.length));
+      const bypassD = lastBypass(envD);
+      t("R7-03-D 从未配置过时，补出的默认列表要真正下发到 chrome.proxy",
+        bypassD.length === 6 && bypassD.indexOf("192.168.0.0/16") >= 0,
+        "下发的 bypassList=" + JSON.stringify(bypassD));
+      envD.closeWindow();
+    }
+
+    // ---- R7-03-E（防回归）：proxyHost / proxyPort 的空缺补默认值语义不受影响 ----
+    {
+      const envE = buildEnv({ fetchDelay: 20 });
+      await drain(envE);
+      await put(envE, "sync", { enableProxy: true, proxyType: "socks5", proxyHost: "", proxyPort: "", bypassList: "example.com" });
+      await drain(envE);
+      fireUpdate(envE);
+      await drain(envE);
+      await sleep(80);
+      t("R7-03-E proxyHost 空缺时仍补默认值（既有语义不受影响）",
+        envE.syncStore.proxyHost === DEFAULTS.proxyHost,
+        "proxyHost=" + JSON.stringify(envE.syncStore.proxyHost));
+      t("R7-03-E proxyPort 空缺时仍补默认值（既有语义不受影响）",
+        envE.syncStore.proxyPort === DEFAULTS.proxyPort,
+        "proxyPort=" + JSON.stringify(envE.syncStore.proxyPort));
+      t("R7-03-E 用户已填的非空绕过列表不得被改写",
+        envE.syncStore.bypassList === "example.com",
+        "sync.bypassList=" + JSON.stringify(envE.syncStore.bypassList));
+      envE.closeWindow();
+    }
+  }
+
+  console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);
 })().catch(e => { console.error("EXC: " + (e && e.stack || e)); process.exit(2); });

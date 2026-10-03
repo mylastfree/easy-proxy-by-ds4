@@ -717,21 +717,46 @@ chrome.runtime.onInstalled.addListener(function (details) {
 
       if (!cur.proxyHost) patch.proxyHost = S.DEFAULTS.proxyHost;
       if (!cur.proxyPort) patch.proxyPort = S.DEFAULTS.proxyPort;
-      if (!cur.bypassList) patch.bypassList = S.DEFAULTS.bypassList;
 
       var allowed = S.PROXY_TYPES.map(function (t) { return t.value; });
       if (items.proxyType && allowed.indexOf(items.proxyType) < 0) {
         patch.proxyType = S.DEFAULTS.proxyType;
       }
 
-      if (Object.keys(patch).length) {
-        chrome.storage.sync.set(patch, function () {
-          void chrome.runtime.lastError;
+      // 【R7-03】绕过列表的补缺必须按【有效来源】判断，不能只看 sync。
+      //   绕过列表的取值规则是「sync 非空优先，为空则回退 local」
+      //   （settings.js 的 resolveBypassList，popup 与 background 共用）：
+      //   超长列表保存时 popup 先写 local.bypassList（用户规则），
+      //   再把 sync.bypassList 写成【空串】占位。
+      //   此前这里只看 normalizeSettings(items) 的结果，占位空串被判成「用户没配」，
+      //   于是默认 6 条覆盖了 sync —— 下发值随即变成默认，用户长列表被遮蔽；
+      //   此后用户在 popup 点一次保存就会走 clearLocalBypassIfAny() 把 local 也写成
+      //   空串，而 local 并无第二份副本，长列表就此永久丢失。
+      //   三态必须分开；判据取【原始键是否存在】，而不是 normalizeSettings 的结果
+      //   —— 后者会用默认值填满缺失的键，从而抹掉「从未配置」这一事实：
+      //     · 键缺失     + local 无有效值 → 确实从未配置 → 补默认值；
+      //     · 键缺失     + local 有有效值 → local 才是有效来源 → 保持现状；
+      //     · sync 空串  + local 有有效值 → 降级占位 → 保持现状；
+      //     · sync 空串  + local 无有效值 → 用户主动清空 → 保持现状。
+      //   local 读取失败时无法区分后两种，宁可不补写，也不覆盖用户数据。
+      chrome.storage.local.get(['bypassList'], function (localItems) {
+        var localErr = chrome.runtime.lastError;
+        var syncHasKey = !!items && Object.prototype.hasOwnProperty.call(items, 'bypassList');
+        var localRaw = (!localErr && localItems) ? localItems.bypassList : undefined;
+        var localHasValue = typeof localRaw === 'string' && localRaw.length > 0;
+        if (!localErr && !syncHasKey && !localHasValue) {
+          patch.bypassList = S.DEFAULTS.bypassList;
+        }
+
+        if (Object.keys(patch).length) {
+          chrome.storage.sync.set(patch, function () {
+            void chrome.runtime.lastError;
+            applyProxySerial();
+          });
+        } else {
           applyProxySerial();
-        });
-      } else {
-        applyProxySerial();
-      }
+        }
+      });
     });
     return;
   }
