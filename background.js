@@ -50,10 +50,22 @@ function readBypassText() {
   });
 }
 
+// 状态写入代次（R3-07）：
+//   状态是"最近一次结论"的快照，而结论可能"较早得出、较晚写入"——
+//   例如对比测试在窗口内已经写下 overridden，测试结束时的"出口相同"结论
+//   又会把它改写成 error，使用户看到过期且错误的结论。
+//   这里给每次写入编号，写入方据此判断自己是否已被更新的结论取代。
+var stateSeq = 0;
+var lastStateSeq = 0;
+
 function writeState(state) {
-  chrome.storage.session.set({ lastState: state }, function () {
+  var seq = ++stateSeq;
+  lastStateSeq = seq;
+  var payload = Object.assign({}, state, { seq: seq });
+  chrome.storage.session.set({ lastState: payload }, function () {
     void chrome.runtime.lastError;
   });
+  return seq;
 }
 
 function writeTest(result) {
@@ -174,7 +186,7 @@ async function applyProxy() {
   // 暂停期间不得静默丢弃本次请求：
   // 只 return 会让「测试期间保存的新配置」永远不下发 —— 界面与存储显示新端口，
   // 浏览器却仍在用旧配置，且没有任何报错（R3-01）。
-  // 这里记脏，由测试的恢复阶段结束后按【最新 settings】重新下发一次。
+  // 这里记脏，由对比窗口的收尾阶段按【最新 settings】重新下发一次。
   if (suspendDepth > 0) {
     suspendDirty = true;
     updateIcon("suspended");
@@ -182,6 +194,13 @@ async function applyProxy() {
     return { ok: true, status: "suspended" };
   }
 
+  return applyProxyCore();
+}
+
+// 真正的下发实现，【不含】暂停检查。
+// 对比窗口的恢复阶段必须直接用它：窗口期间 suspendDepth 仍然 > 0（暂停贯穿收尾），
+// 但恢复本身就是要按最新 settings 提交，不能被自己的暂停挡掉（R3-01）。
+async function applyProxyCore() {
   var settings = await readSettings();
   settings.bypassList = await readBypassText();
 
@@ -216,6 +235,19 @@ async function applyProxy() {
     } catch (legacyErr) {
       console.warn("清理遗留作用域失败（不影响本次下发）:", LEGACY_SCOPES[i], legacyErr);
     }
+  }
+
+  // 3.5) 下发前的控制权保护（不夺权）：
+  //   若当前代理设置已【确证】被企业策略或其它扩展接管，再写下去就是夺权 ——
+  //   对比窗口收尾之后的排队任务会走到这里，此时外部接管仍在，必须跳过。
+  //   注意：回读失败（pre 为 null）时不阻断正常下发，否则代理故障期间扩展完全不可用；
+  //   "未知即拒绝"的严格判定只用在【对比窗口收尾】那条会造成夺权的路径上。
+  var pre = await readProxyDetails();
+  var preLevel = pre ? pre.levelOfControl : null;
+  if (preLevel && !isControllableByUs(preLevel)) {
+    updateIcon("overridden");
+    writeState({ status: "overridden", levelOfControl: preLevel, at: Date.now() });
+    return { ok: true, status: "overridden", levelOfControl: preLevel };
   }
 
   // 4) 原生 fixed_servers 下发（不生成 PAC 脚本）
@@ -254,16 +286,50 @@ async function applyProxy() {
     return { ok: false, status: "error", errors: [rmsg] };
   }
 
+  // 控制权判定改为【白名单】（R3-04）：
+  //   此前是 `if (level && level !== 'controlled_by_this_extension')` —— level 缺失
+  //   （undefined）时短路为假，直接落入 applied：在"无法确认控制权"的情况下宣称
+  //   "已生效"，属失败开放。现在只有确证由本扩展控制才算成功。
   var level = details.levelOfControl;
-  if (level && level !== 'controlled_by_this_extension') {
+  if (level !== 'controlled_by_this_extension') {
+    if (!level) {
+      var umsg = "回读结果缺少 levelOfControl，无法确认代理控制权";
+      updateIcon("error");
+      writeState({ status: "error", message: umsg, at: Date.now() });
+      return { ok: false, status: "error", errors: [umsg] };
+    }
     updateIcon("overridden");
     writeState({ status: "overridden", levelOfControl: level, at: Date.now() });
     return { ok: true, status: "overridden", levelOfControl: level };
   }
 
+  // 落实校验（R3-07）：set 的回调成功 ≠ 配置真的生效。
+  //   此前对比窗口会把 `{mode:"direct"}` 当作 backup 写回，set 成功但代理并未挂上，
+  //   状态却仍写 applied —— 界面说"已生效"，实际却在直连。
+  var actualMode = details.value && details.value.mode;
+  if (actualMode && actualMode !== "fixed_servers") {
+    var mmsg = "下发后实际代理模式为 " + actualMode + "，与期望的 fixed_servers 不符";
+    updateIcon("error");
+    writeState({ status: "error", message: mmsg, levelOfControl: level, at: Date.now() });
+    return { ok: false, status: "error", errors: [mmsg] };
+  }
+
   updateIcon("applied");
   writeState({ status: "applied", levelOfControl: level, at: Date.now() });
   return { ok: true, status: "applied" };
+}
+
+// 排他入口（R3-01）：把一段会改动 chrome.proxy 的复合操作整体排入同一条串行队列。
+//   与 applyProxySerial 的区别：任务体不受「代次跳过」影响（它自身就是最新意图），
+//   但它会推进代次，使此前排队的旧请求过期 —— 因为任务收尾时会按最新 settings 提交，
+//   那些旧请求想要的结果已经被这次提交覆盖。
+//   对比测试的「清除 → 取直连出口 → 恢复」必须整体走这里，否则它会和普通下发
+//   构成两条互相交错的写路径：恢复写回在途时保存的新端口会被旧 backup 反向覆盖。
+function applyProxyExclusive(task) {
+  ++applyGeneration;
+  var run = applyChain.then(function () { return task(); });
+  applyChain = run.then(function () {}, function () {});
+  return run;
 }
 
 // applyProxy 的串行化入口。所有事件回调都应调用它，而不是直接调用 applyProxy。
@@ -337,83 +403,154 @@ async function runConnectionTest(compare) {
   }
 
   if (compare && settings.enableProxy && controlledByUs) {
-    var backup = before && before.value ? before.value : null;
-
-    // 暂停自动下发：否则测试期间任何 storage 变化都会把代理重新写回，
-    // 使下面这次「直连出口」实际测到代理出口，导致 ipChanged 误判。
-    //
-    // 用计数器（进入 +1 / 退出 -1）而非布尔保存-恢复：
-    // 布尔模式在并发下会失配并永久卡住，计数器无论怎样交错都必然归零。
-    // try/finally 保证即使中途抛错也一定递减。
-    suspendDepth++;
-    try {
-      try {
-        await clearProxyScope("regular");
-      } catch (directClearErr) {
-        // 清除失败就无法取得可信的直连出口，必须如实标记，不能假装测过直连。
-        result.directClearFailed = (directClearErr && directClearErr.message) || String(directClearErr);
-      }
-      result.direct = await fetchExit();
-    } finally {
-      suspendDepth--;
-      if (suspendDepth < 0) suspendDepth = 0;   // 防御性归零，避免异常路径下变负
-
-      // 恢复阶段第一步：复核控制权。
-      // 若对比期间代理已被企业策略或其它扩展接管，写回旧 backup 等同于夺权，
-      // 必须直接放弃写回，只如实记录状态。
-      var controlNow = await readProxyDetails();
-      var levelNow = controlNow ? controlNow.levelOfControl : null;
-      var takenExternally = !!(levelNow &&
-        levelNow !== "controlled_by_this_extension" &&
-        levelNow !== "controllable_by_this_extension");
-
-      if (takenExternally) {
-        suspendDirty = false;
-        result.overriddenDuringTest = levelNow;
-        writeState({ status: "overridden", levelOfControl: levelNow, at: Date.now() });
-        updateIcon("overridden");
-      } else {
-        try {
-          if (backup) await setProxy(backup);
-          else await clearProxyScope("regular");
-        } catch (restoreErr) {
-          result.restoreFailed = true;
-          // 尽力恢复：按当前设置重新下发一次（绕过串行队列，确保立即执行）
-          try { await applyProxy(); } catch (e2) {}
-        }
-
-        // 恢复阶段第二步：重放暂停期间被跳过的更新（R3-01）。
-        // 上面的恢复写回的是【测试前的旧配置】；若用户在这期间改过端口或关闭了代理，
-        // 旧备份会把它反向覆盖，且此后不再有 storage 变化事件来纠正，
-        // 于是界面/存储与实际长期不一致且无任何报错。这里按最新 settings 重新下发。
-        if (suspendDirty && suspendDepth === 0) {
-          suspendDirty = false;
-          try {
-            await applyProxy();
-          } catch (e3) {
-            console.warn("重放暂停期间的设置变更失败:", e3);
-          }
-        }
-      }
-    }
+    // 整个对比窗口作为一个【排他任务】排入与普通下发相同的串行队列（R3-01）。
+    //   · 此前窗口内的 clear / 恢复都直接调用，与普通下发构成两条并行写路径；
+    //     窗口期间保存的新端口会被恢复写回的旧 backup 反向覆盖，且此后没有任何
+    //     变化事件来纠正 —— 界面与存储显示新值，浏览器却长期在用旧值。
+    //   · 入队后：窗口之前排队的旧请求会在任务开始时过期；窗口期间到达的更新请求
+    //     只排队不执行；窗口收尾按【最新 settings】提交，排队请求随后幂等重放。
+    await applyProxyExclusive(function () {
+      return runCompareWindow(result, settings);
+    });
 
     result.ipChanged = !!(result.exit.ok && result.direct && result.direct.ok &&
       result.exit.ip !== result.direct.ip);
 
-    // 测试得出「未生效」结论时，同步更新整体状态，避免界面自相矛盾：
-    // 此前测试面板会说「代理很可能未生效」，而顶部状态条仍显示「已生效」。
+    // 测试得出「未生效」结论时，同步更新整体状态，避免界面自相矛盾。
+    // 但【不得覆盖更权威的结论】（R3-07）：窗口内若发生外部接管或控制权变更，
+    // 写下的 overridden 表达的是"我们已放弃控制权"——这比"出口相同"的推断更重要；
+    // 被改写成 error 会让用户以为只是代理没配对，从而去排查代理，
+    // 而真正需要处理的是企业策略或其它扩展。此前这里无条件写 error，把 overridden 盖掉。
     if (result.exit.ok && result.direct && result.direct.ok && !result.ipChanged) {
-      writeState({
-        status: "error",
-        message: "出口检测显示当前出口与直连相同，代理可能未生效",
-        at: Date.now()
-      });
-      updateIcon("error");
+      var supersededByTakeover = !!(result.overriddenDuringTest || result.controlChangedBeforeClear);
+      if (supersededByTakeover) {
+        result.stateSuperseded = true;
+      } else {
+        writeState({
+          status: "error",
+          message: "出口检测显示当前出口与直连相同，代理可能未生效",
+          at: Date.now()
+        });
+        updateIcon("error");
+      }
     }
   }
 
   writeTest(result);
   return result;
+}
+
+// 对比窗口的排他任务体（R3-01 / R3-04 / R3-07）。
+// 调用前提：已经在 applyChain 内部执行，因此这里是 chrome.proxy 的唯一写入者。
+// 顺序：复核控制权 → 清除 → 取直连出口 → 按最新 settings 收尾提交。
+async function runCompareWindow(result, settingsAtStart) {
+  // 暂停标记贯穿整个窗口（含收尾提交）：窗口期间到达的下发请求就此记脏，
+  //   收尾提交之后再递减，保证"暂停"不会在恢复之前失效（R3-01 根因之二）。
+  suspendDepth++;
+  try {
+    // 窗口一开始就【主动】把状态转成 suspended（R3-07）。
+    //   此前 suspended 只在"暂停期间恰好收到一次 apply 请求"时才产生：
+    //   正常的对比测试（用户没动设置）全程没有任何可观测的状态变化，界面会一直
+    //   停留在测试前的旧结论上，而实际此刻代理已被清除、正在取直连出口。
+    //   现在由窗口自身产生，与"是否有人恰好改设置"无关。
+    writeState({ status: "suspended", at: Date.now() });
+    updateIcon("suspended");
+
+    // 第一步：清除【之前】重新确认控制权（R3-04）。
+    //   runConnectionTest 的 controlledByUs 由公式算出，而清除是在这之后才执行；
+    //   两者之间企业策略或其它扩展可能接管（check-then-act TOCTOU）。
+    //   若此时已非我方/不可控，就绝不能执行清除 —— 那会把刚被接管方的配置清掉，
+    //   而恢复阶段又会因为检测到接管而放弃写回，导致外部配置被我们破坏且无人恢复。
+    var controlBeforeClear = await readProxyDetails();
+    var levelBeforeClear = controlBeforeClear ? controlBeforeClear.levelOfControl : null;
+    if (!isControllableByUs(levelBeforeClear)) {
+      result.controlChangedBeforeClear = levelBeforeClear || "unknown";
+      result.compareSkipped = "control_changed_before_clear";
+      // 即时读取脏标记：此刻暂停窗口可能已经打开了记脏（清除前复核与清除之间的变化）
+      result.pendingResubmit = suspendDirty;
+      writeState({ status: "overridden", levelOfControl: levelBeforeClear || null, at: Date.now() });
+      updateIcon("overridden");
+      return result;
+    }
+
+    try {
+      await clearProxyScope("regular");
+    } catch (directClearErr) {
+      // 清除失败就无法取得可信的直连出口，必须如实标记，不能假装测过直连。
+      result.directClearFailed = (directClearErr && directClearErr.message) || String(directClearErr);
+    }
+    result.direct = await fetchExit();
+
+    // 第二步：收尾复核控制权。
+    //   白名单判定（R3-04）：只有确证"本扩展控制"或"当前无人控制（可被我方控制）"
+    //   才允许提交。回读失败（controlNow=null）、返回缺字段、或已被外部接管，
+    //   一律视为【不可提交】—— 此前回读失败被当成"没人接管"而默认写回旧 backup，
+    //   属失败开放。
+    var controlNow = await readProxyDetails();
+    var levelNow = controlNow ? controlNow.levelOfControl : null;
+
+    if (!isControllableByUs(levelNow)) {
+      // 不夺权：绝不写回。
+      //   也【不清空脏标记】（R3-01 逃逸面）：暂停期间用户保存的新配置仍然有待提交，
+      //   清掉它就等于把这次变更永久丢弃，且没有任何提示 —— 与原始缺陷同型。
+      result.overriddenDuringTest = levelNow || "unknown_control";
+      // 即时读取脏标记（R3-01 逃逸面）：暂停期保存的新配置确实还有待下发，
+      // 必须如实汇报，绝不能清空它后当作"什么都没发生"。
+      result.pendingResubmit = suspendDirty;
+      writeState({
+        status: levelNow ? "overridden" : "error",
+        levelOfControl: levelNow || null,
+        message: levelNow ? undefined : "对比后无法回读控制权，已放弃写回以免夺权",
+        pendingResubmit: suspendDirty,
+        at: Date.now()
+      });
+      updateIcon(levelNow ? "overridden" : "error");
+      return result;
+    }
+
+    // 第三步：按【最新 settings】提交，而不是写回测试前的旧 backup（R3-01 根因之三）。
+    //   旧 backup 会把窗口期间用户改的端口、乃至"关闭代理"反向覆盖，且此后不再有
+    //   变化事件来纠正。按最新 settings 提交则天然同时满足：
+    //     用户改了端口 → 下发新端口；用户关闭代理 → 清除代理；用户没改 → 语义等价。
+    //   applyProxyCore 内部会回读控制权并校验实际模式，因此状态与实际保持一致（R3-07）。
+    try {
+      await applyProxyCore();
+      suspendDirty = false;
+    } catch (restoreErr) {
+      result.restoreFailed = true;
+      var rmsg = (restoreErr && restoreErr.message) || String(restoreErr);
+      console.warn("对比后按最新设置提交失败:", rmsg);
+      writeState({ status: "error", message: "对比后恢复代理设置失败：" + rmsg, at: Date.now() });
+      updateIcon("error");
+    }
+
+    // 第四步：兜底重放。收尾提交已按最新 settings 执行；若期间还有更新到达而
+    //   未被子提交覆盖（理论上被队列保证，此处为纵深防御），再补一次。
+    if (suspendDirty) {
+      try {
+        await applyProxyCore();
+        suspendDirty = false;
+      } catch (e3) {
+        console.warn("重放暂停期间的设置变更失败:", e3);
+      }
+    }
+
+    return result;
+  } finally {
+    // 暂停贯穿收尾：直到恢复与重放全部结束才递减（R3-01 根因之二）。
+    suspendDepth--;
+    if (suspendDepth < 0) suspendDepth = 0;   // 防御性归零，避免异常路径下变负
+  }
+}
+
+// 控制权白名单（R3-04）：只有这两种取值表示"我方可以合法写入代理设置"。
+//   · controlled_by_this_extension —— 由本扩展控制；
+//   · controllable_by_this_extension —— 当前无人控制，本扩展可以接管。
+// 其它取值（其它扩展 / 企业策略）以及 null/undefined（回读失败或缺字段）
+// 一律视为不可写：未知不是"没有接管"，未知就是未知。
+function isControllableByUs(level) {
+  return level === "controlled_by_this_extension" ||
+         level === "controllable_by_this_extension";
 }
 
 /* ==================== 生命周期与事件 ==================== */

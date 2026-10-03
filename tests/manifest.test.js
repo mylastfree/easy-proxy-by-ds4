@@ -115,5 +115,35 @@ t("无悬空引用（引用的 ID 全部存在）", missingIds.length === 0,
   missingIds.length ? "缺失: " + missingIds.join(", ") : "");
 
 console.log("");
+console.log("== 发布 tag 与 manifest.version 一致性（R3-02）==");
+{
+  // 说明：门禁【只校验】，不创建也不移动任何 tag —— 创建正式 tag 属于发布动作。
+  //   触发条件为 tag push 时，CI 另有一步硬断言；这里做本地软校验：
+  //   git 不可用或当前提交没有 tag 时不计失败（避免日常开发误报），
+  //   但只要存在指向 HEAD 的 tag，它就必须等于 v{version}。
+  let tagAtHead = null, gitAvailable = true;
+  try {
+    const { execFileSync } = require("node:child_process");
+    const out = execFileSync("git", ["tag", "--points-at", "HEAD"], {
+      cwd: path.join(__dirname, ".."), stdio: ["ignore", "pipe", "ignore"]
+    }).toString().trim();
+    tagAtHead = out ? out.split(/\r?\n/).filter(Boolean) : [];
+  } catch (e) { gitAvailable = false; }
+
+  const version = read("manifest.json") && JSON.parse(read("manifest.json")).version;
+  if (!gitAvailable) {
+    console.log("  SKIP  git 不可用，跳过发布 tag 一致性校验");
+  } else if (tagAtHead === null || tagAtHead.length === 0) {
+    console.log("  SKIP  当前提交没有 tag（候选提交），跳过发布 tag 一致性校验");
+  } else {
+    for (const tag of tagAtHead) {
+      t("指向 HEAD 的 tag " + tag + " 与 manifest.version 一致（应为 v" + version + "）",
+        tag === "v" + version, "tag=" + tag + " version=" + version);
+    }
+  }
+  t("manifest.json 能读出 version", typeof version === "string" && version.length > 0, String(version));
+}
+
+console.log("");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail > 0 ? 1 : 0);

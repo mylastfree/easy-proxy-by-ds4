@@ -84,6 +84,9 @@ function renderStatus(state) {
   var text = row[0];
   if (state.errors && state.errors.length) text += "：" + state.errors.join("；");
   else if (state.message) text += "：" + state.message;
+  // 对比测试期间保存的配置，若因外部接管而尚未下发，必须让用户看得见（R3-01）。
+  // 此前这种情况被静默丢弃：存储里是新值、界面无任何提示、浏览器仍在用旧配置。
+  if (state.pendingResubmit) text += "（有配置变更待下发）";
   el.statusBar.textContent = text;
   el.statusBar.className = "status " + row[1];
 }

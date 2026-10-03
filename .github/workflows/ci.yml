@@ -58,6 +58,22 @@ jobs:
       - name: 并发护栏测试（N1/N2：暂停计数与测试互斥）
         run: node tests/concurrency.test.js
 
+      # 发布 tag 一致性（R3-02）：tag 触发时，tag 名必须与 manifest.version 完全对应。
+      # 只校验，不创建也不移动 tag —— 创建正式 tag 属于发布动作。
+      - name: 发布 tag 与版本一致性校验
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -e
+          VERSION=$(node -p "require('./manifest.json').version")
+          EXPECTED="v$VERSION"
+          ACTUAL="${GITHUB_REF_NAME}"
+          echo "期望 tag: $EXPECTED；实际 tag: $ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::发布 tag($ACTUAL) 与 manifest.version($VERSION) 不一致，拒绝发布"
+            exit 1
+          fi
+          echo "tag 与版本一致"
+
       - name: 变异测试（验证护栏测试真的会拦截回归）
         run: node tests/mutation-check.js
 
