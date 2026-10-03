@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>代理设置</title>
+  <style>
+    body { width: 420px; padding: 16px; margin: 0;
+           font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+           background: #f7f8fa; color: #222; font-size: 13px; }
+    h3 { margin: 0 0 12px; padding-bottom: 8px; font-size: 15px;
+         color: #1f2d3d; border-bottom: 2px solid #3498db; }
+    .status { padding: 8px 10px; margin-bottom: 12px; border-radius: 4px;
+              font-size: 12px; line-height: 1.5; }
+    .status.ok    { background: #e8f6ec; color: #1e7b34; border-left: 3px solid #2ecc71; }
+    .status.warn  { background: #fff6e5; color: #8a5a00; border-left: 3px solid #f39c12; }
+    .status.error { background: #fdecea; color: #a3251b; border-left: 3px solid #e74c3c; }
+    .status.muted { background: #eef0f3; color: #5a6772; border-left: 3px solid #95a5a6; }
+    label { display: block; margin: 10px 0 4px; font-weight: 500; }
+    input[type="text"], input[type="number"], select, textarea {
+      width: 100%; box-sizing: border-box; padding: 6px;
+      border: 1px solid #ccd2d9; border-radius: 4px; font-size: 13px; }
+    textarea { height: 118px; resize: vertical;
+               font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+    .inline { display: flex; align-items: center; gap: 6px; margin: 10px 0; }
+    .inline label { margin: 0; }
+    .btns { display: flex; gap: 8px; margin-top: 14px; }
+    button { flex: 1; padding: 9px; border: none; border-radius: 4px;
+             font-size: 13px; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: default; }
+    #saveButton { background: #3498db; color: #fff; }
+    #saveButton:hover:not(:disabled) { background: #2980b9; }
+    #resetButton { background: #e6e9ed; color: #444; }
+    #resetButton:hover { background: #d6dae0; }
+    details { margin-top: 10px; font-size: 12px; color: #5a6772; }
+    details pre { background: #eef0f3; padding: 8px; border-radius: 4px;
+                  white-space: pre-wrap; font-size: 11px; line-height: 1.6; margin: 6px 0 0; }
+    .hint { margin-top: 8px; font-size: 12px; min-height: 16px; line-height: 1.5; }
+    .hint.ok { color: #1e7b34; }
+    .hint.warn { color: #8a5a00; }
+    .hint.error { color: #a3251b; }
+    .panel { margin-top: 14px; padding: 10px; border: 1px solid #dde1e6;
+             border-radius: 4px; background: #fff; }
+    .panel h4 { margin: 0 0 8px; font-size: 13px; color: #1f2d3d; }
+    .kv { font-size: 12px; line-height: 1.8; }
+    .kv b { display: inline-block; min-width: 62px; color: #5a6772; font-weight: 500; }
+    .verdict { margin-top: 8px; padding: 6px 8px; border-radius: 3px; font-size: 12px; }
+    .verdict.ok { background: #e8f6ec; color: #1e7b34; }
+    .verdict.warn { background: #fff6e5; color: #8a5a00; }
+    .verdict.error { background: #fdecea; color: #a3251b; }
+  </style>
+</head>
+<body>
+  <h3>代理设置</h3>
+
+  <div id="statusBar" class="status muted">读取状态中…</div>
+
+  <div class="inline">
+    <input type="checkbox" id="enableProxy">
+    <label for="enableProxy">启用代理</label>
+  </div>
+
+  <label for="proxyType">代理类型</label>
+  <select id="proxyType"></select>
+
+  <div class="row">
+    <div>
+      <label for="proxyHost">代理地址</label>
+      <input type="text" id="proxyHost">
+    </div>
+    <div>
+      <label for="proxyPort">代理端口</label>
+      <input type="number" id="proxyPort" min="1" max="65535">
+    </div>
+  </div>
+
+  <label for="bypassList">不使用代理的网址列表（每行一个）</label>
+  <textarea id="bypassList" spellcheck="false"></textarea>
+
+  <details>
+    <summary>支持哪些写法？（点击展开）</summary>
+    <pre>192.168.0.0/16     该网段内的 IP 直连（仅对 IP 字面量生效）
+.local  .lan       以该后缀结尾的域名直连（如 nas.local）
+*.example.com      匹配全部子域（不含 example.com 本身）
+.example.com       等价于 *.example.com
+example.com        精确匹配该主机
+example.com:8080   仅该端口的请求直连
+<local>            不含点的主机名（如 http://nas）
+
+注意：网段规则只对「用 IP 访问」生效。
+      若用内网域名访问，请用 .local / .lan 这类后缀规则。
+
+回环地址（127.0.0.1、localhost、169.254.x.x）
+Chrome 已默认直连，无需手动填写。</pre>
+  </details>
+
+  <div class="btns">
+    <button id="saveButton">保存设置</button>
+    <button id="resetButton">恢复默认</button>
+  </div>
+  <div id="hint" class="hint"></div>
+
+  <div class="panel">
+    <h4>连接测试</h4>
+    <div class="btns" style="margin-top:0">
+      <button id="testButton">测试当前出口</button>
+      <button id="testDirectButton">对比直连出口</button>
+    </div>
+    <div id="testResult" class="kv" style="margin-top:10px;color:#5a6772">
+      尚未测试。点击「测试当前出口」查看流量实际从哪里出去。
+    </div>
+  </div>
+
+  <script src="settings.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
