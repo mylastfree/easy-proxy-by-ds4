@@ -98,6 +98,7 @@
 | `background.js` | 代理下发、状态维护、错误监听、出口检测 |
 | `popup.js` | 表单渲染、行内校验、测试结果展示 |
 | `popup.html` | 界面结构与样式 |
+| `icon-{red,green}-{16,32,48,128}.png` | 状态图标，四档标准尺寸，红=未启用 / 绿=已生效 |
 
 ## 隐私说明
 
@@ -139,6 +140,12 @@ node tests\mutation-check.js   # 运行后会自动还原被变异文件
 ## 版本历史
 
 详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.1.0`。
+
+## 安全
+
+权限仅 `proxy` + `storage`，**不申请任何 host 权限**，因此无法读取网页内容、浏览历史或 Cookie。唯一的对外请求是你在点击「连接测试」时访问 `ipinfo.io`。详见 [SECURITY.md](SECURITY.md)。
+
+发现漏洞请走 [私密报告渠道](SECURITY.md)，不要开公开 Issue。
 
 ## 许可证
 

@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.1.0]
+// background.js —— MV3 Service Worker  [v2.1.1]
 importScripts("settings.js");
 
 var S = self.EasyProxy;
@@ -6,6 +6,20 @@ var CONFIG_KEYS = Object.keys(S.DEFAULTS);
 
 // 旧版可能残留的其它作用域，启用时一并清理，避免其继续压制流量
 var LEGACY_SCOPES = ['regular_only', 'incognito_persistent', 'incognito_session_only'];
+
+// 图标按尺寸分别提供，Chrome 按显示场景挑选合适的一档，避免缩放模糊
+var ICON_RED = {
+  "16": "icon-red-16.png",
+  "32": "icon-red-32.png",
+  "48": "icon-red-48.png",
+  "128": "icon-red-128.png"
+};
+var ICON_GREEN = {
+  "16": "icon-green-16.png",
+  "32": "icon-green-32.png",
+  "48": "icon-green-48.png",
+  "128": "icon-green-128.png"
+};
 
 /* ==================== 存储读写 ==================== */
 
@@ -77,7 +91,7 @@ function readProxyDetails() {
 function updateIcon(status) {
   // 只有真正下发成功才显示绿色，避免"绿着但直连"的误导
   var ok = status === 'applied';
-  chrome.action.setIcon({ path: ok ? 'icon-green.png' : 'icon-red.png' }, function () {
+  chrome.action.setIcon({ path: ok ? ICON_GREEN : ICON_RED }, function () {
     void chrome.runtime.lastError;
   });
   var titles = {

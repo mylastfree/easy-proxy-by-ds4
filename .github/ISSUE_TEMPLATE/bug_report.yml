@@ -1,0 +1,98 @@
+name: 缺陷报告
+description: 报告一个可复现的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请尽量填写完整，缺少环境信息的缺陷往往难以定位。
+
+        > 如果是**安全问题**，请不要在此公开提交，改用 [SECURITY.md](../blob/main/SECURITY.md) 中的私密渠道。
+
+  - type: input
+    id: version
+    attributes:
+      label: 扩展版本
+      description: 在 `chrome://extensions` 中查看，或见仓库的 Releases
+      placeholder: 例如 2.1.1
+    validations:
+      required: true
+
+  - type: input
+    id: chrome
+    attributes:
+      label: Chrome 版本与渠道
+      description: 在 `chrome://version` 中查看（注意区分稳定版 / Beta / Dev）
+      placeholder: 例如 Chrome 136.0.7103.93（稳定版）
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统
+      placeholder: 例如 Windows 11 25H2
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请写出最小可复现的步骤
+      placeholder: |
+        1. 打开扩展弹窗
+        2. 把端口改为 ...
+        3. 点击保存
+        4. 观察到 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+    validations:
+      required: true
+
+  - type: input
+    id: proxy
+    attributes:
+      label: 代理软件与监听端口
+      description: 例如 sing-box / v2rayN / Clash，以及地址端口
+      placeholder: 例如 sing-box mixed 127.0.0.1:10808
+    validations:
+      required: false
+
+  - type: textarea
+    id: tests
+    attributes:
+      label: 连接测试结果
+      description: |
+        如果条件允许，请点击弹窗里的「对比直连出口」并粘贴结果。
+        这一步能直接区分「代理没生效」与「代理生效但行为不符预期」。
+      placeholder: |
+        当前出口: ...
+        直连出口: ...
+        结论: ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: console
+    attributes:
+      label: 控制台日志
+      description: |
+        `chrome://extensions` → 本扩展 → 「Service Worker」可查看后台日志；
+        在弹窗上右键「检查」可查看弹窗日志。
+      render: shell
+    validations:
+      required: false
