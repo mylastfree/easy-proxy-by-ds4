@@ -21,9 +21,28 @@ const testFiles = [
   "concurrency.test.js"
 ].map(function (f) { return path.join(__dirname, f); });
 
+// 换行符处理：
+//   变异用的 from/to 片段统一按 LF 书写，但仓库在 Windows 检出时可能是 CRLF。
+//   若直接拿含 \n 的片段去匹配 CRLF 文件，会注入失败 —— 这在 CI（Linux）与
+//   本地（Windows）之间表现不一致，属于可移植性缺陷。
+//   这里读取时把 CRLF 归一为 LF 做匹配，写回时再还原成原文件的风格。
+function detectEol(s) { return s.indexOf("\r\n") >= 0 ? "\r\n" : "\n"; }
+function toLf(s) { return s.split("\r\n").join("\n"); }
+function restoreEol(s, eol) { return eol === "\n" ? s : s.split("\n").join(eol); }
+
 const originals = {
   bg: fs.readFileSync(targets.bg, "utf8"),
   set: fs.readFileSync(targets.set, "utf8")
+};
+
+// 匹配用（LF 归一），写回用（原风格）
+const norm = {
+  bg: toLf(originals.bg),
+  set: toLf(originals.set)
+};
+const eol = {
+  bg: detectEol(originals.bg),
+  set: detectEol(originals.set)
 };
 
 // 只要有一个测试文件失败，就认为变异被拦截
@@ -109,9 +128,13 @@ try {
   for (const m of mutations) {
     const file = targets[m.target];
     const orig = originals[m.target];
-    const mutated = orig.split(m.from).join(m.to);
+    // 在 LF 归一化的文本上做替换，确保 CRLF 检出时同样能命中
+    const mutatedLf = norm[m.target].split(m.from).join(m.to);
+    const mutated = mutatedLf === norm[m.target]
+      ? orig                                   // 未命中，视为注入失败
+      : restoreEol(mutatedLf, eol[m.target]);  // 命中，按原风格写回
 
-    if (mutated === orig) {
+    if (mutatedLf === norm[m.target]) {
       rows.push([m.name, "注入失败", "-", false, true]);
       bad++;
       continue;
