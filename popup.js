@@ -168,6 +168,12 @@ function renderTest(result) {
     if (result.ipChanged) {
       verdict = "✓ 代理确实生效：当前出口与直连出口不同。";
       kind = "ok";
+    } else if (result.stateSuperseded) {
+      verdict = "ℹ 对比期间控制权已变更，保留接管结论，不用出口比较覆盖它。";
+      kind = "warn";
+    } else if (result.activeMode === "fixed_servers") {
+      verdict = "ℹ 出口 IP 与直连相同，但代理配置仍在，并未回退直连。";
+      kind = "warn";
     } else {
       verdict = "✗ 出口 IP 与直连相同——代理很可能未生效，或代理本身不改变出口。";
       kind = "error";

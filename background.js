@@ -50,22 +50,10 @@ function readBypassText() {
   });
 }
 
-// 状态写入代次（R3-07）：
-//   状态是"最近一次结论"的快照，而结论可能"较早得出、较晚写入"——
-//   例如对比测试在窗口内已经写下 overridden，测试结束时的"出口相同"结论
-//   又会把它改写成 error，使用户看到过期且错误的结论。
-//   这里给每次写入编号，写入方据此判断自己是否已被更新的结论取代。
-var stateSeq = 0;
-var lastStateSeq = 0;
-
 function writeState(state) {
-  var seq = ++stateSeq;
-  lastStateSeq = seq;
-  var payload = Object.assign({}, state, { seq: seq });
-  chrome.storage.session.set({ lastState: payload }, function () {
+  chrome.storage.session.set({ lastState: state }, function () {
     void chrome.runtime.lastError;
   });
-  return seq;
 }
 
 function writeTest(result) {
@@ -423,16 +411,8 @@ async function runConnectionTest(compare) {
     // 被改写成 error 会让用户以为只是代理没配对，从而去排查代理，
     // 而真正需要处理的是企业策略或其它扩展。此前这里无条件写 error，把 overridden 盖掉。
     if (result.exit.ok && result.direct && result.direct.ok && !result.ipChanged) {
-      var supersededByTakeover = !!(result.overriddenDuringTest || result.controlChangedBeforeClear);
-      if (supersededByTakeover) {
+      if (result.overriddenDuringTest || result.controlChangedBeforeClear) {
         result.stateSuperseded = true;
-      } else {
-        writeState({
-          status: "error",
-          message: "出口检测显示当前出口与直连相同，代理可能未生效",
-          at: Date.now()
-        });
-        updateIcon("error");
       }
     }
   }

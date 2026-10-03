@@ -435,6 +435,18 @@ function ask(handler, msg) {
     });
     const html4 = p.el.testResult.innerHTML;
     t("控制权未知时说明已跳过对比", html4.indexOf("无法确认当前代理控制权") >= 0, html4);
+
+    p.renderTest({
+      ok: true,
+      activeMode: "fixed_servers",
+      exit: { ok: true, ip: "192.0.2.1" },
+      direct: { ok: true, ip: "192.0.2.1" },
+      ipChanged: false,
+      settings: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808" }
+    });
+    const html5 = p.el.testResult.innerHTML;
+    t("配置仍在时，不说代理很可能未生效", html5.indexOf("很可能未生效") < 0, html5);
+    t("配置仍在时，说明并未回退直连", html5.indexOf("并未回退直连") >= 0, html5);
   }
 
   console.log("");

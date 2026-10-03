@@ -458,6 +458,32 @@ function t(name, cond, extra) {
   }
 
   console.log("");
+  console.log("== R5-02：出口相同不得把仍生效的代理显示成异常 ==");
+  {
+    const env = buildEnv({ fetchDelay: 30 });
+    await ready(env, "10808");
+    env.sandbox.fetch = function () {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ ip: "192.0.2.1", org: "", city: "", region: "", country: "" })
+      });
+    };
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(200);
+    const st = env.sessionStore.lastState || {};
+    t("两次出口相同时，生效配置仍是原代理",
+      env.getEffective() === "127.0.0.1:10808",
+      "effective=" + env.getEffective());
+    t("两次出口相同时，状态不是 error",
+      st.status === "applied", JSON.stringify(st));
+    t("两次出口相同时，最后一档图标仍是绿色",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-green-16.png",
+      "icon=" + env.iconCalls[env.iconCalls.length - 1]);
+    t("测试结果仍记录出口未变化",
+      resp && resp.result && resp.result.ipChanged === false);
+  }
+
+  console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);
 })().catch(e => { console.error("EXC: " + (e && e.stack || e)); process.exit(2); });
