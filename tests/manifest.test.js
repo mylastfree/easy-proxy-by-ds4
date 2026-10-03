@@ -115,6 +115,17 @@ t("无悬空引用（引用的 ID 全部存在）", missingIds.length === 0,
   missingIds.length ? "缺失: " + missingIds.join(", ") : "");
 
 console.log("");
+console.log("== CI 必须先跑所有权测试，再跑变异 ==");
+{
+  const ci = read(".github/workflows/ci.yml");
+  const ownAt = ci.indexOf("node tests/ownership.test.js");
+  const mutAt = ci.indexOf("node tests/mutation-check.js");
+  t("CI 含独立的 ownership 步骤", ownAt >= 0);
+  t("ownership 步骤位于变异步骤之前", ownAt >= 0 && mutAt > ownAt,
+    "ownership=" + ownAt + " mutation=" + mutAt);
+}
+
+console.log("");
 console.log("== 发布 tag 与 manifest.version 一致性（R3-02）==");
 {
   // 说明：门禁【只校验】，不创建也不移动任何 tag —— 创建正式 tag 属于发布动作。
