@@ -13,7 +13,7 @@ const SENDER_ID = "test-extension-id";
 function buildEnv(opts) {
   opts = opts || {};
   const syncStore = {}, localStore = {}, sessionStore = {};
-  const listeners = { changed: [], installed: [], startup: [], message: [] };
+  const listeners = { changed: [], installed: [], startup: [], message: [], onChange: [] };
   const applied = [];
   let proxyActive = false;
   const fetchBehaviour = opts.fetchBehaviour || "ok";
@@ -98,7 +98,10 @@ function buildEnv(opts) {
             value: proxyActive ? { mode: "fixed_servers" } : { mode: "system" },
             levelOfControl: "controlled_by_this_extension"
           }), 0);
-        }
+        },
+        // R6-04：background.js 会注册 chrome.proxy.settings.onChange；
+        //   缺少该桩会让脚本一加载就抛 TypeError，整套用例连锁失败。
+        onChange: { addListener(f) { listeners.onChange.push(f); } }
       },
       onProxyError: { addListener: f => {} }
     },

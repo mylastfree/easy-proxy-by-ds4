@@ -20,7 +20,7 @@ const bgSrc = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
 function buildEnv(opts) {
   opts = opts || {};
   const syncStore = {}, localStore = {}, sessionStore = {};
-  const listeners = { changed: [], message: [] };
+  const listeners = { changed: [], message: [], onChange: [] };
   const setCalls = [];          // 每次 setProxy 的主机:端口
   let proxyActive = false;
   // 记录「当前实际生效的代理配置」，供 R3-01 的行为断言使用。
@@ -122,7 +122,10 @@ sandbox.chrome = {
             value = { mode: "direct" };
           }
           setTimeout(function () { cb({ value: value, levelOfControl: "controlled_by_this_extension" }); }, 0);
-        }
+        },
+        // R6-04：background.js 会注册 chrome.proxy.settings.onChange；
+        //   缺少该桩会让脚本一加载就抛 TypeError，整套用例连锁失败。
+        onChange: { addListener: function (f) { listeners.onChange.push(f); } }
       },
       onProxyError: { addListener: function(){} }
     },

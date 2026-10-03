@@ -28,7 +28,7 @@ function buildEnv(opts) {
   const syncStore = {};
   const localStore = {};
   const sessionStore = {};
-  const listeners = { changed: [], installed: [], startup: [], message: [] };
+  const listeners = { changed: [], installed: [], startup: [], message: [], onChange: [] };
   const applied = [];        // 按「完成时刻」记录真正写入浏览器的配置
   let proxyActive = false;   // 当前是否挂着代理（决定 fetch 返回哪个出口 IP）
   let fetchCount = 0;
@@ -145,7 +145,10 @@ function buildEnv(opts) {
             value: proxyActive ? { mode: "fixed_servers" } : { mode: "system" },
             levelOfControl: "controlled_by_this_extension"
           }), 0);
-        }
+        },
+        // R6-04：background.js 会注册 chrome.proxy.settings.onChange；
+        //   缺少该桩会让脚本一加载就抛 TypeError，整套用例连锁失败。
+        onChange: { addListener(f) { listeners.onChange.push(f); } }
       },
       onProxyError: { addListener() {} }
     },

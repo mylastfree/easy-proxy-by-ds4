@@ -170,6 +170,13 @@ var suspendDepth = 0;
 // 因此必须单独记脏，退出暂停后按最新 settings 重放（R3-01）。
 var suspendDirty = false;
 
+// 【R6-04】我方最近一次成功下发的意图，用于识别 chrome.proxy.settings.onChange 的
+//   自触发回声（本扩展自己 set/clear 也会触发该事件）。用【值比对】而不是时间窗：
+//   时间窗会把「我方写完之后立刻被外部接管」这一段真实变化静默吞掉，值比对没有这个盲区。
+//   登记在册的代价：外部恰好下发与我方完全相同的 mode/host/port 时会被误判为回声，
+//   但那种情况下状态本来等价，影响可忽略。
+var lastIntent = null;
+
 async function applyProxy() {
   // 暂停期间不得静默丢弃本次请求：
   // 只 return 会让「测试期间保存的新配置」永远不下发 —— 界面与存储显示新端口，
@@ -205,6 +212,8 @@ async function applyProxyCore() {
   // 1) 未启用：清除常规作用域
   if (!settings.enableProxy) {
     try {
+      // R6-04：记录本次下发意图（直连），供 onChange 回声抑制按值比对。
+      lastIntent = { mode: "direct" };
       await clearProxyScope("regular");
     } catch (clearErr) {
       var cmsg = (clearErr && clearErr.message) || String(clearErr);
@@ -266,6 +275,12 @@ async function applyProxyCore() {
   };
 
   try {
+    // R6-04：记录本次下发意图，供 onChange 回声抑制按值比对。
+    lastIntent = {
+      mode: "fixed_servers",
+      host: config.rules.singleProxy.host,
+      port: String(config.rules.singleProxy.port)
+    };
     await setProxy(config);
   } catch (err) {
     var msg = (err && err.message) || String(err);
@@ -641,6 +656,95 @@ chrome.runtime.onInstalled.addListener(function (details) {
 });
 
 chrome.runtime.onStartup.addListener(function () { applyProxySerial(); });
+
+// 【R6-04】代理设置的【外部】变化：企业策略或其它扩展接管 / 释放之后，状态必须及时对齐。
+//   此前状态只由 startup、onProxyError 与 storage 变化驱动，全文件未注册 onChange，
+//   于是外部接管后 getStatus 会一直返回过时的 applied，外部释放后更是界面宣称生效、
+//   实际却在直连（02 探针-H / 探针-J），只能等冷启动才被纠正。
+//
+// 【硬约束】回调里【只读回查】，绝不写回：
+//   · 不调用 setProxy / clearProxyScope / applyProxyCore / applyProxySerial；
+//   · 否则会在外部接管的瞬间夺权，与 isControllableByUs 白名单策略直接冲突
+//     （那套策略的全部意义就是「确证可写才写」）。
+//   本回调只做三件事：readProxyDetails 回读 → 推导状态 → writeState + updateIcon。
+//
+// 【自触发抑制】本扩展自己每次 set/clear 也会触发该事件。这里用【值比对】而不是时间窗：
+//   与 lastIntent 完全一致的变更判定为我方回声，直接忽略；只要值不同（外部接管）立刻生效。
+//   时间窗方案会把「我方写完 300ms 内被外部接管」这一段真实变化静默吞掉，本方案没有这个盲区。
+//   代价（登记在册）：外部恰好下发与我方完全相同的 mode/host/port 时会被误判为回声。
+chrome.proxy.settings.onChange.addListener(function (details) {
+  readProxyDetails().then(function (d) {
+    // 回读失败：状态未知，如实写 error（不猜、不写回）。
+    //   onChange 的 details 在部分 Chrome 版本里只带 levelOfControl、不带完整 value，
+    //   因此不能凭 details 猜状态，必须自己回读，才能同时拿到 value 与 levelOfControl。
+    if (!d) {
+      writeState({ status: "error", message: "代理设置已变化，但无法回读确认当前状态", at: Date.now() });
+      updateIcon("error");
+      return;
+    }
+
+    var level = d.levelOfControl;
+    var actualMode = d.value && d.value.mode;
+    var sp = (d.value && d.value.rules && d.value.rules.singleProxy) || null;
+
+    // 自触发回声：实际生效配置与我方最近一次意图一致 → 这次变化是我方自己造成的，
+    //   状态由下发路径自己写，这里不重复回查、不重复刷新图标。
+    if (isOwnLastIntent(actualMode, sp)) return;
+
+    if (!isControllableByUs(level)) {
+      // 已被外部接管（企业策略或其它扩展）：如实记录，不夺权、不写回。
+      writeState({ status: "overridden", levelOfControl: level || null, pendingResubmit: suspendDirty, at: Date.now() });
+      updateIcon("overridden");
+      return;
+    }
+
+    // 【关键】「无人控制」不等于「生效的是我方的配置」。
+    //   外部扩展下发 fixed_servers 后释放控制权，level 会回到
+    //   controllable_by_this_extension，而实际生效的仍是【别人的 host/port】。
+    //   若这里只看 actualMode === "fixed_servers" 就写 applied，
+    //   界面会宣称「本扩展的代理已生效」——那是与 R6-04 同类的新可见性错误。
+    //   因此必须把实际 host/port 与我方 settings 比对。
+    readSettings().then(function (st) {
+      var isFixed = actualMode === "fixed_servers";
+      var mineIsFixed = !!st.enableProxy;
+      var sameTarget = !!sp && sp.host === S.stripBrackets(st.proxyHost) &&
+                       String(sp.port) === String(st.proxyPort);
+
+      if (mineIsFixed && isFixed && sameTarget) {
+        writeState({ status: "applied", levelOfControl: level, at: Date.now() });
+        updateIcon("applied");
+        return;
+      }
+      if (!mineIsFixed && !isFixed) {
+        writeState({ status: "direct", at: Date.now() });
+        updateIcon("direct");
+        return;
+      }
+      // 剩下的组合都是「界面结论会与实际不符」的那一档，必须如实报 error：
+      //   · 我方已启用，但生效的不是我方目标（外部配置刚被释放）
+      //   · 我方未启用，但存在非我方下发的代理配置
+      //   前台与图标都按 error 呈现，用户才知道要去查策略或其它扩展，
+      //   而不是误以为代理已生效（外部释放）或压根没启用（外部残留配置）。
+      var msg = mineIsFixed
+        ? "本扩展已启用代理，但当前生效的代理配置不是本扩展下发的（可能被外部释放或覆盖）"
+        : "本扩展未启用代理，但当前存在非本扩展下发的代理配置";
+      writeState({ status: "error", message: msg, levelOfControl: level, at: Date.now() });
+      updateIcon("error");
+    });
+  });
+});
+
+// 判断「实际生效配置」是否就是我方最近一次下发的意图（R6-04 回声抑制）。
+//   只比 mode / host / port —— 这三项才是「生效的是不是我要的东西」的判据；
+//   bypassList 不参与比对：它不影响控制权归属，也不作为状态结论的依据。
+//   端口两侧统一转成字符串，避免 number/string 造成的假差异。
+function isOwnLastIntent(actualMode, sp) {
+  if (!lastIntent) return false;
+  if (actualMode !== lastIntent.mode) return false;
+  if (lastIntent.mode !== "fixed_servers") return true;
+  if (!sp) return false;
+  return sp.host === lastIntent.host && String(sp.port) === String(lastIntent.port);
+}
 
 // 代理运行时错误：fatal=false 恰好表示"已静默回退直连"，必须让用户看见
 chrome.proxy.onProxyError.addListener(function (details) {

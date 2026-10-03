@@ -22,7 +22,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function buildEnv(opts) {
   opts = opts || {};
   const syncStore = {}, localStore = {}, sessionStore = {};
-  const listeners = { changed: [], message: [] };
+  const listeners = { changed: [], message: [], onChange: [] };
   const setCalls = [];       // setProxy 的发起序列
   const clearCalls = [];     // clear 的作用域序列
   const timeline = [];       // 窗口内每次 set/clear 【完成】时刻的真实生效配置
@@ -34,6 +34,8 @@ function buildEnv(opts) {
   let directPhaseSeen = false, restoreSetSeen = false;
   let onRestoreSet = null, onClearDuringDirect = null;
   let getHook = null, getCount = 0;
+  // R6-04：模拟外部扩展 / 企业策略的控制等级（null 表示仍由本扩展控制）。
+  let externalLevel = null;
   let setHook = null, clearHook = null;
 
   function makeArea(store, areaName) {
@@ -87,7 +89,9 @@ function buildEnv(opts) {
     const value = effective !== null
       ? { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: effective.split(":")[0], port: effective.split(":")[1] } } }
       : { mode: "direct" };
-    setTimeout(() => cb({ value, levelOfControl: "controlled_by_this_extension" }), 0);
+    // externalLevel 非空时优先返回它：模拟外部接管或外部释放控制权（R6-04）。
+    const level = externalLevel || "controlled_by_this_extension";
+    setTimeout(() => cb({ value, levelOfControl: level }), 0);
   }
   sandbox.chrome = {
     runtime: { lastError: undefined, id: SENDER_ID,
@@ -127,7 +131,10 @@ function buildEnv(opts) {
             if (cb) cb();
           }, 0);
         },
-        get(o, cb) { getCount++; if (getHook) return getHook(getCount, o, cb, defaultGet); return defaultGet(o, cb); }
+        get(o, cb) { getCount++; if (getHook) return getHook(getCount, o, cb, defaultGet); return defaultGet(o, cb); },
+        // R6-04：background.js 会注册 chrome.proxy.settings.onChange；
+        //   缺少该桩会让脚本一加载就抛 TypeError，整套用例连锁失败。
+        onChange: { addListener(f) { listeners.onChange.push(f); } }
       },
       onProxyError: { addListener() {} }
     },
@@ -150,7 +157,15 @@ function buildEnv(opts) {
     resetDirect: () => { directPhaseSeen = false; },
     setGetHook: fn => { getHook = fn; getCount = 0; },
     setSetHook: fn => { setHook = fn; },
-    setClearHook: fn => { clearHook = fn; } };
+    setClearHook: fn => { clearHook = fn; },
+    // R6-04：驱动 chrome.proxy.settings.onChange 的真实回调（外部接管 / 释放）。
+    fireProxyChange: details => { for (const fn of listeners.onChange.slice()) fn(details); },
+    // 模拟外部接管或释放：只改控制等级与实际生效配置，不经过我方任何写路径。
+    externalSet: (level, host, port) => {
+      effective = host === null ? null : host + ":" + port;
+      proxyActive = host !== null;
+      externalLevel = level;
+    } };
 }
 
 // 排空串行队列：background 的 applyChain 挂在 VM 全局上
@@ -436,6 +451,135 @@ function t(name, cond, extra) {
       env.titleCalls.indexOf("代理设置") < 0,
       "setTitle 序列 = " + JSON.stringify(env.titleCalls));
     await p1;
+  }
+
+  console.log("");
+  console.log("== R6-04：外部接管与外部释放后，状态必须被刷新（只读回查）==");
+  {
+    // 方向一：外部接管。本扩展自身【没有任何存储变化】，只发生代理设置变化。
+    //   缺陷链路（02 探针-H）：全文件未注册 onChange → getStatus 一直返回过时的 applied。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    const before = env.sessionStore.lastState || {};
+    t("前置：接管前状态为 applied", before.status === "applied", JSON.stringify(before));
+
+    env.externalSet("controlled_by_other_extensions", "external", "9090");
+    env.fireProxyChange({ levelOfControl: "controlled_by_other_extensions" });
+    await drain(env);
+
+    const after = env.sessionStore.lastState || {};
+    t("外部接管后状态被刷新为 overridden（不再停留在 applied）",
+      after.status === "overridden",
+      "lastState=" + JSON.stringify(after));
+    t("外部接管后没有发生我方夺权式写回",
+      env.setCalls.indexOf("127.0.0.1:10808") < 0,
+      "set 序列=" + JSON.stringify(env.setCalls));
+    // 通道④：前台状态条与图标都由 writeState/updateIcon 驱动，图标必须转红。
+    t("外部接管后末次图标为红色（通道④）",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-red-16.png",
+      "icon=" + env.iconCalls[env.iconCalls.length - 1]);
+    // 通道② 反向护栏：没有脏标记时不得声称"有配置变更待下发"。
+    t("外部接管但无待下发变更时不得误报 pendingResubmit（通道②）",
+      after.pendingResubmit !== true, "lastState=" + JSON.stringify(after));
+  }
+  {
+    // 通道②/④：接管【期间】用户改过配置（脏标记在位）→ 状态必须如实保留该标记，
+    //   否则前台（popup.js:89）看不到「有配置变更待下发」，与 R3-01 静默丢弃同型。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    env.sandbox.suspendDirty = true;
+    env.externalSet("controlled_by_other_extensions", "external", "9090");
+    env.fireProxyChange({ levelOfControl: "controlled_by_other_extensions" });
+    await drain(env);
+
+    const st = env.sessionStore.lastState || {};
+    t("外部接管时状态为 overridden（构造前置事实）",
+      st.status === "overridden", "lastState=" + JSON.stringify(st));
+    t("接管期间确有未下发变更时，状态必须保留待下发标记（通道②/④）",
+      st.pendingResubmit === true, "lastState=" + JSON.stringify(st));
+  }
+  {
+    // 方向二：外部释放（02 探针-J，比接管更危险：界面说 applied 而实际直连）。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    env.externalSet("controlled_by_other_extensions", "external", "9090");
+    env.fireProxyChange({ levelOfControl: "controlled_by_other_extensions" });
+    await drain(env);
+    t("前置：外部接管已被如实记录",
+      (env.sessionStore.lastState || {}).status === "overridden",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState));
+
+    // 外部释放：配置回到直连，控制权回到无人控制
+    env.externalSet("controllable_by_this_extension", null, null);
+    env.fireProxyChange({ levelOfControl: "controllable_by_this_extension" });
+    await drain(env);
+
+    const st = env.sessionStore.lastState || {};
+    t("外部释放后不得继续宣称 applied（实际已是直连）",
+      st.status !== "applied", "lastState=" + JSON.stringify(st));
+    // R3-07 同型：我方启用着代理而实际是直连时，结论必须是「异常」而不是「直连」——
+    //   后者会告诉用户"你没启用代理"，而用户明明是启用的。
+    t("外部释放后如实报异常并说明我方配置未生效",
+      st.status === "error" && typeof st.message === "string" && st.message.length > 0,
+      "lastState=" + JSON.stringify(st));
+    t("外部释放后不得发生我方写回（释放不等于邀请夺权）",
+      env.setCalls.indexOf("127.0.0.1:10808") < 0,
+      "set 序列=" + JSON.stringify(env.setCalls));
+    t("外部释放后末次图标为红色（通道④：绝不留下绿色）",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-red-16.png",
+      "icon=" + env.iconCalls[env.iconCalls.length - 1]);
+  }
+  {
+    // 方向二·加固：无人控制，但生效的是【别人的 fixed_servers】。
+    //   只看 mode === "fixed_servers" 就写 applied，会让界面宣称"本扩展的代理已生效"，
+    //   而真正生效的是别人的 host/port —— 与 R6-04 同类的新可见性错误。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    env.externalSet("controllable_by_this_extension", "someone-else", "7777");
+    env.fireProxyChange({ levelOfControl: "controllable_by_this_extension" });
+    await drain(env);
+
+    const st = env.sessionStore.lastState || {};
+    t("无人控制但生效配置非我方时，不得宣称 applied",
+      st.status !== "applied", "lastState=" + JSON.stringify(st));
+    t("该情形下状态如实说明配置不是本扩展下发的",
+      st.status === "error" && /不是本扩展下发/.test(String(st.message || "")),
+      "lastState=" + JSON.stringify(st));
+  }
+  {
+    // 方向二·加固之二：我方【未启用】代理，但外部下发了 fixed_servers 后释放控制权。
+    //   此时生效的仍是别人的配置，界面若报 direct（"未启用代理（直连）"）同样是错的。
+    const env = buildEnv({ fetchDelay: 20 });
+    await drain(env);
+    env.externalSet("controllable_by_this_extension", "someone-else", "7777");
+    env.fireProxyChange({ levelOfControl: "controllable_by_this_extension" });
+    await drain(env);
+
+    const st = env.sessionStore.lastState || {};
+    t("未启用代理但存在非我方下发的代理配置时，不得报 direct",
+      st.status !== "direct", "lastState=" + JSON.stringify(st));
+    t("该情形下状态如实说明存在非本扩展下发的配置",
+      st.status === "error" && /非本扩展下发/.test(String(st.message || "")),
+      "lastState=" + JSON.stringify(st));
+  }
+  {
+    // 自触发抑制（R6-04）：我方一次成功的下发本身就会触发 onChange，
+    //   不得因此被自己的事件再回查、再写一遍状态。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10101" }));
+    await drain(env);
+    const afterWrite = JSON.stringify(env.sessionStore.lastState || {});
+    t("前置：我方下发成功后状态为 applied",
+      (env.sessionStore.lastState || {}).status === "applied",
+      "lastState=" + afterWrite);
+
+    // 模拟 Chrome 为我方这次 set 派发的回声（值与刚下发的完全一致）
+    env.fireProxyChange({ levelOfControl: "controlled_by_this_extension" });
+    await drain(env);
+    t("我方自己的写操作回声不被重复回查（状态未被二次改写）",
+      JSON.stringify(env.sessionStore.lastState || {}) === afterWrite,
+      "改动后=" + JSON.stringify(env.sessionStore.lastState) + " / 原值=" + afterWrite);
   }
 
   console.log("");
