@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.3.0]
+// background.js —— MV3 Service Worker  [v2.5.0]
 importScripts("settings.js");
 
 var S = self.EasyProxy;
