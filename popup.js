@@ -354,7 +354,29 @@ function refreshStatus() {
 
 // 仅当 local 中确实存有内容时才清空它；
 // 否则会产生一次「空 → 空」之外的伪变化并触发多余的下发。
-function clearLocalBypassIfAny() {
+//
+// 【R8-02】参数 savedBypassList = 【本次写入 sync 的 bypassList】。
+//   当它【逐字符等于】内置默认列表时，绝对不清 local —— 这不是冗余判断，
+//   删掉它会让用户的长列表永久丢失，理由如下：
+//     · 更早版本的升级补缺缺陷把默认列表写进了 sync.bypassList，而用户真实的长列表
+//       只剩 local 一份（超长列表降级保存时 local 是唯一副本）；
+//     · 此时 resolveBypassList 的「sync 非空优先」让界面显示默认 6 条，用户看不到
+//       自己的规则，什么都没改就点一次「保存」—— 表单里回写的正是这份默认列表；
+//     · 「保存的是系统默认列表」与「用户主动清空/改写列表」在存储层面无法区分，
+//       只有这一条判据能把两者分开，从而保住 local 里那份唯一副本
+//       （另一半防线在 background.js 的 onInstalled 存量救援）。
+//
+//   判据必须是【逐字符】比较：长度、条数这类近似判据会把用户自写的等长列表误判成
+//   默认值，使正常的「改短列表后清理 local」被静默跳过 —— 那份过期副本会在用户下次
+//   清空绕过列表时经 resolveBypassList 的回退规则重新生效。
+//   误判的代价也经过权衡：用户手写出与默认列表逐字相同的列表（含首行注释与空行）
+//   概率可忽略；即使真的发生，代价只是 local 多留一份与 sync 相同的残留，
+//   不丢数据 —— 保守方向正确。
+function clearLocalBypassIfAny(savedBypassList) {
+  // 【R8-02】保存的正是系统默认列表 → 保留 local，不发任何写入。
+  if (typeof savedBypassList === "string" && savedBypassList === S.DEFAULTS.bypassList) {
+    return Promise.resolve();
+  }
   return new Promise(function (resolve) {
     chrome.storage.local.get(["bypassList"], function (cur) {
       // 【R8-01】读取失败时 cur 为 undefined：绝不能把它当成「local 里没有列表」，
@@ -395,7 +417,9 @@ function save() {
         showHint("绕过列表较长，已存于本地（不跨设备同步）", "warn");
       })
     : setStorage("sync", settings).then(function () {
-        return clearLocalBypassIfAny();
+        // 【R8-02】把本次写进 sync 的 bypassList 一并交给清理函数：
+        //   它据此判断「保存的是系统默认列表」还是「用户自己撰写的列表」。
+        return clearLocalBypassIfAny(settings.bypassList);
       }).then(function () {
         showHint("设置已保存", "ok");
       });

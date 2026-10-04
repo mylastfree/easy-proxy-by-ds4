@@ -690,6 +690,137 @@ function t(name, cond, extra) {
   }
 
   console.log("");
+  console.log("== R8-02-B：污染状态下用户「打开 popup 不编辑 + 点一次保存」不得永久删除 local 里的用户长列表 ==");
+  {
+    // 与 ownership.test.js 的 R8-02-A 同一污染形态：sync 被更早版本写成了【系统内置默认列表】，
+    //   用户真正的长列表只在 local。popup 的取值规则是「sync 非空优先」，于是界面显示默认 6 条，
+    //   用户的规则完全不可见；用户什么都没改、只点一次「保存」，就走短列表分支把默认列表写回
+    //   sync，随后 clearLocalBypassIfAny() 把 local 写成空串 —— local 没有第二份副本，
+    //   长列表【永久丢失】。全过程没有任何 lastError（不是读取失败问题，R8-01 覆盖不到）。
+    //
+    // 这里断言的对象是【真实存储内容】（localStore 与 localSetCalls 的实参），
+    //   不是「某函数被调用」这类间接证据 —— 丢数据这件事只能从存储本身体现。
+    const sboxB = { TextEncoder: TextEncoder };
+    sboxB.self = sboxB; sboxB.globalThis = sboxB;
+    vm.createContext(sboxB);
+    vm.runInContext(settingsSrc, sboxB);
+    const DEFAULTS_B = sboxB.EasyProxy.DEFAULTS;
+    const LONG_B = Array.from({ length: 950 }, (_, i) => "legacy-" + (i + 1) + ".internal.example").join("\n");
+
+    const env = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: DEFAULTS_B.bypassList },
+      localStore: { bypassList: LONG_B }
+    });
+    await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+    await env.settle(60);
+
+    t("B-1 前置事实：污染现场 —— 界面显示的是内置默认 6 条（用户自己的规则被遮蔽）",
+      env.els.bypassList.value === DEFAULTS_B.bypassList,
+      "界面长度=" + String(env.els.bypassList.value).length + "；默认长度=" + DEFAULTS_B.bypassList.length);
+    t("B-2 前置事实：local 里是用户的 950 条长列表",
+      env.localStore.bypassList === LONG_B,
+      "local 条数=" + String(env.localStore.bypassList || "").split("\n").length);
+
+    env.syncSetCalls.length = 0; env.localSetCalls.length = 0;
+    env.click("saveButton");            // 用户没有编辑任何内容，只点了一次「保存」
+    await env.settle(140);
+
+    t("B-3 保存确实写入了 sync（证明路径真的走到了 clearLocalBypassIfAny）",
+      env.syncSetCalls.length === 1,
+      "sync.set 次数=" + env.syncSetCalls.length);
+    t("B-4 核心：一次普通保存后 local.bypassList 未被写成空串（断言真实存储内容）",
+      env.localStore.bypassList === LONG_B,
+      "local 条数=" + String(env.localStore.bypassList || "").split("\n").length + " 期望 950");
+    t("B-5 核心：local.set 的调用序列里没有任何一次把 bypassList 写成空串",
+      !env.localSetCalls.some(o => o && o.bypassList === ""),
+      JSON.stringify(env.localSetCalls.map(o => String(o && o.bypassList).length)));
+  }
+
+  console.log("");
+  console.log("== R8-02-C：正常用户保存时清理 local 的既有语义必须保留（不许把清理功能整个关掉）==");
+  {
+    // 防回归（关键）：R8-02-B 的护栏是「保存进 sync 的列表逐字符等于默认列表 → 不清 local」。
+    //   若把它写成「一律不清」，长列表确实不会被误删，但清理功能本身被废掉：
+    //   用户从超长列表改回短列表后，local 里那份过期副本会永远留下，
+    //   而 resolveBypassList 在 sync 为空时【回退 local】—— 用户下次清空绕过列表时，
+    //   早就该消失的旧规则会重新生效。因此必须证明「该清的仍然清」。
+    const sboxC = { TextEncoder: TextEncoder };
+    sboxC.self = sboxC; sboxC.globalThis = sboxC;
+    vm.createContext(sboxC);
+    vm.runInContext(settingsSrc, sboxC);
+    const DEFAULTS_C = sboxC.EasyProxy.DEFAULTS;
+
+    // C-1：sync 是用户自己写的短列表（逐字符 ≠ 默认列表），local 里残留着一份过期副本 ——
+    //   这一次保存必须把 local 清掉。
+    const envC = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "example.com" },
+      localStore: { bypassList: "stale-from-previous-degrade.internal" }
+    });
+    await waitUntil(() => proxyTarget(envC.proxy.value) === "socks5 127.0.0.1:10808");
+    await envC.settle(60);
+    t("C-1 前置事实：sync 是用户自己写的短列表，local 里残留着一份过期副本",
+      envC.els.bypassList.value === "example.com" &&
+      envC.localStore.bypassList === "stale-from-previous-degrade.internal",
+      JSON.stringify([envC.els.bypassList.value, envC.localStore.bypassList]));
+    t("C-2 前置事实：用户自己写的短列表逐字符不等于内置默认列表",
+      "example.com" !== DEFAULTS_C.bypassList, "默认长度=" + DEFAULTS_C.bypassList.length);
+
+    envC.syncSetCalls.length = 0; envC.localSetCalls.length = 0;
+    envC.click("saveButton");
+    await envC.settle(140);
+
+    t("C-3 关键：正常用户保存时 local 的过期副本仍被清成空串（该清的仍清）",
+      envC.localStore.bypassList === "",
+      JSON.stringify(envC.localStore.bypassList));
+    t("C-4 关键：确实发生了一次 local.set({bypassList: \"\"})",
+      envC.localSetCalls.some(o => o && o.bypassList === ""),
+      JSON.stringify(envC.localSetCalls.map(o => String(o && o.bypassList).length)));
+    t("C-5 保存写入的仍是用户自己写的短列表（未被默认列表覆盖）",
+      envC.syncSetCalls.length === 1 && envC.syncSetCalls[0].bypassList === "example.com",
+      JSON.stringify(envC.syncSetCalls.map(o => o.bypassList)));
+
+    // C-6：local 本来就为空（题述的正常用户现场）→ 保存不得产生多余的 local 写入。
+    const envD = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "example.com" },
+      localStore: {}
+    });
+    await waitUntil(() => proxyTarget(envD.proxy.value) === "socks5 127.0.0.1:10808");
+    await envD.settle(60);
+    envD.syncSetCalls.length = 0; envD.localSetCalls.length = 0;
+    envD.click("saveButton");
+    await envD.settle(140);
+    t("C-6 local 本来就为空时不产生多余的 local 写入（空 → 空 的伪变化）",
+      envD.localSetCalls.length === 0 && envD.syncSetCalls.length === 1,
+      JSON.stringify([envD.localSetCalls.length, envD.syncSetCalls.length]));
+    t("C-7 local 仍没有 bypassList 内容（既没被清、也没被写脏）",
+      !envD.localStore.bypassList, JSON.stringify(envD.localStore.bypassList));
+
+    // C-8（防误伤 · 锁住「逐字符」这个判据本身）：
+    //   用户自写的列表若【恰好与默认列表等长、条数相同但内容不同】，它仍然不是默认列表，
+    //   保存时该清 local 就得清。若有人把逐字符比较改成「长度相同」「条数相同」这类近似判据，
+    //   这条断言会立刻变红 —— 那正是 R8-02-E 在 background 侧锁住的同一个陷阱。
+    const NEAR_C = DEFAULTS_C.bypassList.split("192.168.0.0/16").join("192.168.9.0/16").split(".lan").join(".laa");
+    const envE = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: NEAR_C },
+      localStore: { bypassList: "stale-from-previous-degrade.internal" }
+    });
+    await waitUntil(() => proxyTarget(envE.proxy.value) === "socks5 127.0.0.1:10808");
+    await envE.settle(60);
+    t("C-8 前置事实：界面显示的是用户自写的等长列表（长度与默认列表相同，内容不同）",
+      envE.els.bypassList.value === NEAR_C && NEAR_C.length === DEFAULTS_C.bypassList.length &&
+      NEAR_C !== DEFAULTS_C.bypassList,
+      "长度 " + NEAR_C.length + " vs " + DEFAULTS_C.bypassList.length);
+
+    envE.syncSetCalls.length = 0; envE.localSetCalls.length = 0;
+    envE.click("saveButton");
+    await envE.settle(140);
+
+    t("C-9 关键：等长但内容不同的用户列表保存后，local 的过期副本仍被清掉（判据必须是逐字符的）",
+      envE.localStore.bypassList === "" && envE.localSetCalls.some(o => o && o.bypassList === ""),
+      JSON.stringify([envE.localStore.bypassList, envE.localSetCalls.map(o => String(o && o.bypassList).length)]));
+  }
+
+  console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);
 })().catch(e => { console.error(e); process.exit(2); });

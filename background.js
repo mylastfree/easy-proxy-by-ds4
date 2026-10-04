@@ -753,6 +753,36 @@ chrome.runtime.onInstalled.addListener(function (details) {
           patch.bypassList = S.DEFAULTS.bypassList;
         }
 
+        // 【R8-02】存量救援：更早版本的升级补缺缺陷把【默认列表】写进了 sync.bypassList，
+        //   而用户真实的长列表只剩 local 一份（超长列表降级保存时 local 是唯一副本）。
+        //   此后 resolveBypassList 的「sync 非空优先」规则让默认 6 条遮蔽了用户列表：
+        //   用户打开 popup 看到的是默认值（自己的规则不可见），点一次「保存」就经
+        //   popup 的 clearLocalBypassIfAny() 把 local 也清空 —— local 没有第二份副本，
+        //   长列表永久丢失；全程没有任何 lastError，前后端状态都宣称一切正常。
+        //   R7-03 只挡住了【新】用户进入该状态，存量已污染用户必须在这里被救回来。
+        //
+        //   识别判据刻意采用【逐字符等于默认列表】：用户手写出与内置默认列表逐字相同
+        //   的列表（含首行注释与空行）的概率可忽略，而「长度」「条数」这类近似判据会把
+        //   用户自写的等长列表误判成污染并清掉 sync —— 那是用一次误伤换一次修复，
+        //   不可接受。因此这里只认逐字符相等：条件不满足时（正常用户）不做任何写入，
+        //   行为与修复前完全一致。
+        //
+        //   修复动作 = 把 sync.bypassList 写成【空串】：恢复「已降级到 local」的正常
+        //   占位形态，使取值规则回退到 local，用户的长列表重新生效并随本次下发生效。
+        //   【绝对不要】顺手改 local —— 那是用户唯一的数据副本。
+        //
+        //   与本段上面的判据互斥：那条要求 sync 里【没有】bypassList 键，
+        //   而存量污染要求 sync 里该键存在且逐字符等于默认列表；两者不可能同时成立，
+        //   因此这两处赋值不会互相覆盖，正常用户的行为一字不变。
+        var syncRaw = items && items.bypassList;
+        var legacyShadowed =
+          !localErr &&
+          localHasValue &&
+          typeof syncRaw === 'string' &&
+          syncRaw === S.DEFAULTS.bypassList &&
+          localRaw !== S.DEFAULTS.bypassList;
+        if (legacyShadowed) patch.bypassList = '';
+
         if (Object.keys(patch).length) {
           chrome.storage.sync.set(patch, function () {
             void chrome.runtime.lastError;

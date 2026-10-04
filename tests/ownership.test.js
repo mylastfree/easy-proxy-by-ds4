@@ -1886,6 +1886,174 @@ function t(name, cond, extra) {
   }
 
   console.log("");
+  console.log("== R8-02：存量污染（sync 被写成默认列表）必须自愈，合法降级与用户自写列表不得被误伤 ==");
+  {
+    // 污染形态（第八轮独立审计确定性复现，两位审核者独立得出同一结论）：
+    //   更早版本的升级补缺缺陷把【系统内置默认绕过列表】写进了 sync.bypassList，
+    //   而用户真实的长列表仍在 local.bypassList。
+    //   resolveBypassList 的规则是「sync 非空优先」，于是默认 6 条遮蔽了用户列表：
+    //     · 界面显示默认 6 条，用户自己的规则不可见；
+    //     · 用户点一次保存就走短列表分支把默认列表写回 sync，随后
+    //       clearLocalBypassIfAny() 把 local 写成空串 —— local 没有第二份副本，
+    //       用户的长列表【永久丢失】（该链路由 popup.test.js 的 R8-02-B 覆盖）。
+    //   全过程没有任何 lastError：这不是读取失败问题，R7-03 只挡住【新】用户进入该状态，
+    //   存量已污染用户仍会丢数据，因此必须在升级路径上补一次存量救援。
+    //
+    // 【为什么判据是「逐字符等于默认列表」而不是长度/条数】
+    //   用户手写出与内置默认列表逐字相同的列表（含首行注释与空行）的概率可忽略，
+    //   因此「逐字符相同」几乎只能来自缺陷写入；而长度、条数这类近似判据会把
+    //   用户自写的等长列表误判成污染并清掉 sync —— 用一次误伤换一次修复不可接受。
+    //   R8-02-E 专门用「等长、等条数但内容不同」的列表来锁住这一点。
+    //
+    // 断言对象一律是【真实的 chrome.storage.sync / local 内容】与
+    //   【真实下发给 chrome.proxy 的生效配置】，不看内部变量。
+    const sbox8 = { TextEncoder: TextEncoder };
+    sbox8.self = sbox8; sbox8.globalThis = sbox8;
+    vm.createContext(sbox8);
+    vm.runInContext(settingsSrc, sbox8);
+    const DEFAULTS8 = sbox8.EasyProxy.DEFAULTS;
+    const LONG8 = Array.from({ length: 950 }, (_, i) => "legacy-" + (i + 1) + ".internal.example").join("\n");
+    // 与默认列表【等长、等条数】但内容不同的用户列表：近似判据会误伤它，逐字符判据不会。
+    const NEAR8 = DEFAULTS8.bypassList.split("192.168.0.0/16").join("192.168.9.0/16").split(".lan").join(".laa");
+    const count8 = s => String(s || "").split("\n").length;
+
+    function fireUpdate8(env) {
+      for (const fn of env.listeners.installed.slice()) fn({ reason: "update" });
+    }
+    function lastBypass8(env) {
+      const cfg = env.setConfigs[env.setConfigs.length - 1];
+      return (cfg && cfg.rules && cfg.rules.bypassList) || [];
+    }
+    function put8(env, area, obj) {
+      return new Promise(r => env.sandbox.chrome.storage[area].set(obj, r));
+    }
+
+    // ---- R8-02-A（核心，存量救援）----
+    {
+      const envA8 = buildEnv({ fetchDelay: 20 });
+      await drain(envA8);
+      await put8(envA8, "sync", { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: DEFAULTS8.bypassList });
+      await put8(envA8, "local", { bypassList: LONG8 });
+      await drain(envA8);
+      await sleep(60);
+
+      t("R8-02-A 前置事实：污染现场 —— sync 逐字符等于默认列表，local 是用户的 950 条长列表",
+        envA8.syncStore.bypassList === DEFAULTS8.bypassList && envA8.localStore.bypassList === LONG8,
+        "sync 长度=" + String(envA8.syncStore.bypassList && envA8.syncStore.bypassList.length) +
+        "；local 条数=" + count8(envA8.localStore.bypassList));
+
+      const beforeA8 = lastBypass8(envA8);
+      t("R8-02-A 前置事实：污染下发的确实是默认 6 条（用户规则被遮蔽，取值规则本身正常）",
+        beforeA8.length === 6 && beforeA8.indexOf("192.168.0.0/16") >= 0 &&
+        beforeA8.indexOf("legacy-1.internal.example") < 0,
+        "下发的 bypassList=" + JSON.stringify(beforeA8));
+
+      const setsBeforeA8 = envA8.setConfigs.length;
+      fireUpdate8(envA8);
+      await drain(envA8);
+      await sleep(80);
+      const afterA8 = lastBypass8(envA8);
+
+      t("R8-02-A 升级确实触发了新的下发（否则下面的断言会假阳性）",
+        envA8.setConfigs.length > setsBeforeA8,
+        "setConfigs " + setsBeforeA8 + " -> " + envA8.setConfigs.length);
+
+      t("R8-02-A 核心：升级后 sync.bypassList 被写成空串占位（恢复「已降级到 local」的正常形态）",
+        envA8.syncStore.bypassList === "",
+        "sync.bypassList=" + JSON.stringify(envA8.syncStore.bypassList));
+
+      t("R8-02-A 核心：升级后 local.bypassList 原封不动（那是用户唯一的数据副本）",
+        envA8.localStore.bypassList === LONG8,
+        "local 条数=" + count8(envA8.localStore.bypassList) + " 期望 950");
+
+      t("R8-02-A 核心：升级后下发给 chrome.proxy 的 bypassList 是用户的 950 条长列表（不是默认 6 条）",
+        afterA8.length === 950 && afterA8.indexOf("legacy-1.internal.example") >= 0 &&
+        afterA8.indexOf("192.168.0.0/16") < 0,
+        "下发的 bypassList 条数=" + afterA8.length + "；前 3 条=" + JSON.stringify(afterA8.slice(0, 3)));
+
+      envA8.closeWindow();
+    }
+
+    // ---- R8-02-D（防回归）：合法降级（sync 空串占位 + local 长列表）升级后一切照旧 ----
+    {
+      const envD8 = buildEnv({ fetchDelay: 20 });
+      await drain(envD8);
+      await put8(envD8, "sync", { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "" });
+      await put8(envD8, "local", { bypassList: LONG8 });
+      await drain(envD8);
+      await sleep(60);
+      t("R8-02-D 前置事实：合法降级现场 —— sync 是空串占位、local 是用户长列表",
+        envD8.syncStore.bypassList === "" && envD8.localStore.bypassList === LONG8,
+        "sync=" + JSON.stringify(envD8.syncStore.bypassList) + "；local 条数=" + count8(envD8.localStore.bypassList));
+
+      fireUpdate8(envD8);
+      await drain(envD8);
+      await sleep(80);
+      t("R8-02-D 合法降级：升级后 sync 仍是空串占位（存量救援不得顺手改写它）",
+        envD8.syncStore.bypassList === "",
+        "sync.bypassList=" + JSON.stringify(envD8.syncStore.bypassList));
+      t("R8-02-D 合法降级：升级后 local 的长列表原封不动",
+        envD8.localStore.bypassList === LONG8,
+        "local 条数=" + count8(envD8.localStore.bypassList));
+      const afterD8 = lastBypass8(envD8);
+      t("R8-02-D 合法降级：升级后下发给 chrome.proxy 的仍是用户长列表",
+        afterD8.length === 950 && afterD8.indexOf("legacy-1.internal.example") >= 0,
+        "下发的 bypassList 条数=" + afterD8.length);
+      envD8.closeWindow();
+    }
+
+    // ---- R8-02-E（防误伤，关键）：sync 是用户自己写的列表 → 升级不得改动 sync ----
+    {
+      // E-1：与默认列表【等长、等条数】但内容不同的用户列表 ——
+      //   这是近似判据（长度/条数）会误伤、而逐字符判据不会误伤的形态。
+      const envE8 = buildEnv({ fetchDelay: 20 });
+      await drain(envE8);
+      await put8(envE8, "sync", { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: NEAR8 });
+      await put8(envE8, "local", { bypassList: "stale-local.internal" });
+      await drain(envE8);
+      await sleep(60);
+      t("R8-02-E 前置事实：sync 是与默认列表等长等条数但内容不同的用户列表，local 另有其它值",
+        NEAR8.length === DEFAULTS8.bypassList.length && NEAR8 !== DEFAULTS8.bypassList &&
+        envE8.syncStore.bypassList === NEAR8 && envE8.localStore.bypassList === "stale-local.internal",
+        "长度 " + NEAR8.length + " vs " + DEFAULTS8.bypassList.length);
+
+      fireUpdate8(envE8);
+      await drain(envE8);
+      await sleep(80);
+      t("R8-02-E 防误伤：升级后用户自己写的列表逐字符未被改动（近似判据会在这里误伤）",
+        envE8.syncStore.bypassList === NEAR8,
+        "sync.bypassList=" + JSON.stringify(envE8.syncStore.bypassList));
+      t("R8-02-E 防误伤：local 的其它值也未被触碰",
+        envE8.localStore.bypassList === "stale-local.internal",
+        "local.bypassList=" + JSON.stringify(envE8.localStore.bypassList));
+      const afterE8 = lastBypass8(envE8);
+      t("R8-02-E 防误伤：下发给 chrome.proxy 的仍是用户自己写的 6 条",
+        afterE8.length === 6 && afterE8.indexOf("192.168.9.0/16") >= 0 && afterE8.indexOf("192.168.0.0/16") < 0,
+        "下发的 bypassList=" + JSON.stringify(afterE8));
+      envE8.closeWindow();
+    }
+    {
+      // E-2：普通形态 —— 用户自写的短列表 + local 有其它值。
+      const envF8 = buildEnv({ fetchDelay: 20 });
+      await drain(envF8);
+      await put8(envF8, "sync", { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "example.com\nintranet.corp" });
+      await put8(envF8, "local", { bypassList: "stale-local.internal" });
+      await drain(envF8);
+      await sleep(60);
+      fireUpdate8(envF8);
+      await drain(envF8);
+      await sleep(80);
+      t("R8-02-E 防误伤（普通形态）：用户自写的短列表逐字符未被改动",
+        envF8.syncStore.bypassList === "example.com\nintranet.corp",
+        "sync.bypassList=" + JSON.stringify(envF8.syncStore.bypassList));
+      t("R8-02-E 防误伤（普通形态）：local 的其它值未被触碰",
+        envF8.localStore.bypassList === "stale-local.internal",
+        "local.bypassList=" + JSON.stringify(envF8.localStore.bypassList));
+      envF8.closeWindow();
+    }
+  }
+
+  console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);
 })().catch(e => { console.error("EXC: " + (e && e.stack || e)); process.exit(2); });
