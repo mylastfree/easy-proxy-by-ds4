@@ -27,7 +27,12 @@ var STATUS_TEXT = {
   error: ["代理异常，流量可能已回退直连", "error"],
   // 【R7-01-F】error 档的第二种来源：读取配置失败。此时我们什么都没做，
   //   代理未被改动，因此绝不能沿用上面那条「可能已回退直连」的断言。
-  error_read_failed: ["无法读取配置，本次未改动代理", "warn"]
+  error_read_failed: ["无法读取配置，本次未改动代理", "warn"],
+  // 【R8-04】状态本身没读到（session.get 失败）。与 direct 的区别是本质性的：
+  //   这一档下我们【根本不知道】代理现在是什么状态，必须如实说不知道；
+  //   用 muted 档的直连文案会把「读不到」谎报成「用户没开代理」。
+  //   也不并入 error 档：本次什么都没做，代理没有被改动，凭什么说它异常。
+  status_read_failed: ["状态未知：无法读取当前状态，代理可能仍在生效", "warn"]
 };
 
 function setStorage(area, obj) {
@@ -81,8 +86,11 @@ function showHint(message, kind) {
   el.hint.className = "hint " + (kind || "");
 }
 
-function renderStatus(state) {
-  if (!state) state = { status: "direct" };
+// 【R8-04】第二个参数 readFailed 来自后台 getStatus 的失败标记，
+//   它必须与「真的没有状态」分开：两者在旧代码里都是 state 为空，
+//   而旧代码那句兜底会把两者一起说成「未启用代理（直连）」。
+function renderStatus(state, readFailed) {
+  if (!state) state = readFailed ? { status: "status_read_failed" } : { status: "direct" };
   // 【R7-01-F】读取失败不是「代理坏了」：单独取文案，避免状态条自相矛盾
   //   （前半句说代理可能已回退直连、后半句说本次未改动代理）。
   var key = (state.status === "error" && state.reason === "read_failed")
@@ -347,7 +355,9 @@ function load() {
 function refreshStatus() {
   send({ action: "getStatus" }).then(function (resp) {
     if (!resp) return;
-    renderStatus(resp.state);
+    // 【R8-04】resp.readFailed 为真时 state 必为 null，两者一起交给 renderStatus：
+    //   只传 state 会让它走了「真的没有状态」那条正确兜底，重新变成假象。
+    renderStatus(resp.state, resp.readFailed === true);
     renderTest(resp.test);
   });
 }

@@ -966,6 +966,17 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
 
   if (request.action === "getStatus") {
     chrome.storage.session.get(["lastState", "lastTest"], function (items) {
+      // 【R8-04】读取失败必须如实上报，不得把「读不到」伪装成「没有状态」。
+      //   前台 renderStatus 对 !state 的兜底是「未启用代理（直连）」：在此之前，
+      //   一次 session 读取失败就会让界面宣称用户没开代理 —— 而 chrome.proxy 里
+      //   我方的代理其实还在生效、session 里那份 lastState 也仍然是 applied。
+      //   这与 R7-01（配置读取失败）、R8-01（设置读取失败）是同一条语义：
+      //   读不到 ≠ 用户关掉了代理。readFailed 是给前台区分「没有」用的。
+      var readErr = chrome.runtime.lastError;
+      if (readErr) {
+        sendResponse({ state: null, test: null, readFailed: true });
+        return;
+      }
       sendResponse({
         state: (items && items.lastState) || null,
         test: (items && items.lastTest) || null

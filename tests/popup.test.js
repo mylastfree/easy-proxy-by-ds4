@@ -176,6 +176,15 @@ function buildChainEnv(opts) {
   const syncStore = Object.assign({}, opts.syncStore || {});
   const localStore = Object.assign({}, opts.localStore || {});
   const sessionStore = {};
+  // 【R8-04】popup 侧注册的消息处理器：本环境里 background.js 跑在【另一个 vm 上下文】，
+  //   它的 chrome.runtime.onMessage.addListener 注册不到 popup 的 chrome 桩上，
+  //   于是 popup.js 的 getStatus 请求过去只会拿到 null（连不上后台）；
+  //   而本任务要覆盖的恰恰是「后台确实回答了，但回答的内容是读取失败」。
+  //   因此把 popup 的 sendMessage 直接接到【真实 background.js 的监听器】上，
+  //   由 bgSendResponse 把响应送回来 —— 走的是产品里真实的那段回调代码。
+  const msgHandlers = [];
+  const bgSendResponse = v => { for (const fn of bgResponses.slice()) fn(v); bgResponses.length = 0; };
+  const bgResponses = [];
   const proxy = { value: null, applied: [], cleared: [] };
   const syncSetCalls = [];          // sync.set 的调用序列（含失败调用，用于「有没有写」）
   const localSetCalls = [];         // local.set 的调用序列
@@ -195,8 +204,25 @@ function buildChainEnv(opts) {
         id: "test-extension-id",
         onInstalled: { addListener() {} },
         onStartup: { addListener() {} },
-        onMessage: { addListener() {} },
-        sendMessage(message, cb) { if (cb) setTimeout(() => cb(null), 0); }
+        onMessage: { addListener(fn) { msgHandlers.push(fn); } },
+        sendMessage(message, cb) {
+          // 真实链路：popup 发出 getStatus → background.js 从 session 里取 lastState
+          //   → 后台经 sendResponse 异步回答。回调期间若读取失败，popup 这段回调里
+          //   看到的 chrome.runtime.lastError 就是后台侧注入的那一个。
+          if (realm !== "popup" || !cb) { if (cb) setTimeout(() => cb(null), 0); return; }
+          setTimeout(() => {
+            for (const fn of msgHandlers.slice()) {
+              let answered = false;
+              const r = fn(message, { id: "test-extension-id" }, function (v) {
+                answered = true;
+                if (!v) { cb(null); return; }
+                try { cb(v); } finally { api.runtime.lastError = undefined; }
+              });
+              if (r === true) return;              // 后台异步回答（getStatus 分支正是如此）
+              if (!answered) cb(null);
+            }
+          }, 0);
+        }
       },
       storage: {},
       proxy: {
@@ -308,10 +334,20 @@ function buildChainEnv(opts) {
   vm.runInContext(bgSrcForChain, bgCtx);
 
   return {
-    els, popupCtx, bgCtx, proxy, syncStore, localStore, syncSetCalls, localSetCalls,
+    els, popupCtx, bgCtx, proxy, syncStore, localStore, sessionStore, syncSetCalls, localSetCalls,
+    // 直接改 session 存储，模拟「上一次下发时写下的真实状态」（真实产品里写于 background.js）
+    setSessionState(obj) {
+      const changes = {};
+      for (const k of Object.keys(obj)) { changes[k] = { newValue: obj[k] }; sessionStore[k] = obj[k]; }
+      for (const fn of storageListeners.slice()) fn(changes, "session");
+    },
     readMode(realm, area, m) { modes[realm][area] = m; },
     readPayload(realm, kind) { modes[realm].payload = kind; },
     reload() { popupCtx.load(); },
+    // 「用户重新打开弹窗」：等价于重新执行 popup.js 末尾的那两个真实入口
+    //   （load() 填表单 + refreshStatus() 取状态）。reload() 只跑前者，
+    //   用来单独验证表单；凡是状态条的现场都必须走这一条。
+    reopen() { popupCtx.load(); popupCtx.refreshStatus(); },
     click(id) { getEl(id).click(); },
     hint: () => getEl("hint").textContent,
     settle: ms => sleep(ms === undefined ? 40 : ms),
@@ -478,7 +514,7 @@ function t(name, cond, extra) {
     env.readMode("popup", "sync", "fail");
     env.readPayload("popup", "undefined");
     env.syncSetCalls.length = 0; env.localSetCalls.length = 0;
-    env.reload();
+    env.reopen();
     await env.settle();
 
     t("A-1：开关【不呈现为未勾选】，而是「不确定」态（indeterminate）",
@@ -501,7 +537,7 @@ function t(name, cond, extra) {
     // 另一种真实失败形态：回调 payload 是空对象 {}，但 lastError 有值
     await env.settle();
     env.readPayload("popup", "empty");
-    env.reload();
+    env.reopen();
     await env.settle();
     t("A-7：payload 为空对象但 lastError 有值时同样判为失败",
       env.els.proxyHost.value !== "127.0.0.1" && env.els.proxyHost.value !== "10.20.30.40" &&
@@ -510,7 +546,7 @@ function t(name, cond, extra) {
 
     // 恢复路径：存储恢复后，再次 load（onChanged / 重新打开弹窗）必须回到正常
     env.readMode("popup", "sync", "ok");
-    env.reload();
+    env.reopen();
     await env.settle();
     t("A-8：读取恢复后，界面恢复为用户的真实设置（enableProxy=true，10.20.30.40:10809）",
       env.els.enableProxy.checked === true && env.els.enableProxy.indeterminate === false &&
@@ -531,7 +567,7 @@ function t(name, cond, extra) {
     await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
 
     env.readMode("popup", "sync", "fail");
-    env.reload();
+    env.reopen();
     await env.settle();
     env.syncSetCalls.length = 0; env.localSetCalls.length = 0;
 
@@ -560,7 +596,7 @@ function t(name, cond, extra) {
     });
     await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 10.20.30.40:10809");
     env.readMode("popup", "sync", "fail");
-    env.reload();
+    env.reopen();
     await env.settle();
     // 存储随后恢复（那次读取失败只是偶发），用户此时以为「界面显示的就是我的设置」，
     // 于是点了一次「保存设置」——这正是探针 POPUP_READ_FAILURE_THEN_SAVE 的先后顺序。
@@ -595,7 +631,7 @@ function t(name, cond, extra) {
     await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
 
     env.readMode("popup", "local", "fail");
-    env.reload();
+    env.reopen();
     await env.settle();
     const afterLoad = env.els.bypassList.value;
     t("D-1：local 读取失败时不把「读不到」当成「用户没有列表」（不显示内置默认列表）",
@@ -820,6 +856,186 @@ function t(name, cond, extra) {
       JSON.stringify([envE.localStore.bypassList, envE.localSetCalls.map(o => String(o && o.bypassList).length)]));
   }
 
+
+  /* ============================================================
+     R8-04：getStatus 的 session.get 读取失败不得被前台兜底成「直连」
+     ------------------------------------------------------------
+     缺陷链路（第八轮审计探针 SESSION_READ_FAIL 复现）：
+       · background.js 的 getStatus 分支不检查 chrome.runtime.lastError，
+         读取失败时 items 为空 → 送回 { state: null }；
+       · popup.js 的 renderStatus 第一句 `if (!state) state = { status: "direct" };`
+         把「读不到状态」兜底成了「未启用代理（直连）」。
+     现场事实：chrome.proxy 里我方的 socks5 仍在生效、session 里的 lastState
+       也仍然是 applied —— 界面却宣称用户没开代理。
+
+     本段断言的对象都是【最终事实】，不是 popup 的内部变量：
+       · 界面显示的文案 —— statusBar 的真实 textContent；
+       · 代理是否被动过 —— chrome.proxy 的生效配置与 set/clear 调用序列；
+       · 状态是否读到了 —— 由真实 background.js 的 getStatus 分支（经真实
+         chrome.runtime.onMessage 链路）回答，而不是由测试直接编造响应。
+     ============================================================ */
+
+  console.log("");
+  console.log("== R8-04-A：session 读取失败 —— 界面不得显示「未启用代理（直连）」 ==");
+  {
+    const env = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "example.com" },
+      localStore: {}
+    });
+    await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+    // 真实现场：上一次下发成功，session 里留下的是 applied
+    env.setSessionState({ lastState: { status: "applied", mode: "fixed_servers" } });
+    await env.settle(60);
+
+    const stEnv = env.popupCtx.el.statusBar;
+    t("A-前置：session 里确实存着 applied（代理已生效的真实状态）",
+      (env.sessionStore.lastState || {}).status === "applied",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState));
+    t("A-前置：代理确实生效中（socks5 127.0.0.1:10808）",
+      proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808",
+      "实际生效 = " + proxyTarget(env.proxy.value));
+    t("A-前置（未注入失败时）：界面如实显示「代理已生效」",
+      stEnv.textContent.indexOf("代理已生效") >= 0,
+      "状态条=" + JSON.stringify(stEnv.textContent));
+
+    // 注入：session.get 读取失败（回调期间 lastError 有值、payload 为空）
+    env.readMode("bg", "session", "fail");
+    env.readPayload("bg", "undefined");
+    env.proxy.applied.length = 0; env.proxy.cleared.length = 0;
+    env.reopen();
+    await env.settle(80);
+
+    t("A-1 核心：读取失败后界面【不得】出现「未启用代理（直连）」（这正是被兜底出来的假象）",
+      stEnv.textContent.indexOf("未启用代理") < 0,
+      "状态条=" + JSON.stringify(stEnv.textContent));
+    t("A-2 核心：界面必须如实表达「状态未知 / 读取不到」",
+      /状态未知|无法读取/.test(stEnv.textContent),
+      "状态条=" + JSON.stringify(stEnv.textContent));
+    t("A-3 读取失败不是错误态：不得声称代理可能已回退直连",
+      !/回退直连|流量可能/.test(stEnv.textContent),
+      "状态条=" + JSON.stringify(stEnv.textContent));
+    t("A-4 状态条用的是既有的 warn 档（与 R7-01-F 的读取失败同档；不得沿用直连的 muted）",
+      stEnv.className === "status warn",
+      "className=" + JSON.stringify(stEnv.className));
+
+    // 读取恢复：同一入口必须回到真实状态（证明 A-1/A-2 不是把状态条写死）
+    env.readMode("bg", "session", "ok");
+    env.reopen();
+    await env.settle(80);
+    t("A-5 读取恢复后界面回到「代理已生效」（证明没有把状态条写死为未知）",
+      stEnv.textContent.indexOf("代理已生效") >= 0,
+      "状态条=" + JSON.stringify(stEnv.textContent));
+  }
+
+  console.log("");
+  console.log("== R8-04-B：同一现场 —— 代理配置绝不能被这次读取失败改动 ==");
+  {
+    const env = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "example.com" },
+      localStore: {}
+    });
+    await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+    env.setSessionState({ lastState: { status: "applied", mode: "fixed_servers" } });
+    await env.settle(60);
+    const appliedBefore = env.proxy.applied.length;
+
+    env.readMode("bg", "session", "fail");
+    env.readPayload("bg", "undefined");
+    env.proxy.applied.length = 0; env.proxy.cleared.length = 0;
+    env.reopen();
+    await env.settle(80);
+
+    t("B-1 核心：chrome.proxy 的实际生效配置仍是 socks5 127.0.0.1:10808",
+      proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808",
+      "实际生效 = " + proxyTarget(env.proxy.value));
+    t("B-2 核心：chrome.proxy.settings.set 调用次数为 0（没有重新下发）",
+      env.proxy.applied.length === 0, JSON.stringify(env.proxy.applied));
+    t("B-3 核心：clearProxyScope 调用次数为 0（没有把 regular 作用域清掉）",
+      env.proxy.cleared.filter(s => s === "regular").length === 0,
+      JSON.stringify(env.proxy.cleared));
+    t("B-4 存储里的 enableProxy 仍是 true（这次读取失败没有波及 sync）",
+      env.syncStore.enableProxy === true, "enableProxy=" + env.syncStore.enableProxy);
+    // 交接：读取失败【叠加】用户点一次保存，代理仍必须完好（同一个入口的两段）
+    env.click("saveButton");
+    await env.settle(160);
+    t("B-5 读取失败 + 一次保存：代理仍生效（0 次 clear、生效配置未变）",
+      proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808" &&
+      env.proxy.cleared.filter(s => s === "regular").length === 0,
+      "生效 = " + proxyTarget(env.proxy.value) + " cleared=" + JSON.stringify(env.proxy.cleared));
+    t("B-6 前置事实：正常路径本就会下发一次（证明 B-2 的 0 次不是「链路根本没通」）",
+      appliedBefore >= 1, "首次下发次数=" + appliedBefore);
+  }
+
+  console.log("");
+  console.log("== R8-04-C（防回归）：session.get 正常、lastState = applied → 「代理已生效」 ==");
+  {
+    const env = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "example.com" },
+      localStore: {}
+    });
+    await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+    const stEnv = env.popupCtx.el.statusBar;
+    t("C-前置：全新安装、后台还没写下任何状态时，界面显示的是「直连」兜底",
+      stEnv.textContent === "未启用代理（直连）",
+      "状态条=" + JSON.stringify(stEnv.textContent));
+
+    env.setSessionState({ lastState: { status: "applied", mode: "fixed_servers" } });
+    await env.settle(80);
+    t("C-1 防回归：正常读到 applied 时显示「代理已生效」（既有语义一字不变）",
+      stEnv.textContent.indexOf("代理已生效") >= 0,
+      "状态条=" + JSON.stringify(stEnv.textContent));
+    t("C-2 防回归：applied 档的样式类是 ok",
+      stEnv.className === "status ok", "className=" + JSON.stringify(stEnv.className));
+    t("C-3 防回归：applied 的文案逐字符等于既有 STATUS_TEXT，未追加任何后缀",
+      stEnv.textContent === "代理已生效", "状态条=" + JSON.stringify(stEnv.textContent));
+  }
+
+  console.log("");
+  console.log("== R8-04-D（防回归，关键）：真的没有状态时「直连」仍然是正确显示 ==");
+  {
+    // 这一条是本次修复的【反向锁】：R8-04-A 要求「读不到 → 状态未知」，
+    //   若把判据写成「只要没有 state 就报未知」，全新安装（从未写入过状态）
+    //   就会被谎报成读故障 —— 那是把一个假象换成另一个假象。
+    const env = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "example.com" },
+      localStore: {}
+    });
+    await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+    await env.settle(60);
+    const stEnv = env.popupCtx.el.statusBar;
+
+    // 「读取正常、但 session 里确实什么都没有」的真实来历：全新安装时 popup 可能
+    //   先于首次下发被打开；service worker 被回收后 session 也可能被清空。
+    //   这里直接清掉那两个键 —— 【全程不注入任何 lastError】，所以后台那次
+    //   session.get 是成功的：区别只在「没有」，不在「读不到」。
+    delete env.sessionStore.lastState;
+    delete env.sessionStore.lastTest;
+    env.reopen();
+    await env.settle(80);
+
+    t("D-前置：session 里确实没有任何状态（读取前）",
+      env.sessionStore.lastState === undefined && env.sessionStore.lastTest === undefined,
+      "sessionStore=" + JSON.stringify(env.sessionStore));
+    t("D-1 关键：读取正常但确实没有状态时，显示「未启用代理（直连）」（该行为必须保留）",
+      stEnv.textContent === "未启用代理（直连）",
+      "状态条=" + JSON.stringify(stEnv.textContent));
+    t("D-2 关键：不得谎报成「状态未知 / 无法读取」",
+      !/状态未知|无法读取/.test(stEnv.textContent),
+      "状态条=" + JSON.stringify(stEnv.textContent));
+    t("D-3 样式类仍是 direct 档的 muted",
+      stEnv.className === "status muted", "className=" + JSON.stringify(stEnv.className));
+
+    // D-4 是 D-1 的【对照】：此刻 session 里的内容与 D-1 完全相同（都是空），
+    //   唯一变量是后台那次 session.get 是否失败 —— 界面必须据此给出不同结论。
+    //   （第二种真实失败形态：回调 payload 是空对象 {} 但 lastError 有值）
+    env.readMode("bg", "session", "fail");
+    env.readPayload("bg", "empty");
+    env.reopen();
+    await env.settle(80);
+    t("D-4 payload 为空对象但 lastError 有值时同样判为「读不到」，不判「直连」",
+      stEnv.textContent.indexOf("未启用代理") < 0 && /状态未知|无法读取/.test(stEnv.textContent),
+      "状态条=" + JSON.stringify(stEnv.textContent));
+  }
   console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);
