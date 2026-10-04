@@ -300,7 +300,7 @@ function t(name, cond, extra) {
   console.log("");
   console.log("== R3-01-R3：下发【在途】时启动对比 → 直连取样不得被污染，且不得回退旧值 ==");
   {
-    const env = buildEnv({ fetchDelay: 100, slowPort: 9000, slowMs: 200 });
+    const env = buildEnv({ fetchDelay: 500, slowPort: 9000, slowMs: 850 });
     await ready(env, "10808");
     env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "9000" }), () => {});
     // 等 9000 的 set 真正发起（仍在途，200ms 未完成）后立刻启动对比
