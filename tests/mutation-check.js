@@ -133,8 +133,42 @@ const mutations = [
     // 去掉收尾提交后，代理会停留在被清除的直连状态，ownership 用例必须变红。
     name: "M11 窗口收尾不再提交（R3-01 回归：清除后不恢复）",
     target: "bg",
-    from: "      await applyProxyCore();\n      suspendDirty = false;",
-    to: "      if (false) { suspendDirty = false; }",
+    from: "      core = await applyProxyCore();",
+    to: "      if (false) { core = await applyProxyCore(); }",
+    expectFail: true
+  },
+  {
+    // 第六轮 R6-01：窗口收尾必须真正【消费 applyProxyCore 的返回值】，并显式排除 overridden。
+    //   恒真清脏会把 error / saved_not_applied / 被接管 一并当成"恢复成功"：
+    //   既丢掉"恢复未完成"的如实上报，也丢掉待下发标记。
+    name: "M14 窗口收尾恒真清脏（R6-01 回归：不消费返回值、不排除 overridden）",
+    target: "bg",
+    from: "    } else if (!result.restoreFailed && core && core.ok === true && core.status !== \"overridden\") {",
+    to: "    } else if (true) {",
+    expectFail: true
+  },
+  {
+    // 第六轮 R6-03：普通成功下发路径同样必须【消费脏标记】。
+    //   否则"接管期间记脏、接管解除后重放成功"这条链会把 dirty 一路留给后续窗口，
+    //   使一次用户根本没改配置的对比测试误报"有配置变更待下发"。
+    name: "M15 普通成功路径不再清脏（R6-03 回归：脏标记跨窗口遗留）",
+    target: "bg",
+    from: "  if (core && core.ok === true && core.status !== \"overridden\") {",
+    to: "  if (false) {",
+    expectFail: true
+  },
+  {
+    // 第六轮 D-2：chrome.proxy.settings.onChange 的回查必须是【只读】的 ——
+    //   外部接管/释放时只能刷新状态，绝不能顺手把我们的配置写回去夺权。
+    //   这里在"每次回查都会经过"的回调顶部注入一次真实写回，
+    //   ownership 的「不得发生我方夺权式写回」断言必须变红。
+    //   【选点说明 · 实测依据】写回的捕获断言全部由 fireProxyChange 驱动，而现有用例
+    //   都不给回查挂 get 钩子，因此"回读失败"分支(this 块内 if (!d))恒不可达 ——
+    //   把写回塞进那个分支等于注入了一段死代码，变异会假性放行(MISS)，护栏形同虚设。
+    name: "M16 只读回查里发生夺权式写回（D-2 回归：外部接管被我方覆盖）",
+    target: "bg",
+    from: "  readProxyDetails().then(function (d) {",
+    to: "  readProxyDetails().then(function (d) {\n    setProxy({ mode: \"fixed_servers\", rules: { singleProxy: { scheme: \"socks5\", host: \"127.0.0.1\", port: \"10808\" } } }).catch(function () {});",
     expectFail: true
   },
   {
