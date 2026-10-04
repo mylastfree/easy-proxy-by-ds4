@@ -123,10 +123,10 @@
 | `tests/fix-safety.test.js` | 修复安全性：暂停标志必然复位、串行队列不累积、收紧判定未误伤合法输入（19 项） |
 | `tests/concurrency.test.js` | 并发护栏（N1/N2）：暂停计数不泄漏、测试互斥生效（33 项） |
 | `tests/ownership.test.js` | 所有权护栏：断言实际生效配置而非存储值，外部接管不夺权也不丢配置（228 项） |
-| `tests/popup.test.js` | popup 交互：异常时按钮必须复位，且如实显示失败原因（99 项） |
+| `tests/popup.test.js` | popup 交互：异常时按钮必须复位，且如实显示失败原因（104 项） |
 | `tests/mutation-check.js` | 变异测试：故意破坏每个修复点，确认护栏测试真的会失败（16 项变异） |
 
-七套功能测试合计 **527 项断言**。
+七套功能测试合计 **532 项断言**。
 
 ```powershell
 node tests\manifest.test.js

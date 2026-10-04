@@ -281,6 +281,20 @@ function buildChainEnv(opts) {
           const snapshot = JSON.parse(JSON.stringify(obj));
           if (name === "sync") syncSetCalls.push(snapshot);
           if (name === "local") localSetCalls.push(snapshot);
+          // 【R9-01 门禁】定向失败注入：允许测试只阻断某一类写入（例如后台自愈写下的
+          //   {bypassList:""}），从而把「存量污染现场」稳定固定到保存之前，用例因此
+          //   不依赖任何挂钟时序。失败契约必须与真实一致：不写 store、不派 onChanged、
+          //   且 lastError 只在回调期间存在。
+          if (typeof opts.setFilter === "function") {
+            const reason = opts.setFilter(realm, name, obj);
+            if (reason) {
+              setTimeout(() => {
+                api.runtime.lastError = { message: typeof reason === "string" ? reason : "storage.set 失败（测试注入）" };
+                try { if (cb) cb(); } finally { api.runtime.lastError = undefined; }
+              }, 0);
+              return;
+            }
+          }
           const changes = {};
           for (const k of Object.keys(obj)) {
             if (JSON.stringify(store[k]) !== JSON.stringify(obj[k])) {
@@ -858,6 +872,63 @@ function t(name, cond, extra) {
     t("C-9 关键：等长但内容不同的用户列表保存后，local 的过期副本仍被清掉（判据必须是逐字符的）",
       envE.localStore.bypassList === "" && envE.localSetCalls.some(o => o && o.bypassList === ""),
       JSON.stringify([envE.localStore.bypassList, envE.localSetCalls.map(o => String(o && o.bypassList).length)]));
+  }
+
+  console.log("");
+  console.log("== R9-01（门禁版）：遮蔽现场下用户【编辑后保存】不得删除 local 唯一副本 ==");
+  {
+    // 与 R8-02-B 同一污染形态，区别在【用户编辑了内容】：
+    //   R8-02-B 是「不编辑、只点保存」，保存值逐字符等于默认列表，旧判据侥幸拦住；
+    //   本用例把默认列表改一个字，旧判据立即失效并清空 local —— 那是不可逆的数据丢失。
+    //
+    // 污染现场用【定向失败注入】固定：只阻断后台自愈写下的 {bypassList:""}，
+    //   其余写入照常。这样 loadedShadowed 在保存时必定为 true，用例不含任何时序竞争。
+    const sboxR9 = { TextEncoder: TextEncoder };
+    sboxR9.self = sboxR9; sboxR9.globalThis = sboxR9;
+    vm.createContext(sboxR9);
+    vm.runInContext(settingsSrc, sboxR9);
+    const DEF_R9 = sboxR9.EasyProxy.DEFAULTS.bypassList;
+    const NL = String.fromCharCode(10);
+    const LONG_R9 = Array.from({ length: 500 }, (_, i) => "r9-" + (i + 1) + ".internal.example").join(NL);
+
+    const envR9 = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: DEF_R9 },
+      localStore: { bypassList: LONG_R9 },
+      setFilter: (realm, areaName, obj) => {
+        if (areaName === "sync" && Object.keys(obj).length === 1 && obj.bypassList === "") {
+          return "自愈写入被测试阻断，以固定污染现场";
+        }
+        return null;
+      }
+    });
+    await waitUntil(() => proxyTarget(envR9.proxy.value) === "socks5 127.0.0.1:10808");
+    await envR9.settle(160);
+
+    t("R9-01-A 前置事实：污染现场被固定住（sync 仍是内置默认列表，local 是用户 500 条规则）",
+      envR9.syncStore.bypassList === DEF_R9 && envR9.localStore.bypassList === LONG_R9,
+      JSON.stringify([String(envR9.syncStore.bypassList).length, String(envR9.localStore.bypassList).split(NL).length]));
+
+    t("R9-01-B 前置事实：界面显示的是被遮蔽后的默认列表（用户自己的规则不可见）",
+      envR9.els.bypassList.value === DEF_R9,
+      "界面长度=" + String(envR9.els.bypassList.value).length + "；默认长度=" + DEF_R9.length);
+
+    envR9.syncSetCalls.length = 0; envR9.localSetCalls.length = 0;
+    // 用户在被遮蔽的表单上编辑一个字：保存值不再等于默认列表
+    envR9.els.bypassList.value = DEF_R9 + NL + "edited-by-user.internal.example";
+    envR9.click("saveButton");
+    await envR9.settle(200);
+
+    t("R9-01-C 核心：编辑后保存不得把 local 写成空串（断言真实存储内容）",
+      envR9.localStore.bypassList === LONG_R9,
+      "local 条数=" + String(envR9.localStore.bypassList || "").split(NL).length + " 期望 500");
+
+    t("R9-01-D 核心：local.set 的调用序列里不存在把 bypassList 写成空串的条目",
+      !envR9.localSetCalls.some(o => o && o.bypassList === ""),
+      JSON.stringify(envR9.localSetCalls.map(o => String(o && o.bypassList).length)));
+
+    t("R9-01-E 保存本身确实写入了 sync（排除「根本没保存」造成的假绿）",
+      envR9.syncSetCalls.length === 1 && String(envR9.syncSetCalls[0].bypassList).indexOf("edited-by-user") >= 0,
+      JSON.stringify(envR9.syncSetCalls.map(o => String(o.bypassList).length)));
   }
 
 
