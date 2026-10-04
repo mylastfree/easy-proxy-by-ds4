@@ -14,7 +14,11 @@ const { spawnSync } = require("node:child_process");
 const rootDir = path.join(__dirname, "..");
 const targets = {
   bg: path.join(rootDir, "background.js"),
-  set: path.join(rootDir, "settings.js")
+  set: path.join(rootDir, "settings.js"),
+  // 【V-02】popup.js 此前不是变异目标：R9-01 的守卫（formWasShadowed）与本轮 V-02 的
+  //   修复都落在 popup.js；若不纳入变异，新增用例只能靠人工确认「改回恒假会红」。
+  //   纳入后 M17/M18 会在每次门禁运行中自动证明那两条用例是承重的。
+  popup: path.join(rootDir, "popup.js")
 };
 // 变异后必须运行【全部】测试：只跑其中一个会漏掉护栏。
 // 曾经踩过的坑：护栏写在 concurrency.test.js，而这里只跑 background.test.js，
@@ -40,17 +44,20 @@ function restoreEol(s, eol) { return eol === "\n" ? s : s.split("\n").join(eol);
 
 const originals = {
   bg: fs.readFileSync(targets.bg, "utf8"),
-  set: fs.readFileSync(targets.set, "utf8")
+  set: fs.readFileSync(targets.set, "utf8"),
+  popup: fs.readFileSync(targets.popup, "utf8")
 };
 
 // 匹配用（LF 归一），写回用（原风格）
 const norm = {
   bg: toLf(originals.bg),
-  set: toLf(originals.set)
+  set: toLf(originals.set),
+  popup: toLf(originals.popup)
 };
 const eol = {
   bg: detectEol(originals.bg),
-  set: detectEol(originals.set)
+  set: detectEol(originals.set),
+  popup: detectEol(originals.popup)
 };
 
 // 只要有一个测试文件失败，就认为变异被拦截。
@@ -210,6 +217,27 @@ const mutations = [
     from: "if (typeof localValue === 'string') return localValue;",
     to: "if (false) return localValue;",
     expectFail: true
+  },
+  {
+    // 【V-02 第 1 层】把「遮蔽现场 + 超长 → 零写入拒绝」改成恒假：
+    //   代码会掉进 formWasShadowed 分支，把【超长的表单值】写进 sync —— 在真实
+    //   Chrome 上那是必然 lastError 失败、用户却看到「已保存」。
+    //   R9-01-F7（零写入）必须变红。
+    name: "M17 遮蔽现场超长拒绝层恒假（V-02 回归：超长值被写进 sync）",
+    target: "popup",
+    from: "  if (formWasShadowed && oversize) {",
+    to: "  if (false) {",
+    expectFail: true
+  },
+  {
+    // 【V-02 第 2 层】把入口守卫改成恒假 —— 等价于 R9-01 修复前的状态：
+    //   超长值走 oversize 分支，直接 setStorage("local", {bypassList: 表单值})，
+    //   覆盖用户唯一副本。R9-01-F3 / R9-01-F4 必须变红。
+    name: "M18 遮蔽现场入口守卫恒假（V-02 回归：oversize 分支覆盖 local 唯一副本）",
+    target: "popup",
+    from: "  var chain = formWasShadowed\n    ? setStorage(\"sync\", settings).then(function () {",
+    to: "  var chain = false\n    ? setStorage(\"sync\", settings).then(function () {",
+    expectFail: true
   }
 ];
 
@@ -270,6 +298,7 @@ try {
 } finally {
   fs.writeFileSync(targets.bg, originals.bg);
   fs.writeFileSync(targets.set, originals.set);
+  fs.writeFileSync(targets.popup, originals.popup);
 }
 
 console.log("变异测试结果：");
@@ -280,7 +309,8 @@ for (const r of rows) {
 }
 
 const restored = fs.readFileSync(targets.bg, "utf8") === originals.bg &&
-                 fs.readFileSync(targets.set, "utf8") === originals.set;
+                 fs.readFileSync(targets.set, "utf8") === originals.set &&
+                 fs.readFileSync(targets.popup, "utf8") === originals.popup;
 console.log("");
 console.log("达标 " + ok + " 项，未达标 " + miss + " 项，注入失败 " + injectFail + " 项，" +
   "门禁自身失效(BAD) " + bad + " 项");

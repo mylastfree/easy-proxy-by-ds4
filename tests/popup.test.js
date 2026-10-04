@@ -932,6 +932,129 @@ function t(name, cond, extra) {
   }
 
 
+  console.log("");
+  console.log("== R9-01-F：遮蔽现场下保存【超长列表】不得覆盖 local 唯一副本（V-02）==");
+  {
+    // 与 R9-01 同一污染形态（sync=内置默认列表 + local=用户 500 条规则），
+    //   区别在【表单值超过 MAX_SYNC_BYTES_PER_ITEM(8192)】：
+    //   此时 save() 走 oversize 分支，而该分支此前没有 formWasShadowed 守卫，
+    //   会直接 setStorage("local", {bypassList: 表单值}) 覆盖用户唯一副本（V-02）。
+    //
+    // 污染现场仍用【定向失败注入】固定：只阻断后台自愈写下的 {bypassList:""}，
+    //   其余写入照常 —— 用例不含任何时序竞争。
+    const sboxF = { TextEncoder: TextEncoder };
+    sboxF.self = sboxF; sboxF.globalThis = sboxF;
+    vm.createContext(sboxF);
+    vm.runInContext(settingsSrc, sboxF);
+    const DEF_F = sboxF.EasyProxy.DEFAULTS.bypassList;
+    const MAX_F = sboxF.EasyProxy.MAX_SYNC_BYTES_PER_ITEM;
+    const NL_F = String.fromCharCode(10);
+    const LONG_F = Array.from({ length: 500 }, (_, i) => "r9f-" + (i + 1) + ".internal.example").join(NL_F);
+    // 用户粘贴的 600 条列表：单条 26 字符左右，总长必然 > 8192
+    const PASTED_F = Array.from({ length: 600 }, (_, i) => "pasted-" + (i + 1) + ".big.example.com").join(NL_F);
+
+    t("R9-01-F0 构造前提：粘贴的列表确实超过 sync 单键上限（否则本用例根本不走 oversize 分支）",
+      sboxF.EasyProxy.estimateBytes({ bypassList: PASTED_F }) > MAX_F,
+      "字节=" + sboxF.EasyProxy.estimateBytes({ bypassList: PASTED_F }) + " 上限=" + MAX_F);
+
+    const envF = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: DEF_F },
+      localStore: { bypassList: LONG_F },
+      setFilter: (realm, areaName, obj) => {
+        if (areaName === "sync" && Object.keys(obj).length === 1 && obj.bypassList === "") {
+          return "自愈写入被测试阻断，以固定污染现场";
+        }
+        return null;
+      }
+    });
+    await waitUntil(() => proxyTarget(envF.proxy.value) === "socks5 127.0.0.1:10808");
+    await envF.settle(160);
+
+    t("R9-01-F1 前置事实：污染现场被固定住（sync 仍是默认列表，local 是用户 500 条规则）",
+      envF.syncStore.bypassList === DEF_F && envF.localStore.bypassList === LONG_F,
+      JSON.stringify([String(envF.syncStore.bypassList).length, String(envF.localStore.bypassList).split(NL_F).length]));
+
+    t("R9-01-F2 前置事实：表单确实渲染出被遮蔽的现场（守卫的本轮新增条件据此判定）",
+      envF.els.bypassList.value === DEF_F,
+      "界面长度=" + String(envF.els.bypassList.value).length);
+
+    envF.syncSetCalls.length = 0; envF.localSetCalls.length = 0;
+    envF.els.bypassList.value = PASTED_F;       // 用户在遮蔽现场粘贴一份超长列表
+    envF.click("saveButton");
+    await envF.settle(200);
+
+    // 核心（数据完整性）：local 必须逐字符仍是用户原列表
+    t("R9-01-F3 核心：遮蔽现场保存超长列表不得覆盖 local 唯一副本（断言真实存储内容）",
+      envF.localStore.bypassList === LONG_F,
+      "local 条数=" + String(envF.localStore.bypassList || "").split(NL_F).length +
+      " 期望 500；首行=" + JSON.stringify(String(envF.localStore.bypassList || "").split(NL_F)[0]));
+
+    // 核心（写入序列）：local.set 的任何一次都必须为空 —— 而不是「除了某次以外」
+    //   注意：断言【整条序列为空】比断言「不等于某个值」更严，能同时挡住
+    //   「写空串」「写粘贴值」「写默认列表」三种覆盖形态。
+    t("R9-01-F4 核心：local.set 的调用序列必须为空（遮蔽现场绝不允许写 local，而不是只禁止写空串）",
+      envF.localSetCalls.length === 0,
+      JSON.stringify(envF.localSetCalls.map(o => String(o && o.bypassList).length)));
+
+    // 核心（零写入）：遮蔽现场 + 超长值时，连 sync 也不能写。
+    //   原因：chrome.storage.sync 的单键上限是 QUOTA_BYTES_PER_ITEM = 8192 字节，
+    //   写进去在真实 Chrome 上必然以 lastError 失败，而且会把用户表单内容留成
+    //   「半提交」状态（sync 没有该键的新值、用户以为自己存上了）。
+    //   local 是唯一副本，超长值又无处安放 —— 唯一安全的动作是【写入之前就拒绝】。
+    //   本仓库的 storage 桩不做配额校验，所以「错误地写 sync」在测试里不会自动报错：
+    //   这一条断言是唯一能挡住该错误实现的门。
+    t("R9-01-F7 核心：遮蔽现场下超长值必须零写入（sync 也不写；真实 sync 单键上限 8192 字节）",
+      envF.syncSetCalls.length === 0,
+      JSON.stringify(envF.syncSetCalls.map(o => String(o.bypassList).length)));
+
+    // 排除假绿：保存被拒绝时必须给出【可理解且如实】的解释，不能静默什么都不做
+    t("R9-01-F5 拒绝保存时必须留下如实的提示（排除「点了没反应」造成的假绿）",
+      envF.hint().length > 0 && envF.hint().indexOf("未保存") >= 0,
+      JSON.stringify(envF.hint()));
+
+    // 提示语必须如实：不得再出现「已存于本地」这种与事实相反的结论
+    t("R9-01-F6 提示语不得声称已经存到本地（local 未被写入，那句话与事实相反）",
+      envF.hint().indexOf("已存于本地") < 0,
+      JSON.stringify(envF.hint()));
+
+    // ---- 同现场、短列表分支：真正证明「守卫没有把保存功能一并关掉」 ----
+    //   上面的 6 条只证明「没有丢数据」；若实现被写成「遮蔽现场一律拒绝保存」，
+    //   那 6 条会全绿，但用户的正常保存需求被废掉。这一段是必需的反向对照。
+    {
+      const SHORT_F = "only-a-few.internal.example";   // 远小于 8192 字节
+
+      const envFs = buildChainEnv({
+        syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: DEF_F },
+        localStore: { bypassList: LONG_F },
+        setFilter: (realm, areaName, obj) => {
+          if (areaName === "sync" && Object.keys(obj).length === 1 && obj.bypassList === "") {
+            return "自愈写入被测试阻断，以固定污染现场";
+          }
+          return null;
+        }
+      });
+      await waitUntil(() => proxyTarget(envFs.proxy.value) === "socks5 127.0.0.1:10808");
+      await envFs.settle(160);
+      t("R9-01-F8 前置事实（短列表分支）：表单仍是被遮蔽的默认列表",
+        envFs.els.bypassList.value === DEF_F,
+        "界面长度=" + String(envFs.els.bypassList.value).length);
+
+      envFs.syncSetCalls.length = 0; envFs.localSetCalls.length = 0;
+      envFs.els.bypassList.value = SHORT_F;
+      envFs.click("saveButton");
+      await envFs.settle(200);
+
+      t("R9-01-F9 反向对照：遮蔽现场下保存【短】列表必须成功写入 sync（证明保存功能没被关掉）",
+        envFs.syncSetCalls.some(o => o.bypassList === SHORT_F),
+        JSON.stringify(envFs.syncSetCalls.map(o => String(o.bypassList).length)));
+      t("R9-01-F10 反向对照：短列表保存时 local 仍必须零写入",
+        envFs.localSetCalls.length === 0 && envFs.localStore.bypassList === LONG_F,
+        JSON.stringify([envFs.localSetCalls.length,
+          String(envFs.localStore.bypassList || "").split(NL_F).length]));
+    }
+  }
+
+
   /* ============================================================
      R8-04：getStatus 的 session.get 读取失败不得被前台兜底成「直连」
      ------------------------------------------------------------

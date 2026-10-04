@@ -371,8 +371,12 @@ function load() {
       loadedShadowed = shadowed;
       if (shadowed) {
         console.warn("检测到历史遗留的绕过列表污染现场：本机 local 保存着用户规则，但 sync 是内置默认列表。已标记本次表单，保存时不会据此删除 local。");
+        // 【W-01】此前的文案是「此提示存在期间请勿保存」——守卫补全覆盖全部写入路径之后，
+        //   这句话已经变成谎言（保存不会删掉本机那份规则），而且会诱导用户在被遮蔽的
+        //   界面上空等。新文案把两件事分开说清：「保存不会丢数据」与「保存会覆盖生效值」。
         showHint("检测到历史遗留的绕过列表：本机保存着你自己的规则，但当前生效的是内置默认列表。" +
-          "后台正在自动恢复为你的规则；此提示存在期间请勿保存，或保存后重新打开弹窗确认。", "warn");
+          "后台正在自动恢复为你的规则。此时可以直接保存（不会删掉本机那份规则），" +
+          "但保存的内容会成为当前生效值；若想恢复自己的规则，请等本提示消失后再保存。", "warn");
       }
     });
   });
@@ -458,30 +462,51 @@ function save() {
   //   因此这里取快照，回调里只读快照。
   var formWasShadowed = loadedShadowed;
 
-  var chain = oversize
-    ? setStorage("local", { bypassList: settings.bypassList }).then(function () {
-        return setStorage("sync", Object.assign({}, settings, { bypassList: "" }));
-      }).then(function () {
-        showHint("绕过列表较长，已存于本地（不跨设备同步）", "warn");
+  // 【V-02】安全守卫必须挂在【分支判定之前】，而不是挂在短列表分支的清理动作上。
+  //   遮蔽现场的表单内容不属于用户：此时 oversize 分支的语义前提（「列表太大，
+  //   sync 放不下，所以存一份到 local」）根本不成立 —— local 里躺着的很可能正是
+  //   用户规则的最后一份副本，而表单里那份是内置默认列表加用户的改动。
+  //   因此遮蔽现场【一律不写 local】：写空串会丢副本，写表单值会覆盖副本。
+  //
+  //   第二层约束：遮蔽现场下也不能「顺手把表单值写进 sync」。chrome.storage.sync
+  //   的【单键】上限是 8192 字节（S.MAX_SYNC_BYTES_PER_ITEM 就是它），而走到
+  //   oversize 分支的正是「用户粘贴了超长列表」的情形：写 sync 在真实 Chrome 上
+  //   必然以 lastError 失败，用户却会以为自己保存成功了。
+  //   local 不能写、sync 装不下 → 唯一安全的动作是【在写入之前就拒绝】。
+  //   【注意】本仓库测试的 storage 桩不做配额校验，「错误地写 sync」不会在测试里
+  //   报错，所以这一层由 R9-01-F7 显式断言守住，不能省。
+  if (formWasShadowed && oversize) {
+    console.warn("遮蔽现场下拒绝保存超长绕过列表：local 是用户规则唯一副本不可覆盖，" +
+      "而 sync 的单键上限（" + S.MAX_SYNC_BYTES_PER_ITEM + " 字节）装不下这份列表。" +
+      "本次未写入任何存储。");
+    showHint("未保存：当前显示的绕过列表来自内置默认值，而你粘贴的列表超过了可直接保存的长度上限（" +
+      S.MAX_SYNC_BYTES_PER_ITEM + " 字节），本机还保存着你自己的规则（不会被覆盖）。" +
+      "请先等后台恢复你自己的规则，或把列表缩短后重试。", "error");
+    return;
+  }
+
+  var chain = formWasShadowed
+    ? setStorage("sync", settings).then(function () {
+        // 把「用户规则可能仍未生效」的事实留在日志里，而不是只留在界面：
+        //   后续若出现「我的规则不生效」的报障，维护者能直接定位到这一次主动保存。
+        console.warn("遮蔽现场下保存：已按用户表单写入 sync，但未改动 storage.local" +
+          "（其中的绕过列表可能是用户规则唯一副本，且后台自愈判据已因本次写入不再成立）。");
+        showHint("已保存；但本机还保存着你自己的规则，当前生效的仍可能是这一份表单内容。" +
+          "关闭并重新打开弹窗，或等待后台自动恢复后再确认。", "warn");
       })
-    : setStorage("sync", settings).then(function () {
-        // 【R9-01】核心守卫：如果本次表单是在「被默认列表遮蔽」的现场渲染的，
-        //   那么 settings.bypassList 不能用来证明"local 只是过期副本"——
-        //   用户很可能是照着那份【并不属于他】的默认列表改的。
-        //   此时唯一安全的动作是【不删 local】：它可能是用户规则的最后一份副本，
-        //   删掉不可逆且界面只会报「设置已保存」。
-        //   这里刻意不写回 sync（那会覆盖用户刚刚保存的内容）；把 sync 恢复成
-        //   空串占位的自愈由 background 的 reconcileLegacyBypass 负责。
-        if (formWasShadowed) {
-          console.warn("保存时检测到表单来自被遮蔽的现场，保留 storage.local 的绕过列表副本（可能为用户规则唯一副本）。");
-          return undefined;
-        }
-        // 【R8-02】把本次写进 sync 的 bypassList 一并交给清理函数：
-        //   它据此判断「保存的是系统默认列表」还是「用户自己撰写的列表」。
-        return clearLocalBypassIfAny(settings.bypassList);
-      }).then(function () {
-        showHint("设置已保存", "ok");
-      });
+    : (oversize
+        ? setStorage("local", { bypassList: settings.bypassList }).then(function () {
+            return setStorage("sync", Object.assign({}, settings, { bypassList: "" }));
+          }).then(function () {
+            showHint("绕过列表较长，已存于本地（不跨设备同步）", "warn");
+          })
+        : setStorage("sync", settings).then(function () {
+            // 【R8-02】把本次写进 sync 的 bypassList 一并交给清理函数：
+            //   它据此判断「保存的是系统默认列表」还是「用户自己撰写的列表」。
+            return clearLocalBypassIfAny(settings.bypassList);
+          }).then(function () {
+            showHint("设置已保存", "ok");
+          }));
 
   chain.catch(function (err) {
     showHint("保存失败：" + ((err && err.message) || err), "error");
