@@ -30,6 +30,10 @@ function buildEnv(opts) {
   const fetchLog = [];       // 每次 fetch 时刻的 proxyActive
   const iconCalls = [], titleCalls = [];
   let windowOpen = false, proxyActive = false, effective = null, fetchCount = 0;
+  // R8-03：模拟外部写入方把【协议】(scheme) 改成别的值 —— Chromium 里一个作用域只有
+  //   一份生效配置，所以改写协议会连同 host/port 一起改写（由 externalSetEffective 给出）。
+  //   默认 "socks5"：不注入时与修复前的默认回读一字不差，既有用例行为不变。
+  let effectiveScheme = "socks5";
   const fetchDelay = opts.fetchDelay === undefined ? 80 : opts.fetchDelay;
   const slowPort = opts.slowPort || 0, slowMs = opts.slowMs || 0;
   let directPhaseSeen = false, restoreSetSeen = false;
@@ -92,6 +96,14 @@ function buildEnv(opts) {
   function record(v) { if (windowOpen) timeline.push(v); }
   // 把"真实 set 落地"的效果（proxyActive / effective / timeline）抽成一处，
   // 让默认路径与 setHook 注入路径共用同一份保真逻辑，避免两处漂移。
+  // R8-03：外部写入方「同 host/port、换协议」的写入 —— 只改真实生效配置与控制权等级，
+  //   不经过我方任何写路径（不推 setCalls、不写 timeline，与 externalSet 语义一致）。
+  function externalSetEffective(level, host, port, scheme) {
+    effectiveScheme = scheme;
+    effective = host === null ? null : host + ":" + port;
+    proxyActive = host !== null;
+    externalLevel = level;
+  }
   function applyEffective(label) {
     // 传入字符串 = 代理已按该 label 挂上；传入 null = 没有挂上代理
     //   （真实 Chromium 里 mode:"direct" 的 set 不会挂上代理）。
@@ -102,7 +114,7 @@ function buildEnv(opts) {
   function defaultGet(o, cb) {
     // 忠实还原：真实生效配置就是 effective；直连时 mode 为 "direct"
     const value = effective !== null
-      ? { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: effective.split(":")[0], port: effective.split(":")[1] } } }
+      ? { mode: "fixed_servers", rules: { singleProxy: { scheme: effectiveScheme, host: effective.split(":")[0], port: effective.split(":")[1] } } }
       : { mode: "direct" };
     // externalLevel 非空时优先返回它：模拟外部接管或外部释放控制权（R6-04）。
     const level = externalLevel || "controlled_by_this_extension";
@@ -128,6 +140,7 @@ function buildEnv(opts) {
           const delay = (Number(sp.port) === slowPort) ? slowMs : 0;
           setTimeout(() => {
             // 关键保真：mode:"direct" 的 set 不会挂上代理（Chromium 语义）
+            if (o.value && o.value.mode === "direct") effectiveScheme = "socks5";
             applyEffective((o.value && o.value.mode === "direct") ? null : label);
             sandbox.chrome.runtime.lastError = undefined;
             if (cb) cb();
@@ -181,6 +194,8 @@ function buildEnv(opts) {
     // R6-04：驱动 chrome.proxy.settings.onChange 的真实回调（外部接管 / 释放）。
     fireProxyChange: details => { for (const fn of listeners.onChange.slice()) fn(details); },
     // 模拟外部接管或释放：只改控制等级与实际生效配置，不经过我方任何写路径。
+    // R8-03：外部写入方「同 host/port、换协议」的模拟入口（见 externalSetEffective）。
+    externalSetEffective,
     externalSet: (level, host, port) => {
       effective = host === null ? null : host + ":" + port;
       proxyActive = host !== null;
@@ -724,6 +739,136 @@ function t(name, cond, extra) {
   }
 
   console.log("");
+  console.log("");
+  console.log("== R8-03：回声抑制必须比对 scheme（协议被外部改动不得被吞）==");
+  {
+    // 缺陷事实（R8-03）：lastIntent 只记 mode/host/port，isOwnLastIntent 也只比这三项。
+    //   外部（或用户手动）把生效配置改成【同 host/port、换协议】（socks5 → https）
+    //   后释放控制权，level 回到可控白名单 → 值比对成立、控制权检查放行 →
+    //   整次变化被当成我方回声 return：session 继续写 applied、图标继续留绿，
+    //   而真实生效的协议早已不是我方下发的那个 —— 界面宣称的配置与实际不符。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    t("R8-03-A 前置：我方下发 socks5 127.0.0.1:10808 后状态为 applied",
+      (env.sessionStore.lastState || {}).status === "applied",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState || {}));
+    // 断言对象是【真实下发给 chrome.proxy 的配置】，不是内部变量。
+    const lastCfg = env.setConfigs[env.setConfigs.length - 1] || {};
+    const lastSp = ((lastCfg || {}).rules || {}).singleProxy || {};
+    t("R8-03-A 前置：我方下发的真实配置是 socks5 127.0.0.1:10808",
+      lastSp.scheme === "socks5" && lastSp.host === "127.0.0.1" && String(lastSp.port) === "10808",
+      "下发配置=" + JSON.stringify(lastCfg));
+
+    // 外部写入方：同 host/port，协议换成 https，随后释放控制权。
+    env.externalSetEffective("controllable_by_this_extension", "127.0.0.1", "10808", "https");
+    const writesBefore = env.stateWrites.length, iconsBefore = env.iconCalls.length;
+    const setsBefore = env.setCalls.length, clearsBefore = env.clearCalls.length;
+    env.fireProxyChange({ levelOfControl: "controllable_by_this_extension" });
+    await drain(env);
+
+    const after = env.sessionStore.lastState || {};
+    t("R8-03-A 回声抑制必须先比对协议：协议被外部改动后不得继续宣称 applied",
+      after.status !== "applied", "lastState=" + JSON.stringify(after));
+    t("R8-03-A 协议不一致时必须如实落入既有异常档并说明配置非我方下发",
+      after.status === "error" && /不是本扩展下发/.test(String(after.message || "")),
+      "lastState=" + JSON.stringify(after));
+    t("R8-03-A 协议被外部改动后最后一个图标必须转红（绝不留下绿色）",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-red-16.png",
+      "icon 序列=" + JSON.stringify(env.iconCalls));
+
+    // R8-03-B：状态纠正不得以夺权为代价 —— D-2 只读硬约束必须保持。
+    t("R8-03-B 回调期间不得调用 setProxy（新增 set 必须为 0）",
+      env.setCalls.length - setsBefore === 0,
+      "新增 set=" + JSON.stringify(env.setCalls.slice(setsBefore)));
+    t("R8-03-B 回调期间不得调用 clearProxyScope（新增 clear 必须为 0）",
+      env.clearCalls.length - clearsBefore === 0,
+      "新增 clear=" + JSON.stringify(env.clearCalls.slice(clearsBefore)));
+    t("R8-03-B 协议不一致的纠正必须写状态与图标（不得停在过时结论上）",
+      env.stateWrites.length > writesBefore && env.iconCalls.length > iconsBefore,
+      "新增写入=" + (env.stateWrites.length - writesBefore) + "；新增图标=" + (env.iconCalls.length - iconsBefore));
+    t("R8-03-B 状态里的控制权必须如实记录为 controllable_by_this_extension",
+      after.levelOfControl === "controllable_by_this_extension",
+      "levelOfControl=" + JSON.stringify(after.levelOfControl));
+  }
+  {
+    // R8-03-C（防回归·关键）：mode/host/port/scheme 全同的真实回声必须【仍被抑制】。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10101" }));
+    await drain(env);
+    const stBefore = JSON.stringify(env.sessionStore.lastState || {});
+    t("R8-03-C 前置：我方下发 socks5 127.0.0.1:10101 后状态为 applied",
+      (env.sessionStore.lastState || {}).status === "applied", "lastState=" + stBefore);
+    const writesBeforeC = env.stateWrites.length, iconsBeforeC = env.iconCalls.length;
+
+    env.fireProxyChange({ levelOfControl: "controlled_by_this_extension" });
+    await drain(env);
+
+    t("R8-03-C 协议一致的真实回声不得被当成外部变化（状态一字不变）",
+      JSON.stringify(env.sessionStore.lastState || {}) === stBefore,
+      "改动后=" + JSON.stringify(env.sessionStore.lastState) + " / 原值=" + stBefore);
+    t("R8-03-C 协议一致的真实回声不得产生额外状态写入",
+      env.stateWrites.length === writesBeforeC,
+      "新增写入=" + JSON.stringify(env.stateWrites.slice(writesBeforeC)));
+    t("R8-03-C 协议一致的真实回声不得刷新图标（不抖动）",
+      env.iconCalls.length === iconsBeforeC,
+      "新增图标=" + JSON.stringify(env.iconCalls.slice(iconsBeforeC)));
+  }
+  {
+    // R8-03-D（防回归·关键）：我方 clear 成功后 mode:"direct" 的回声必须【仍被抑制】。
+    //   direct 意图没有协议字段，值比对必须仍走 isOwnLastIntent 的早退分支。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    await setSync(env, Object.assign({}, BASE, { enableProxy: false }));
+    await drain(env);
+    t("R8-03-D 前置：我方清除成功后状态为 direct",
+      (env.sessionStore.lastState || {}).status === "direct",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState));
+    env.externalSetEffective("controllable_by_this_extension", null, null, "socks5");
+    const stBeforeD = JSON.stringify(env.sessionStore.lastState || {});
+    const writesBeforeD = env.stateWrites.length, iconsBeforeD = env.iconCalls.length;
+
+    env.fireProxyChange({ levelOfControl: "controllable_by_this_extension" });
+    await drain(env);
+
+    t("R8-03-D direct 意图（无协议字段）的回声不得被当成外部变化（状态一字不变）",
+      JSON.stringify(env.sessionStore.lastState || {}) === stBeforeD,
+      "改动后=" + JSON.stringify(env.sessionStore.lastState) + " / 原值=" + stBeforeD);
+    t("R8-03-D direct 回声不得产生额外状态写入",
+      env.stateWrites.length === writesBeforeD,
+      "新增写入=" + JSON.stringify(env.stateWrites.slice(writesBeforeD)));
+    t("R8-03-D direct 回声不得刷新图标（不抖动）",
+      env.iconCalls.length === iconsBeforeD,
+      "新增图标=" + JSON.stringify(env.iconCalls.slice(iconsBeforeD)));
+  }
+  {
+    // R8-03-E（防回归）：R7-05 的同目标接管场景（host/port/协议全同、控制权旁落）
+    //   行为必须一字不变：把协议纳入比对不得改变这条既有结论。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    t("R8-03-E 前置：接管前为我方 applied",
+      (env.sessionStore.lastState || {}).status === "applied",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState));
+
+    // 外部以完全相同目标（含协议）接管：协议/host/port 与我方 lastIntent 一字不差。
+    env.externalSetEffective("controlled_by_other_extensions", "127.0.0.1", "10808", "socks5");
+    const setBeforeE = env.setCalls.length, clearBeforeE = env.clearCalls.length;
+    env.fireProxyChange({ levelOfControl: "controlled_by_other_extensions" });
+    await drain(env);
+
+    const afterE = env.sessionStore.lastState || {};
+    t("R8-03-E 同目标（含协议）被外部接管后状态仍为 overridden",
+      afterE.status === "overridden", "lastState=" + JSON.stringify(afterE));
+    t("R8-03-E 接管后 levelOfControl 仍如实记录",
+      afterE.levelOfControl === "controlled_by_other_extensions",
+      "levelOfControl=" + JSON.stringify(afterE.levelOfControl));
+    t("R8-03-E 接管后末次图标仍为红色",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-red-16.png",
+      "icon 序列=" + JSON.stringify(env.iconCalls));
+    t("R8-03-E 接管纠正全程零写回（D-2 只读约束不变）",
+      env.setCalls.length - setBeforeE === 0 && env.clearCalls.length - clearBeforeE === 0,
+      "新增 set=" + (env.setCalls.length - setBeforeE) + "；新增 clear=" + (env.clearCalls.length - clearBeforeE));
+  }
   console.log("== R5-01：入口与窗口使用同一个控制权谓词 ==");
   {
     const env = buildEnv({ fetchDelay: 20 });

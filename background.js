@@ -322,10 +322,14 @@ async function applyProxyCore() {
 
   try {
     // R6-04：记录本次下发意图，供 onChange 回声抑制按值比对。
+    // 【R8-03】必须连【协议】一起记：同 host/port、只把 scheme 换成别的外部写入
+    //   （socks5 → https）在只比 host/port 时会被判成我方回声，整次变化被吞掉，
+    //   界面继续宣称已生效，而真实生效的协议早已不是我方下发的那个。
     lastIntent = {
       mode: "fixed_servers",
       host: config.rules.singleProxy.host,
-      port: String(config.rules.singleProxy.port)
+      port: String(config.rules.singleProxy.port),
+      scheme: config.rules.singleProxy.scheme
     };
     await setProxy(config);
   } catch (err) {
@@ -786,6 +790,9 @@ chrome.runtime.onStartup.addListener(function () { applyProxySerial(); });
 //   回声吞掉 —— 界面继续宣称「我方控制 + 已生效」且图标留绿，而真实控制权已是
 //   controlled_by_other_extensions，我方后续下发早已不可行，排障方向也被误导。
 //   该已知代价现已由控制权维度消除（是消除，不是降级为「影响可忽略」）。
+//   【R8-03】值比对此前漏了协议：同 host/port、只把 scheme 换成别的外部写入会被当成
+//   我方回声整次吞掉，界面继续宣称已生效。值比对现为 mode/host/port/scheme 四项，
+//   与 isOwnLastIntent 的判据、以及状态推导里的 sameTarget 判据保持一致。
 chrome.proxy.settings.onChange.addListener(function (details) {
   readProxyDetails().then(function (d) {
     // 回读失败：状态未知，如实写 error（不猜、不写回）。
@@ -832,8 +839,12 @@ chrome.proxy.settings.onChange.addListener(function (details) {
     readSettings().then(function (st) {
       var isFixed = actualMode === "fixed_servers";
       var mineIsFixed = !!st.enableProxy;
+      // 【R8-03】同目标必须连协议一起比对：只比 host/port 时，「同 host/port、换协议」
+      //   的外部配置会被当成我方目标而写出 applied —— 界面宣称已生效，链路却早已不是那条。
+      //   协议不同 → 落入下面的 error 档，如实说明生效配置不是本扩展下发的。
       var sameTarget = !!sp && sp.host === S.stripBrackets(st.proxyHost) &&
-                       String(sp.port) === String(st.proxyPort);
+                       String(sp.port) === String(st.proxyPort) &&
+                       sp.scheme === st.proxyType;
 
       if (mineIsFixed && isFixed && sameTarget) {
         writeState({ status: "applied", levelOfControl: level, at: Date.now() });
@@ -870,15 +881,20 @@ chrome.proxy.settings.onChange.addListener(function (details) {
 });
 
 // 判断「实际生效配置」是否就是我方最近一次下发的意图（R6-04 回声抑制）。
-//   只比 mode / host / port —— 这三项才是「生效的是不是我要的东西」的判据；
+//   比对 mode / host / port / scheme 四项，缺一不可 —— 它们共同构成「生效的是不是
+//   我要的东西」的判据：host/port 决定流量去哪儿，scheme 决定用什么协议送过去；
+//   同 host/port 而换了协议（socks5 → https）走的完全是另一条链路（R8-03）。
 //   bypassList 不参与比对：它不影响控制权归属，也不作为状态结论的依据。
 //   端口两侧统一转成字符串，避免 number/string 造成的假差异。
+//   【早退分支语义不变】mode !== "fixed_servers" 的意图（直连没有协议可言）
+//   在 mode 比对通过后即成立，绝不给它强加 scheme 字段。
 function isOwnLastIntent(actualMode, sp) {
   if (!lastIntent) return false;
   if (actualMode !== lastIntent.mode) return false;
   if (lastIntent.mode !== "fixed_servers") return true;
   if (!sp) return false;
-  return sp.host === lastIntent.host && String(sp.port) === String(lastIntent.port);
+  return sp.host === lastIntent.host && String(sp.port) === String(lastIntent.port) &&
+         sp.scheme === lastIntent.scheme;
 }
 
 // 代理运行时错误：fatal=false 恰好表示"已静默回退直连"，必须让用户看见
