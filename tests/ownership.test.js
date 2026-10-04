@@ -603,6 +603,127 @@ function t(name, cond, extra) {
   }
 
   console.log("");
+  console.log("== R7-05：回声抑制必须先过控制权检查（同目标外部接管不得被吞）==");
+  {
+    // 缺陷事实（R7-05）：回声抑制原先只看「实际生效配置是否等于我方 lastIntent」，
+    //   完全不看控制权。外部扩展以【相同】mode/host/port 接管时值比对成立，
+    //   回调直接 return —— session 仍写着「我方控制 + 已生效」、图标仍是绿色，
+    //   而浏览器真实控制权已是 controlled_by_other_extensions。
+    //   路由目标相同 ≠ 控制权相同：后者决定我方后续能否下发（isControllableByUs
+    //   白名单），也决定用户排障方向（该查企业策略/其它扩展，还是查自己的代理）。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    const before = env.sessionStore.lastState || {};
+    t("R7-05-A 前置：接管前为我方 applied",
+      before.status === "applied", "lastState=" + JSON.stringify(before));
+
+    // 外部扩展以【完全相同】的目标接管：host/port 与我方 lastIntent 一字不差。
+    env.externalSet("controlled_by_other_extensions", "127.0.0.1", "10808");
+    const setBefore = env.setCalls.length, clearBefore = env.clearCalls.length;
+    env.fireProxyChange({ levelOfControl: "controlled_by_other_extensions" });
+    await drain(env);
+
+    const after = env.sessionStore.lastState || {};
+    t("R7-05-A 同目标被外部接管后，session 状态必须转为 overridden（不得被当成我方回声吞掉）",
+      after.status === "overridden", "lastState=" + JSON.stringify(after));
+    t("R7-05-A 同目标被外部接管后，状态里的控制权必须如实记录为 controlled_by_other_extensions",
+      after.levelOfControl === "controlled_by_other_extensions",
+      "levelOfControl=" + JSON.stringify(after.levelOfControl));
+    t("R7-05-A 同目标被外部接管后，最后一个图标必须是红色（绝不留下绿色）",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-red-16.png",
+      "icon 序列=" + JSON.stringify(env.iconCalls));
+
+    // R7-05-B：状态纠正【不得】以夺权为代价 —— D-2 只读硬约束必须保持。
+    const setDelta = env.setCalls.length - setBefore;
+    const clearDelta = env.clearCalls.length - clearBefore;
+    t("R7-05-B 同目标接管后回调必须完成状态纠正，且全程零写回（不夺权）",
+      after.status === "overridden" && setDelta === 0 && clearDelta === 0,
+      "status=" + after.status + "；setDelta=" + setDelta + "；clearDelta=" + clearDelta);
+    t("R7-05-B 回调期间不得调用 setProxy（新增 set 必须为 0）",
+      setDelta === 0, "新增 set=" + JSON.stringify(env.setCalls.slice(setBefore)));
+    t("R7-05-B 回调期间不得调用 clearProxyScope（新增 clear 必须为 0）",
+      clearDelta === 0, "新增 clear=" + JSON.stringify(env.clearCalls.slice(clearBefore)));
+  }
+  {
+    // R7-05-C（防回归·关键）：我方 set 成功触发的 onChange 回声必须【仍被抑制】。
+    //   修复把 isControllableByUs 前置后，这条路径要求控制权在白名单内 ——
+    //   真实 Chromium 对我方 set 派发的回声就是 controlled_by_this_extension，
+    //   因此抑制依然成立：不得多写一次状态、不得刷新图标。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "10101" }));
+    await drain(env);
+    const stBefore = JSON.stringify(env.sessionStore.lastState || {});
+    t("R7-05-C 前置：我方下发成功后状态为 applied",
+      (env.sessionStore.lastState || {}).status === "applied", "lastState=" + stBefore);
+    const writesBefore = env.stateWrites.length, iconsBefore = env.iconCalls.length;
+
+    // Chrome 为我方这次 set 派发的回声：实际生效配置与 lastIntent 完全一致。
+    env.fireProxyChange({ levelOfControl: "controlled_by_this_extension" });
+    await drain(env);
+
+    t("R7-05-C 我方 set 回声不得被当成外部变化（状态一字不变）",
+      JSON.stringify(env.sessionStore.lastState || {}) === stBefore,
+      "改动后=" + JSON.stringify(env.sessionStore.lastState) + " / 原值=" + stBefore);
+    t("R7-05-C 我方 set 回声不得产生额外的状态写入",
+      env.stateWrites.length === writesBefore,
+      "新增写入=" + JSON.stringify(env.stateWrites.slice(writesBefore)));
+    t("R7-05-C 我方 set 回声不得刷新图标（图标不抖动）",
+      env.iconCalls.length === iconsBefore,
+      "新增图标=" + JSON.stringify(env.iconCalls.slice(iconsBefore)));
+  }
+  {
+    // R7-05-D（防回归·关键）：我方 clear 成功触发的 onChange 回声同样必须被抑制。
+    //   真实语义：清除之后控制权回到「当前无人控制」，即 controllable_by_this_extension
+    //   —— 它仍在 isControllableByUs 白名单内，所以值比对（lastIntent.mode === "direct"）
+    //   依然能把这次变化认作我方回声。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    await setSync(env, Object.assign({}, BASE, { enableProxy: false }));
+    await drain(env);
+    t("R7-05-D 前置：我方清除成功后状态为 direct",
+      (env.sessionStore.lastState || {}).status === "direct",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState));
+
+    // 真实 Chromium 语义：clear 之后 level 回到 controllable_by_this_extension。
+    env.externalSet("controllable_by_this_extension", null, null);
+    const stBeforeD = JSON.stringify(env.sessionStore.lastState || {});
+    const writesBeforeD = env.stateWrites.length, iconsBeforeD = env.iconCalls.length;
+
+    env.fireProxyChange({ levelOfControl: "controllable_by_this_extension" });
+    await drain(env);
+
+    t("R7-05-D 我方 clear 回声不得被当成外部变化（状态一字不变）",
+      JSON.stringify(env.sessionStore.lastState || {}) === stBeforeD,
+      "改动后=" + JSON.stringify(env.sessionStore.lastState) + " / 原值=" + stBeforeD);
+    t("R7-05-D 我方 clear 回声不得产生额外的状态写入",
+      env.stateWrites.length === writesBeforeD,
+      "新增写入=" + JSON.stringify(env.stateWrites.slice(writesBeforeD)));
+    t("R7-05-D 我方 clear 回声不得刷新图标（图标不抖动）",
+      env.iconCalls.length === iconsBeforeD,
+      "新增图标=" + JSON.stringify(env.iconCalls.slice(iconsBeforeD)));
+  }
+  {
+    // R7-05-E（防回归）：外部以【不同】目标接管时，行为与修复前完全一致。
+    //   值比对本来就不成立，修复只是把控制权检查提前，不改变这条路径。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    env.externalSet("controlled_by_other_extensions", "external", "9090");
+    env.fireProxyChange({ levelOfControl: "controlled_by_other_extensions" });
+    await drain(env);
+
+    const st = env.sessionStore.lastState || {};
+    t("R7-05-E 不同目标被外部接管后状态仍为 overridden",
+      st.status === "overridden", "lastState=" + JSON.stringify(st));
+    t("R7-05-E 不同目标被外部接管后 levelOfControl 如实记录",
+      st.levelOfControl === "controlled_by_other_extensions",
+      "levelOfControl=" + JSON.stringify(st.levelOfControl));
+    t("R7-05-E 不同目标被外部接管后末次图标仍为红色",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-red-16.png",
+      "icon 序列=" + JSON.stringify(env.iconCalls));
+  }
+
+  console.log("");
   console.log("== R5-01：入口与窗口使用同一个控制权谓词 ==");
   {
     const env = buildEnv({ fetchDelay: 20 });

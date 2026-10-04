@@ -198,8 +198,9 @@ var suspendDirty = false;
 // 【R6-04】我方最近一次成功下发的意图，用于识别 chrome.proxy.settings.onChange 的
 //   自触发回声（本扩展自己 set/clear 也会触发该事件）。用【值比对】而不是时间窗：
 //   时间窗会把「我方写完之后立刻被外部接管」这一段真实变化静默吞掉，值比对没有这个盲区。
-//   登记在册的代价：外部恰好下发与我方完全相同的 mode/host/port 时会被误判为回声，
-//   但那种情况下状态本来等价，影响可忽略。
+//   【R7-05】但值比对【不足以】独立判定回声：外部扩展以完全相同的 mode/host/port 接管时
+//   值比对同样成立，控制权却已经不在我方手里。因此回声判定必须【同时】要求控制权仍在
+//   白名单内（见 onChange 回调）。原「同值接管会被误判为回声」的已知代价已由控制权维度消除。
 var lastIntent = null;
 
 async function applyProxy() {
@@ -777,10 +778,14 @@ chrome.runtime.onStartup.addListener(function () { applyProxySerial(); });
 //     （那套策略的全部意义就是「确证可写才写」）。
 //   本回调只做三件事：readProxyDetails 回读 → 推导状态 → writeState + updateIcon。
 //
-// 【自触发抑制】本扩展自己每次 set/clear 也会触发该事件。这里用【值比对】而不是时间窗：
-//   与 lastIntent 完全一致的变更判定为我方回声，直接忽略；只要值不同（外部接管）立刻生效。
+// 【自触发抑制】本扩展自己每次 set/clear 也会触发该事件。这里用【值比对 + 控制权】而不是时间窗：
+//   只有「实际生效配置与 lastIntent 完全一致」【且】「控制权仍可由我方掌握」才判定为我方回声，
+//   直接忽略；值不同（外部接管）或控制权已旁落，都立刻如实生效。
 //   时间窗方案会把「我方写完 300ms 内被外部接管」这一段真实变化静默吞掉，本方案没有这个盲区。
-//   代价（登记在册）：外部恰好下发与我方完全相同的 mode/host/port 时会被误判为回声。
+//   【R7-05】只看值不看控制权是此前的缺陷：外部以【相同】mode/host/port 接管时，事件被当成
+//   回声吞掉 —— 界面继续宣称「我方控制 + 已生效」且图标留绿，而真实控制权已是
+//   controlled_by_other_extensions，我方后续下发早已不可行，排障方向也被误导。
+//   该已知代价现已由控制权维度消除（是消除，不是降级为「影响可忽略」）。
 chrome.proxy.settings.onChange.addListener(function (details) {
   readProxyDetails().then(function (d) {
     // 回读失败：状态未知，如实写 error（不猜、不写回）。
@@ -796,9 +801,16 @@ chrome.proxy.settings.onChange.addListener(function (details) {
     var actualMode = d.value && d.value.mode;
     var sp = (d.value && d.value.rules && d.value.rules.singleProxy) || null;
 
-    // 自触发回声：实际生效配置与我方最近一次意图一致 → 这次变化是我方自己造成的，
-    //   状态由下发路径自己写，这里不重复回查、不重复刷新图标。
-    if (isOwnLastIntent(actualMode, sp)) return;
+    // 自触发回声：必须【同时】满足两点，才认定这次变化是我方自己造成的 ——
+    //   ① 实际生效配置与我方最近一次意图一致（isOwnLastIntent：只负责「值是否等于我方意图」）；
+    //   ② 控制权仍可由我方掌握（isControllableByUs 白名单）。
+    //   缺了②就会把「外部以相同 mode/host/port 接管」误判为回声：值一样，控制权却已旁落，
+    //   界面会一直宣称我方已生效（绿色），而后台下发早已不可行（R7-05）。
+    //   两条合法回声路径都落在白名单内，因此抑制语义不变：
+    //     · set 成功的回声 → controlled_by_this_extension；
+    //     · clear 成功的回声 → controllable_by_this_extension，且 lastIntent.mode === "direct"。
+    //   认定回声后：状态由下发路径自己写，这里不重复回查、不重复刷新图标。
+    if (isControllableByUs(level) && isOwnLastIntent(actualMode, sp)) return;
 
     if (!isControllableByUs(level)) {
       // 已被外部接管（企业策略或其它扩展）：如实记录，不夺权、不写回。
