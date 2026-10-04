@@ -36,6 +36,11 @@ function buildEnv(opts) {
   let effectiveScheme = "socks5";
   const fetchDelay = opts.fetchDelay === undefined ? 80 : opts.fetchDelay;
   const slowPort = opts.slowPort || 0, slowMs = opts.slowMs || 0;
+  // 【R9-03】可保持的 set：命中 holdPort 的下发在测试显式放行前【不完成】。
+  //   这样"在途下发"变成一个受控状态，而不是靠 slowMs 与另一个挂钟定时器赛跑。
+  const holdPort = opts.holdPort || 0;
+  let holdReleased = false;
+  const heldSets = [];
   let directPhaseSeen = false, restoreSetSeen = false;
   let onRestoreSet = null, onClearDuringDirect = null;
   let getHook = null, getCount = 0;
@@ -138,13 +143,19 @@ function buildEnv(opts) {
           setCalls.push(label);
           if (directPhaseSeen && !restoreSetSeen) { restoreSetSeen = true; if (onRestoreSet) setTimeout(() => onRestoreSet(sandbox), 0); }
           const delay = (Number(sp.port) === slowPort) ? slowMs : 0;
-          setTimeout(() => {
+          const land = () => {
             // 关键保真：mode:"direct" 的 set 不会挂上代理（Chromium 语义）
             if (o.value && o.value.mode === "direct") effectiveScheme = "socks5";
             applyEffective((o.value && o.value.mode === "direct") ? null : label);
             sandbox.chrome.runtime.lastError = undefined;
             if (cb) cb();
-          }, delay);
+          };
+          // 【R9-03】命中 holdPort 且在放行之前：不下发、不回调，保持"在途"。
+          if (holdPort && Number(sp.port) === holdPort && !holdReleased) {
+            heldSets.push(land);
+            return;
+          }
+          setTimeout(land, delay);
         },
         clear(o, cb) {
           if (clearHook) return clearHook(o, cb, sandbox);
@@ -193,6 +204,8 @@ function buildEnv(opts) {
     setClearHook: fn => { clearHook = fn; },
     // R6-04：驱动 chrome.proxy.settings.onChange 的真实回调（外部接管 / 释放）。
     fireProxyChange: details => { for (const fn of listeners.onChange.slice()) fn(details); },
+    // 【R9-03】显式放行被挂起的下发（放行后 holdPort 不再拦截，窗口收尾的写回照常落地）。
+    releaseHeldSets: () => { holdReleased = true; for (const f of heldSets.splice(0)) setTimeout(f, 0); },
     // 模拟外部接管或释放：只改控制等级与实际生效配置，不经过我方任何写路径。
     // R8-03：外部写入方「同 host/port、换协议」的模拟入口（见 externalSetEffective）。
     externalSetEffective,
@@ -300,14 +313,32 @@ function t(name, cond, extra) {
   console.log("");
   console.log("== R3-01-R3：下发【在途】时启动对比 → 直连取样不得被污染，且不得回退旧值 ==");
   {
-    const env = buildEnv({ fetchDelay: 500, slowPort: 9000, slowMs: 850 });
+    // 【R9-03】确定性构造：不再用 slowMs=850 与 fetchDelay=500 两个独立挂钟定时器赛跑，
+    //   而是用"可保持的 set"把 9000 的下发【挂起在途】，由测试显式放行。断言对象也从
+    //   "谁先谁后"改成【顺序不变量】：在途下发未收尾之前，对比窗口不得执行 clear:regular。
+    //   排他队列若被移除（M10），窗口会立刻清除并把直连取样污染成"代理仍生效"——
+    //   该断言必然变红，且与 CPU 负载、挂钟精度、CI 平台无关。
+    const env = buildEnv({ fetchDelay: 60, holdPort: 9000 });
     await ready(env, "10808");
     env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "9000" }), () => {});
-    // 等 9000 的 set 真正发起（仍在途，200ms 未完成）后立刻启动对比
+    // 等 9000 的下发真正发起并被挂起（注意：不是等它完成）
     const t0 = Date.now();
     while (env.setCalls.indexOf("127.0.0.1:9000") < 0 && Date.now() - t0 < 1500) await sleep(2);
-    const resp = await ask(env, { action: "testConnection", compare: true });
-    await sleep(800); env.closeWindow();
+    t("R3-01-R3 前置事实：9000 的下发已发起且仍在途（未被放行）",
+      env.setCalls.indexOf("127.0.0.1:9000") >= 0 && env.getEffective() !== "127.0.0.1:9000",
+      "set 序列 = " + JSON.stringify(env.setCalls) + "；实际 = " + env.getEffective());
+
+    const clearsBefore = env.clearCalls.length;
+    const respP = ask(env, { action: "testConnection", compare: true });
+    // 给窗口充足时间：若它没有排在在途下发之后，会立刻执行 clear:regular
+    await sleep(400);
+    t("R3-01-R3 核心（确定性）：在途下发未收尾之前，对比窗口不得清除代理（顺序不变量）",
+      env.clearCalls.slice(clearsBefore).indexOf("regular") < 0,
+      "新增清除 = " + JSON.stringify(env.clearCalls.slice(clearsBefore)) + "；set 序列 = " + JSON.stringify(env.setCalls));
+
+    env.releaseHeldSets();            // 放行在途下发；窗口此后才可能进入直连
+    const resp = await respP;
+    await sleep(700); env.closeWindow();
 
     t("取直连出口时代理确实处于清除状态（未被在途下发污染）",
       env.fetchLog.length >= 2 ? env.fetchLog[1].proxyActive === false : false,
