@@ -30,6 +30,12 @@ function buildEnv(opts) {
   const iconCalls = [];         // setIcon 收到的图标路径
   const titleCalls = [];        // setTitle 收到的标题
   const fetchDelay = opts.fetchDelay || 120;
+  // 【V-05 冗余护栏】可保持的 set：命中 holdPort 的下发在测试显式放行前【不完成】。
+  //   这样"在途下发"是一个受控状态，而不是靠两个挂钟定时器赛跑（与 ownership 同手法）。
+  const holdPort = opts.holdPort || 0;
+  let holdReleased = false;
+  const heldSets = [];
+  const fetchLog = [];          // 每次 fetch 时刻的 proxyActive
 
   function makeArea(store, areaName) {
     return {
@@ -67,6 +73,7 @@ function buildEnv(opts) {
     return new Promise(function (resolve) {
       setTimeout(function () {
         const ip = proxyActive ? "203.0.113.9" : "192.0.2.1";
+        fetchLog.push({ proxyActive: proxyActive });
         resolve({ ok: true, json: function () { return Promise.resolve({ ip: ip }); } });
       }, fetchDelay);
     });
@@ -83,6 +90,10 @@ sandbox.chrome = {
         set: function (o, cb) {
           const sp = (o.value.rules || {}).singleProxy || {};
           setCalls.push(sp.host + ":" + sp.port);
+          if (holdPort && Number(sp.port) === holdPort && !holdReleased) {
+            heldSets.push(cb);
+            return;                   // 不下发、不回调 —— 保持"在途"
+          }
           setTimeout(function () {
             proxyActive = true;
             effective = sp.host + ":" + sp.port;
@@ -121,7 +132,11 @@ sandbox.chrome = {
           } else {
             value = { mode: "direct" };
           }
-          setTimeout(function () { cb({ value: value, levelOfControl: "controlled_by_this_extension" }); }, 0);
+          // 【V-03】levelOfControl 可在运行中切换：测试先把 opts.overridden 置真，
+          //   再写配置，即可模拟"暂停期间被外部接管"——M9 的后果（待下发标记丢失）
+          //   正是在这条路径上以 pendingResubmit 的形态暴露。
+          var level = opts.overridden ? "controlled_by_other_extensions" : "controlled_by_this_extension";
+          setTimeout(function () { cb({ value: value, levelOfControl: level }); }, 0);
         },
         // R6-04：background.js 会注册 chrome.proxy.settings.onChange；
         //   缺少该桩会让脚本一加载就抛 TypeError，整套用例连锁失败。
@@ -139,6 +154,12 @@ sandbox.chrome = {
   vm.runInContext(bgSrc, sandbox);
   return { sandbox: sandbox, syncStore: syncStore, sessionStore: sessionStore,
            setCalls: setCalls, listeners: listeners, iconCalls: iconCalls, titleCalls: titleCalls,
+           fetchLog: fetchLog,
+           // 【V-05 冗余护栏】显式放行被挂起的下发（放行后 holdPort 不再拦截）。
+           releaseHeldSets: function () {
+             holdReleased = true;
+             for (const f of heldSets.splice(0)) setTimeout(f, 0);
+           },
            getEffective: function () { return effective; } };
 }
 
@@ -473,6 +494,135 @@ function ask(handler, msg) {
     t("恢复失败时判定为 error 档（不是 ok）", html6.indexOf("verdict error") >= 0, html6);
   }
 
+  console.log("");
+  console.log("== V-03：暂停期间保存的配置必须在窗口结束后真正下发（含 M9/M11 两种回归形态）==");
+  {
+    // 【V-03 归属澄清 —— 请先读这段，不要凭小节标题猜】
+    //   本段的两条断言各自守住不同的回归形态，实测结论如下（本机施加变异后逐条验证）：
+    //     · V-03-A2 在 M11（窗口收尾不再提交最新配置）下【变红】；
+    //     · V-03-A2 在 M9（暂停期间的存储变化不再记脏）下【保持绿】——
+    //       因为收尾提交用"最新存储值"而不是靠脏标记，M9 的后果在 ownership 侧
+    //       以「待下发标记丢失」的形态暴露（pendingResubmit=false），不在这里。
+    //   因此本段【不声称】自己是 M9 的守门者；M9 的守门者仍是 ownership 侧。
+    //   本段的价值是：让"暂停期间的配置变化是否真的落地"这条语义在本文件里也有护栏
+    //   （M11 之前只被 ownership 抓到）。
+    // 断言对象：【下发给 chrome.proxy 的真实生效配置】与存储值，不看内部变量。
+    const envV3 = buildEnv({ fetchDelay: 150 });
+    await sleep(60);
+    envV3.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
+    await sleep(250);
+    envV3.setCalls.length = 0;
+
+    const handlerV3 = envV3.listeners.message[0];
+    // 在第 2 次 fetch（取「直连出口」）进行中保存新端口 —— 这正是"暂停期间变化"的窗口
+    let nV3 = 0;
+    const origFetchV3 = envV3.sandbox.fetch;
+    envV3.sandbox.fetch = function () {
+      nV3++;
+      if (nV3 === 2) {
+        setTimeout(function () {
+          envV3.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10809" }), function () {});
+        }, 0);
+      }
+      return origFetchV3.apply(this, arguments);
+    };
+
+    await ask(handlerV3, { action: "testConnection", compare: true });
+    await sleep(500);
+
+    t("V-03-A 前置事实：暂停期间保存的新端口确实写进了存储",
+      envV3.syncStore.proxyPort === "10809", String(envV3.syncStore.proxyPort));
+    t("V-03-A2 核心：暂停期间的配置变化在窗口结束后被真正下发（M11 回归的守门者）",
+      envV3.getEffective() === "127.0.0.1:10809" && envV3.setCalls.indexOf("127.0.0.1:10809") >= 0,
+      "实际生效 = " + envV3.getEffective() + "；set 序列 = " + JSON.stringify(envV3.setCalls));
+  }
+
+  console.log("");
+  console.log("== V-05：在途下发未收尾之前，对比窗口不得清除代理（冗余守门者）==");
+  {
+    // 【V-05】这条不变量当前唯一的守门者是 ownership.test.js 的
+    //   「R3-01-R3 核心（确定性）」—— 删掉它 M10 就完全漏检（第九轮 03 §5 Step 3 已证）。
+    //   这里放一条【同语义】的冗余断言：不替代那一条，只保证"未来有人无意改写其中
+    //   一条时，另一条仍会变红"。
+    // 语义：在途下发未收尾之前，代理不得被清成直连（顺序不变量）。
+    const envV5 = buildEnv({ fetchDelay: 60, holdPort: 9000 });
+    await sleep(60);
+    envV5.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
+    await sleep(300);
+    envV5.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "9000" }), function () {});
+
+    // 等 9000 的下发真正【发起】并被挂起（不是等它完成）
+    const t0V5 = Date.now();
+    while (envV5.setCalls.indexOf("127.0.0.1:9000") < 0 && Date.now() - t0V5 < 1500) await sleep(2);
+    t("V-05-A 前置事实：9000 的下发已发起且仍在途（未被放行）",
+      envV5.setCalls.indexOf("127.0.0.1:9000") >= 0 && envV5.getEffective() !== "127.0.0.1:9000",
+      "set 序列 = " + JSON.stringify(envV5.setCalls) + "；实际 = " + envV5.getEffective());
+
+    const respP = ask(envV5.listeners.message[0], { action: "testConnection", compare: true });
+    await sleep(400);
+    t("V-05-B 核心（冗余护栏）：在途下发未收尾之前，对比窗口不得把代理清成直连",
+      envV5.getEffective() !== null,
+      "实际生效 = " + envV5.getEffective() + "；set 序列 = " + JSON.stringify(envV5.setCalls));
+
+    envV5.releaseHeldSets();              // 放行在途下发；窗口此后才可能进入直连
+    await respP;
+    await sleep(700);
+    t("V-05-C 放行后窗口正常收尾，最终生效的是最新端口 9000（未回退、未被丢弃）",
+      envV5.getEffective() === "127.0.0.1:9000",
+      "实际生效 = " + envV5.getEffective() + "；set 序列 = " + JSON.stringify(envV5.setCalls));
+  }
+
+
+  console.log("");
+  console.log("== V-03b：暂停期间被外部接管时，配置变化必须在窗口结束后补发（M9 语义）==");
+  {
+    // 【V-03 归属澄清的第二半 —— 这条是真正针对 M9 的构造】
+    //   M9 = 删掉 `if (suspendDepth > 0) suspendDirty = true;`。
+    //   它的后果只有在【窗口收尾时我方仍写不进去】的现场才可观测：
+    //   若收尾提交能成功，最新配置照样落地（M9 看不出差别）；
+    //   一旦收尾期间被外部接管，收尾提交会被拒，此时唯一的补救就是
+    //   「窗口期间记下的脏标记 + 兜底重放」——脏标记没记上，变更就被永久丢弃。
+    //   接管必须在【窗口已经进入之后】才发生（否则前置检查直接拒发，窗口不会开）。
+    const envV3b = buildEnv({ fetchDelay: 120 });
+    await sleep(60);
+    envV3b.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
+    await sleep(250);
+    envV3b.setCalls.length = 0;
+    envV3b.sessionStore.lastState = undefined;
+
+    const handlerV3b = envV3b.listeners.message[0];
+    let nV3b = 0;
+    const origFetchV3b = envV3b.sandbox.fetch;
+    envV3b.sandbox.fetch = function () {
+      nV3b++;
+      if (nV3b === 2) {
+        // 窗口已进入：此刻把控制权交给"外部扩展"，并在窗口内保存新端口
+        const origGet = envV3b.sandbox.chrome.proxy.settings.get;
+        envV3b.sandbox.chrome.proxy.settings.get = function (o, cb) {
+          setTimeout(function () {
+            cb({
+              value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
+              levelOfControl: "controlled_by_other_extensions"
+            });
+          }, 0);
+        };
+        setTimeout(function () {
+          envV3b.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10809" }), function () {});
+        }, 0);
+      }
+      return origFetchV3b.apply(this, arguments);
+    };
+
+    await ask(handlerV3b, { action: "testConnection", compare: true });
+    await sleep(600);
+
+    const stV3b = envV3b.sessionStore.lastState || {};
+    t("V-03b-A 前置事实：窗口期间保存的新端口确实写进了存储",
+      envV3b.syncStore.proxyPort === "10809", String(envV3b.syncStore.proxyPort));
+    t("V-03b-B 核心（M9 语义）：窗口期间被接管时，必须留下「有配置待下发」的标记",
+      stV3b.pendingResubmit === true,
+      "lastState = " + JSON.stringify(stV3b));
+  }
   console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);

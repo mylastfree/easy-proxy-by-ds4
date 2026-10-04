@@ -332,6 +332,14 @@ function t(name, cond, extra) {
     const respP = ask(env, { action: "testConnection", compare: true });
     // 给窗口充足时间：若它没有排在在途下发之后，会立刻执行 clear:regular
     await sleep(400);
+    // 【V-05 / V-03 归属澄清】这条断言是 M10（去掉排他入队）的【唯一】守门者 ——
+    //   删掉它之后 M10 完全漏检（第九轮 03 §5 Step 3 已证）。
+    //   同语义的【冗余】护栏已在 tests/concurrency.test.js 的「V-05」段
+    //   （该段在 M10 下实测变红，见其 V-05-B）。
+    //   本文件与 concurrency 的分工是：
+    //     · 这里 = 主守门者（含 holdPort 确定性构造）；修订前请先读 concurrency 那一段。
+    //   【另】M9 的守门者不在本行，而在 concurrency 的「V-03b」段与本文件多处的
+    //   pendingResubmit 断言；M11 的守门者在 concurrency 的「V-03-A2」。
     t("R3-01-R3 核心（确定性）：在途下发未收尾之前，对比窗口不得清除代理（顺序不变量）",
       env.clearCalls.slice(clearsBefore).indexOf("regular") < 0,
       "新增清除 = " + JSON.stringify(env.clearCalls.slice(clearsBefore)) + "；set 序列 = " + JSON.stringify(env.setCalls));
