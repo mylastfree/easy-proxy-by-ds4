@@ -224,23 +224,40 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
+// 【R7-08】测试请求失败的统一出口。
+//   消息通道自身出错时（send 同步抛错，或抛错使 send 返回 rejected Promise），
+//   必须与「后台返回 {ok:false}」走同一档失败文案，如实带出原因，不得静默吞掉。
+function renderTestError(err) {
+  var reason = (err && err.message) ? err.message : err;
+  if (!reason) reason = "消息通道异常";
+  el.testResult.innerHTML =
+    '<span style="color:#a3251b">测试失败：' + escapeHtml(reason) + "</span>";
+}
+
 async function runTest(compare) {
   el.testButton.disabled = true;
   el.testDirectButton.disabled = true;
   el.testResult.innerHTML =
     '<span style="color:#5a6772">测试中…' + (compare ? "（对比期间会短暂切换为直连，随后自动恢复）" : "") + "</span>";
 
-  var resp = await send({ action: "testConnection", compare: compare });
+  try {
+    var resp = await send({ action: "testConnection", compare: compare });
 
-  el.testButton.disabled = false;
-  el.testDirectButton.disabled = false;
-
-  if (!resp || !resp.ok) {
-    el.testResult.innerHTML =
-      '<span style="color:#a3251b">测试失败：' + escapeHtml((resp && resp.error) || "无响应") + "</span>";
-    return;
+    if (!resp || !resp.ok) {
+      el.testResult.innerHTML =
+        '<span style="color:#a3251b">测试失败：' + escapeHtml((resp && resp.error) || "无响应") + "</span>";
+      return;
+    }
+    renderTest(resp.result);
+  } catch (err) {
+    // 【R7-08】此前 await 一旦抛出，下面那两行复位永不执行 ——
+    //   两个测试按钮永久禁用，用户只能关掉并重开 popup。
+    renderTestError(err);
+  } finally {
+    // 复位必须放在 finally：正常返回、{ok:false}、抛错三条路径都要回到可点状态
+    el.testButton.disabled = false;
+    el.testDirectButton.disabled = false;
   }
-  renderTest(resp.result);
 }
 
 /* ==================== 加载与保存 ==================== */
@@ -331,8 +348,11 @@ function resetDefaults() {
 renderTypeOptions();
 el.saveButton.addEventListener("click", save);
 el.resetButton.addEventListener("click", resetDefaults);
-el.testButton.addEventListener("click", function () { runTest(false); });
-el.testDirectButton.addEventListener("click", function () { runTest(true); });
+// 【R7-08】runTest 内部已有 try/catch/finally 兜底，正常情况下不会再拒绝；
+//   调用点再补一层 .catch 是契约：即便 runTest 的同步段（禁用按钮、写「测试中…」）
+//   将来抛出，也不会留下 Uncaught (in promise)，失败原因照样显示在结果区。
+el.testButton.addEventListener("click", function () { runTest(false).catch(renderTestError); });
+el.testDirectButton.addEventListener("click", function () { runTest(true).catch(renderTestError); });
 
 // 任一入口（含其它窗口 / 同步设备）改动存储，都刷新当前界面
 chrome.storage.onChanged.addListener(function (changes, areaName) {
