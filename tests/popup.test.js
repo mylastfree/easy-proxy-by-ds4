@@ -1284,6 +1284,15 @@ function t(name, cond, extra) {
       localStore: {}
     });
     await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+    // 【W-03 确定性重写】此前这里直接断言"状态条显示直连兜底"，靠的是"抢在后台
+    //   把 lastState 写进 session 之前读界面"——那是一条【挂钟竞态】：后台先写完就
+    //   会读到 applied，断言随机变红。实测该竞态在 Linux/Node 20 上约 3/20~5/20 命中，
+    //   曾把 CI 的变异门禁基线判成失败（exit 3，"基线失败时变异结果无意义，立即中止"）。
+    //   现在改为【受控构造】：先等后台的状态写入确实落地，再显式把 session 清成
+    //   "后台还没写下任何状态"，然后让界面按 onChanged 重读——同一语义，不再依赖时序。
+    await waitUntil(() => env.sessionStore.lastState !== undefined);
+    env.setSessionState({ lastState: undefined });
+    await env.settle(60);
     const stEnv = env.popupCtx.el.statusBar;
     t("C-前置：全新安装、后台还没写下任何状态时，界面显示的是「直连」兜底",
       stEnv.textContent === "未启用代理（直连）",
