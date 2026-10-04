@@ -1,4 +1,4 @@
-// settings.js —— 设置模型的唯一来源  [v2.6.0]
+// settings.js —— 设置模型的唯一来源  [v2.7.0]
 // 刻意不依赖任何 chrome.* API，使 popup 与 Service Worker 可共用同一套逻辑。
 (function (root) {
   'use strict';

@@ -151,7 +151,7 @@ node tests\mutation-check.js   # 运行后会自动还原被变异文件
 
 ## 版本历史
 
-详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.6.0`。
+详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.7.0`。
 
 ## 安全
 

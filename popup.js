@@ -1,4 +1,4 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.6.0]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.7.0]
 var S = window.EasyProxy;
 
 var el = {
