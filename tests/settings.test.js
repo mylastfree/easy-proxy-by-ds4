@@ -111,6 +111,61 @@ t("估算值为正", S.estimateBytes({ bypassList: "abc" }) > 0);
 t("超 8192 可被识别", S.estimateBytes({ bypassList: "x".repeat(9000) }) > S.MAX_SYNC_BYTES_PER_ITEM);
 t("默认绕过列表未超配额", S.estimateBytes({ bypassList: S.DEFAULTS.bypassList }) < S.MAX_SYNC_BYTES_PER_ITEM);
 
+
+console.log("");
+console.log("== V-01：遮蔽现场「编辑后保存」的识别（纯函数）==");
+{
+  const DEF = S.DEFAULTS.bypassList;
+  const NL = "\n";
+
+  // 形态 1：逐字符等于默认列表 → 是污染现场（既有语义，不能退）
+  t("V-01-a 逐字符等于默认列表 → 判为污染现场",
+    S.isLegacyShadowPair(DEF, "my-own.internal") === true);
+
+  // 形态 2：默认列表 + 用户编辑 → 【同样】是污染现场（这正是 V-01 漏掉的那一格）
+  t("V-01-b 默认列表加一行编辑 → 仍判为污染现场（V-01 的核心）",
+    S.isLegacyShadowPair(DEF + NL + "edited-by-user.internal", "my-own.internal") === true);
+
+  // 形态 3：用户自己写的列表（与默认列表无包含关系）→ 不是污染现场
+  t("V-01-c 用户自写的列表 → 不得判为污染现场（否则会误伤）",
+    S.isLegacyShadowPair("only-my-rule.internal", "my-own.internal") === false);
+
+  // 形态 4：默认列表 + 用户追加的规则（常见真实用法）→ 判为污染现场
+  //   这是本判据的已知取舍：代价是一次确认（用户点第二次即继续），
+  //   收益是不再静默失效。
+  t("V-01-d 默认列表加用户追加的规则 → 判为污染现场（保守方向，代价是一次确认）",
+    S.isLegacyShadowPair(DEF + NL + "-my-extra.internal", "my-own.internal") === true);
+
+  // 形态 5：local 为空 → 不存在唯一副本，任何判据都不成立
+  t("V-01-e local 为空 → 一律不判为污染现场",
+    S.isLegacyShadowPair(DEF, "") === false && S.isLegacyShadowPair(DEF + NL + "x", "") === false);
+
+  // 形态 6：非字符串（读不到 / 类型异常）→ 一律不判为污染现场（宁可不确认，不可误判）
+  t("V-01-f 非字符串输入 → 一律不判为污染现场",
+    S.isLegacyShadowPair(undefined, "x") === false &&
+    S.isLegacyShadowPair(DEF, undefined) === false &&
+    S.isLegacyShadowPair(null, null) === false);
+
+  // 形态 7：反向 —— sync 为空串占位（正常降级形态）→ 不是污染现场
+  t("V-01-g sync 为空串占位（正常降级形态）→ 不判为污染现场",
+    S.isLegacyShadowPair("", "my-own.internal") === false);
+
+  // looksLikeShadowEdit：识别「这串文本 = 内置默认列表 + 用户的编辑」。
+  //   刻意【不】把「逐字符等于默认列表」算进来：那正是 R9-01 的主场景
+  //   （用户什么都没改就保存），既有守卫已能安全处理，不该再打断用户一次。
+  //   逐字符相等的情形由 isLegacyShadowPair 单独覆盖（见 V-01-a/V-01-g）。
+  t("V-01-h 逐字符等于默认列表 → looksLikeShadowEdit 为假（R9-01 主场景不被打断）",
+    S.looksLikeShadowEdit(DEF) === false);
+  t("V-01-i 默认列表 + 一行编辑 → looksLikeShadowEdit 为真（V-01 的核心）",
+    S.looksLikeShadowEdit(DEF + NL + "edited.internal") === true);
+  t("V-01-j 用户自写列表 → looksLikeShadowEdit 为假",
+    S.looksLikeShadowEdit("only-my-rule.internal") === false);
+
+  // 形态 8：默认列表在前但被删掉若干行（用户删了内网规则）→ 不是「前缀」形态
+  //   宁可漏过（退回既有行为），也不把"用户自己精简过的列表"误判成污染。
+  t("V-01-k 默认列表被删行后（不再是前缀）→ 不判为污染现场（宁漏勿误伤）",
+    S.looksLikeShadowEdit(DEF.split(NL).slice(1).join(NL)) === false);
+}
 console.log("");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail > 0 ? 1 : 0);

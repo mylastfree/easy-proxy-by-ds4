@@ -233,6 +233,45 @@
     }
   }
 
+  // 【V-01 / W-02】遮蔽现场（shadow 现场）的识别。
+  //
+  // 与 background.js 的 isLegacyShadowed 的关系：
+  //   · 那个是【后台自愈的判据】，必须保守 —— 它要执行写操作（把 sync 清成空串），
+  //     误判会真的改动用户数据，因此只认【逐字符相等】；
+  //   · 这里是【前台确认门的判据】，代价只是一次确认（用户再点一次即继续），
+  //     不写任何数据。因此可以放宽到「sync 里带着内置默认列表的整段痕迹」，
+  //     用来覆盖 V-01 那一格（用户在被遮蔽的表单上改字后保存）。
+  //   两个判据刻意【不同名、不同文件、语义各自写清】，避免未来被"统一"成一份
+  //   而把保守的那一侧悄悄放宽。
+  //
+  // 判据：把 sync 文本按行规整（去首尾空白、丢空行），若它【以默认列表的整行序列开头】
+  //   且默认列表之后【还有内容】（说明被追加/编辑过），则判为遮蔽现场。
+  //   逐字符相等的情形由 isLegacyShadowPair 单独处理，不在这里重复。
+  function looksLikeShadowEdit(syncListText) {
+    if (typeof syncListText !== 'string' || !syncListText) return false;
+    var normLines = function (t) {
+      return str(t).split('\n').map(function (l) { return l.trim(); })
+        .filter(function (l) { return l.length > 0; });
+    };
+    var syncLines = normLines(syncListText);
+    var defLines = normLines(DEFAULTS.bypassList);
+    if (!defLines.length || syncLines.length <= defLines.length) return false;
+    for (var i = 0; i < defLines.length; i++) {
+      if (syncLines[i] !== defLines[i]) return false;
+    }
+    return true;
+  }
+
+  // 遮蔽现场 = sync 是「内置默认列表原样或带编辑」且 local 里躺着一份不同的用户列表。
+  //   local 为空时不存在"唯一副本"，任何判据都不成立 —— 这是「不误伤」的底线。
+  function isLegacyShadowPair(syncRaw, localRaw) {
+    if (typeof localRaw !== 'string' || !localRaw) return false;
+    if (localRaw === DEFAULTS.bypassList) return false;
+    if (typeof syncRaw !== 'string' || !syncRaw) return false;
+    if (syncRaw === DEFAULTS.bypassList) return true;
+    return looksLikeShadowEdit(syncRaw);
+  }
+
   root.EasyProxy = {
     DEFAULTS: DEFAULTS,
     PROXY_TYPES: PROXY_TYPES,
@@ -244,6 +283,8 @@
     resolveBypassList: resolveBypassList,
     validateSettings: validateSettings,
     stripBrackets: stripBrackets,
-    estimateBytes: estimateBytes
+    estimateBytes: estimateBytes,
+    looksLikeShadowEdit: looksLikeShadowEdit,
+    isLegacyShadowPair: isLegacyShadowPair
   };
 })(typeof globalThis !== 'undefined' ? globalThis : self);

@@ -2089,6 +2089,74 @@ function t(name, cond, extra) {
     }
   }
 
+    // ---- V-04：首次安装（install 分支）不得覆盖云端已有的 sync 配置 ----
+    {
+      // 本段自取默认值：`DEFAULTS` 是 R7-03 段内的块级 const，这里取不到（会 ReferenceError）。
+      const sboxV4 = { TextEncoder: TextEncoder };
+      sboxV4.self = sboxV4; sboxV4.globalThis = sboxV4;
+      vm.createContext(sboxV4);
+      vm.runInContext(settingsSrc, sboxV4);
+      const DEFAULT_V4 = sboxV4.EasyProxy.DEFAULTS;
+
+      function fireInstall(env) {
+        for (const fn of env.listeners.installed.slice()) fn({ reason: "install" });
+      }
+
+      // 场景 1：云端 sync 已有用户配置（模拟"卸载后重装"，local 已空）→ 一个键都不能被覆盖
+      {
+        const envI = buildEnv({ fetchDelay: 20 });
+        await drain(envI);
+        await put(envI, "sync", {
+          enableProxy: true, proxyType: "https", proxyHost: "10.1.2.3", proxyPort: "3128",
+          bypassList: "keep-me.internal"
+        });
+        await drain(envI);
+        const before = JSON.stringify(envI.syncStore);
+        fireInstall(envI);
+        await drain(envI);
+        await sleep(80);
+        t("V-04-A 首次安装：sync 已有用户配置时一个键都不得被覆盖",
+          JSON.stringify(envI.syncStore) === before,
+          "before=" + before + "；after=" + JSON.stringify(envI.syncStore));
+        t("V-04-A2 首次安装：下发给 chrome.proxy 的仍是用户配置（不得被默认值顶掉）",
+          envI.getEffective() === "10.1.2.3:3128",
+          "实际生效 = " + envI.getEffective() + "；set 序列 = " + JSON.stringify(envI.setCalls));
+        envI.closeWindow();
+      }
+
+      // 场景 2（反向对照，防恒真）：真正的全新安装（sync 空）→ 仍必须补默认值
+      {
+        const envJ = buildEnv({ fetchDelay: 20 });
+        await drain(envJ);
+        fireInstall(envJ);
+        await drain(envJ);
+        await sleep(80);
+        t("V-04-B 反向对照：真正的全新安装（sync 全空）仍必须补上默认值（否则修复变成「什么都不做」）",
+          envJ.syncStore.bypassList === DEFAULT_V4.bypassList &&
+          envJ.syncStore.proxyHost === DEFAULT_V4.proxyHost &&
+          envJ.syncStore.proxyPort === DEFAULT_V4.proxyPort,
+          JSON.stringify(envJ.syncStore));
+        envJ.closeWindow();
+      }
+
+      // 场景 3（反向对照）：重装但 sync 里【只有部分键】（旧版本升级过的账户）→ 只补确实缺失的键
+      {
+        const envK = buildEnv({ fetchDelay: 20 });
+        await drain(envK);
+        await put(envK, "sync", { proxyHost: "192.168.9.9" });
+        await drain(envK);
+        fireInstall(envK);
+        await drain(envK);
+        await sleep(80);
+        t("V-04-C 部分键缺失时：已有的 proxyHost 不被覆盖、缺失的键被补上",
+          envK.syncStore.proxyHost === "192.168.9.9" &&
+          envK.syncStore.proxyPort === DEFAULT_V4.proxyPort &&
+          envK.syncStore.bypassList === DEFAULT_V4.bypassList,
+          JSON.stringify(envK.syncStore));
+        envK.closeWindow();
+      }
+    }
+
   console.log("");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);

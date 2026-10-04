@@ -915,6 +915,11 @@ function t(name, cond, extra) {
     envR9.syncSetCalls.length = 0; envR9.localSetCalls.length = 0;
     // 用户在被遮蔽的表单上编辑一个字：保存值不再等于默认列表
     envR9.els.bypassList.value = DEF_R9 + NL + "edited-by-user.internal.example";
+    // 【V-01 契约适配】遮蔽现场下「改过内容的保存」需要二次确认：第一次点击只进入确认态
+    //   （零写入、按钮文案变为「确认保存」），第二次点击才真正写入。
+    //   断言一字未改 —— 变的只是动作次数，因为新契约要求用户显式确认一次。
+    envR9.click("saveButton");
+    await envR9.settle(80);
     envR9.click("saveButton");
     await envR9.settle(200);
 
@@ -1051,6 +1056,113 @@ function t(name, cond, extra) {
         envFs.localSetCalls.length === 0 && envFs.localStore.bypassList === LONG_F,
         JSON.stringify([envFs.localSetCalls.length,
           String(envFs.localStore.bypassList || "").split(NL_F).length]));
+    }
+  }
+
+
+  console.log("");
+  console.log("== V-01：遮蔽现场下「编辑后保存」必须二次确认，首次点击不得写入任何存储 ==");
+  {
+    // 现场构造：与 R9-01-F 同型（只阻断后台自愈写下的 {bypassList:""}）。
+    const sboxV = { TextEncoder: TextEncoder };
+    sboxV.self = sboxV; sboxV.globalThis = sboxV;
+    vm.createContext(sboxV);
+    vm.runInContext(settingsSrc, sboxV);
+    const DEF_V = sboxV.EasyProxy.DEFAULTS.bypassList;
+    const NL_V = String.fromCharCode(10);
+    const LONG_V = Array.from({ length: 500 }, (_, i) => "v1-" + (i + 1) + ".internal.example").join(NL_V);
+
+    function shadowEnv() {
+      return buildChainEnv({
+        syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: DEF_V },
+        localStore: { bypassList: LONG_V },
+        setFilter: (realm, areaName, obj) => {
+          if (areaName === "sync" && Object.keys(obj).length === 1 && obj.bypassList === "") {
+            return "自愈写入被测试阻断，以固定污染现场";
+          }
+          return null;
+        }
+      });
+    }
+
+    // ---- 第一次点击：只进入确认态，不得写入任何存储 ----
+    {
+      const envX = shadowEnv();
+      await waitUntil(() => proxyTarget(envX.proxy.value) === "socks5 127.0.0.1:10808");
+      await envX.settle(160);
+      envX.syncSetCalls.length = 0; envX.localSetCalls.length = 0;
+      envX.els.bypassList.value = DEF_V + NL_V + "edited-by-user.internel.example";
+      envX.click("saveButton");
+      await envX.settle(120);
+      t("V-01-A 首次点击（确认态）：sync 零写入（未被静默种下）",
+        envX.syncSetCalls.length === 0, JSON.stringify(envX.syncSetCalls));
+      t("V-01-B 首次点击（确认态）：local 零写入，用户规则完整",
+        envX.localSetCalls.length === 0 && envX.localStore.bypassList === LONG_V,
+        JSON.stringify([envX.localSetCalls.length, String(envX.localStore.bypassList || "").split(NL_V).length]));
+      t("V-01-C 首次点击（确认态）：按钮文案变为「确认保存」（用户看得见需要再确认）",
+        envX.els.saveButton.textContent.indexOf("确认保存") >= 0,
+        JSON.stringify(envX.els.saveButton.textContent));
+      t("V-01-C2 首次点击（确认态）：提示如实说明尚未写入（不得谎报「设置已保存」）",
+        envX.hint().indexOf("再点一次") >= 0 && envX.hint().indexOf("设置已保存") < 0,
+        JSON.stringify(envX.hint()));
+    }
+
+    // ---- 第二次点击：真正写入 sync，仍不碰 local（Task 1 的入口守卫必须同时生效）----
+    {
+      const envY = shadowEnv();
+      await waitUntil(() => proxyTarget(envY.proxy.value) === "socks5 127.0.0.1:10808");
+      await envY.settle(160);
+      envY.syncSetCalls.length = 0; envY.localSetCalls.length = 0;
+      const EDITED = DEF_V + NL_V + "confirmed-by-user.internel.example";
+      envY.els.bypassList.value = EDITED;
+      envY.click("saveButton");                 // 第一次：进入确认态
+      await envY.settle(80);
+      envY.click("saveButton");                 // 第二次：确认并写入
+      await envY.settle(200);
+      t("V-01-D 二次确认后：sync 写入的正是用户表单内容（保存意图被尊重）",
+        envY.syncSetCalls.some(o => o.bypassList === EDITED),
+        JSON.stringify(envY.syncSetCalls.map(o => String(o.bypassList).length)));
+      t("V-01-E 二次确认后：local 仍零写入（Task 1 的入口守卫与确认门同时生效）",
+        envY.localSetCalls.length === 0 && envY.localStore.bypassList === LONG_V,
+        JSON.stringify(envY.localSetCalls.map(o => String(o && o.bypassList).length)));
+      t("V-01-F 二次确认后：按钮文案复位为「保存设置」（确认态不得跨操作残留）",
+        envY.els.saveButton.textContent.indexOf("确认保存") < 0,
+        JSON.stringify(envY.els.saveButton.textContent));
+    }
+
+    // ---- 第一次点击后再改回「等于默认列表」并点击：R9-01 主场景，不得被二次确认打断 ----
+    {
+      const envZ = shadowEnv();
+      await waitUntil(() => proxyTarget(envZ.proxy.value) === "socks5 127.0.0.1:10808");
+      await envZ.settle(160);
+      envZ.els.bypassList.value = DEF_V + NL_V + "typed-then-reverted.internel.example";
+      envZ.click("saveButton");                 // 进入确认态
+      await envZ.settle(80);
+      envZ.els.bypassList.value = DEF_V;        // 用户又改回与默认列表逐字符相同
+      envZ.syncSetCalls.length = 0; envZ.localSetCalls.length = 0;
+      envZ.click("saveButton");
+      await envZ.settle(200);
+      t("V-01-G 已有的确认态不会把「什么都没改」的保存变成空操作：sync 仍被写入默认列表，local 未被清空",
+        envZ.syncSetCalls.length === 1 && envZ.syncSetCalls[0].bypassList === DEF_V &&
+        envZ.localSetCalls.length === 0 && envZ.localStore.bypassList === LONG_V,
+        JSON.stringify([envZ.syncSetCalls.map(o => String(o.bypassList).length),
+          envZ.localSetCalls.length, String(envZ.localStore.bypassList || "").split(NL_V).length]));
+    }
+
+    // ---- 警示：确认态不得在存储变化（表单重载）后残留 ----
+    {
+      const envW = shadowEnv();
+      await waitUntil(() => proxyTarget(envW.proxy.value) === "socks5 127.0.0.1:10808");
+      await envW.settle(160);
+      envW.els.bypassList.value = DEF_V + NL_V + "first-tap.internel.example";
+      envW.click("saveButton");                 // 进入确认态
+      await envW.settle(80);
+      const midLabel = envW.els.saveButton.textContent;
+      envW.reload();                            // 任意存储变化都会触发 load()
+      await envW.settle(120);
+      t("V-01-H 确认态不跨表单重载残留：按钮文案复位为「保存设置」",
+        midLabel.indexOf("确认保存") >= 0 && envW.els.saveButton.textContent.indexOf("确认保存") < 0,
+        JSON.stringify([midLabel, envW.els.saveButton.textContent]));
     }
   }
 

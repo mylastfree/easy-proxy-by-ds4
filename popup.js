@@ -286,6 +286,10 @@ var loadFailed = false;
 //   唯一副本写空。因此这个标记必须在【渲染表单的那一刻】记录下来，
 //   供保存路径判断"本次保存值能否用来证明 local 是过期副本"。
 var loadedShadowed = false;
+// 【V-01】遮蔽现场下「改字后保存」的行内二次确认状态。
+//   不用 window.confirm()：popup 一旦失焦就会被销毁，原生对话框的返回值
+//   永远回不来，会把保存变成「点了没反应」——用一个静默失败换另一个不可接受。
+var pendingShadowConfirm = false;
 var READ_FAIL_HINT = "读取设置失败，当前显示可能不是你的真实设置；为避免覆盖你的设置，已禁止保存。请关闭并重新打开弹窗（或等存储恢复后自动刷新）。";
 
 function setFormDisabled(disabled) {
@@ -295,6 +299,13 @@ function setFormDisabled(disabled) {
   el.proxyPort.disabled = disabled;
   el.bypassList.disabled = disabled;
   el.saveButton.disabled = disabled;
+}
+
+// 确认态复位：任何一次表单重载或保存结束都必须复位，否则确认态会跨操作残留
+//   （变成「隔了很久之后一次普通点击就种下去了」）。
+function resetShadowConfirm() {
+  pendingShadowConfirm = false;
+  el.saveButton.textContent = "保存设置";
 }
 
 // 表单字段清单：读取失败时统一清空 + 禁用。
@@ -369,6 +380,9 @@ function load() {
         local.bypassList.length > 0 &&
         local.bypassList !== S.DEFAULTS.bypassList;
       loadedShadowed = shadowed;
+      // 【V-01】表单重载即复位确认态与按钮文案：任何一次存储变化（含保存成功后
+      //   自己触发的那次）都会走到这里，确认态不会跨操作残留。
+      resetShadowConfirm();
       if (shadowed) {
         console.warn("检测到历史遗留的绕过列表污染现场：本机 local 保存着用户规则，但 sync 是内置默认列表。已标记本次表单，保存时不会据此删除 local。");
         // 【W-01】此前的文案是「此提示存在期间请勿保存」——守卫补全覆盖全部写入路径之后，
@@ -451,6 +465,26 @@ function save() {
     return;
   }
 
+  // 【V-01】遮蔽现场下用户「改字后保存」会让后台自愈的判据（逐字符等于默认列表）
+  //   永久失效：写进 sync 的值成为当前生效值（resolveBypassList 的 sync 非空优先），
+  //   而用户自己那份规则不再被自动恢复。R9-01 的守卫保证了 local 不被删除
+  //   （数据不丢），但"规则长期不生效"仍是用户必须知情后才能接受的结果。
+  //
+  //   这里刻意不用 window.confirm()：popup 一旦失焦就会被销毁，原生对话框的返回值
+  //   永远回不来，会让保存变成"点了没反应"——那是用一个静默失败换另一个。
+  //   改用行内二次确认：第一次点击只改按钮文案与提示，不写任何存储。
+  //   判据用 looksLikeShadowEdit（「默认列表 + 编辑」形态）：逐字符等于默认列表
+  //   是 R9-01 主场景（用户什么都没改），既有守卫已能安全处理，不在这里打断。
+  //   位置刻意放在 readForm/validateSettings 之后：先把参数校验的错误说出来，
+  //   再让用户确认，避免"先确认、后被告知输入非法"。
+  if (loadedShadowed && !pendingShadowConfirm && S.looksLikeShadowEdit(settings.bypassList)) {
+    pendingShadowConfirm = true;
+    el.saveButton.textContent = "确认保存（会用此内容替换当前生效的绕过列表）";
+    showHint("当前显示的绕过列表来自内置默认值，并不是你自己保存的那一份（你自己的规则保存在本机）。" +
+      "再点一次上面的「确认保存」才会写入；取消请直接关闭弹窗。", "warn");
+    return;
+  }
+
   var oversize =
     S.estimateBytes({ bypassList: settings.bypassList }) > S.MAX_SYNC_BYTES_PER_ITEM;
 
@@ -508,8 +542,12 @@ function save() {
             showHint("设置已保存", "ok");
           }));
 
-  chain.catch(function (err) {
+  chain.then(function () {
+    // 【V-01】保存结束即复位确认态与按钮文案（含成功与失败两条路径）。
+    resetShadowConfirm();
+  }, function (err) {
     showHint("保存失败：" + ((err && err.message) || err), "error");
+    resetShadowConfirm();
   });
 }
 

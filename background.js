@@ -816,9 +816,52 @@ chrome.runtime.onInstalled.addListener(function (details) {
   var reason = details && details.reason;
 
   if (reason === 'install') {
-    chrome.storage.sync.set(S.DEFAULTS, function () {
-      void chrome.runtime.lastError;
-      applyProxySerial();
+    // 【V-04】此前这里无条件 chrome.storage.sync.set(S.DEFAULTS)，前提是
+    //   "全新安装 → sync 必然是空的"。该前提在一种真实场景下不成立：
+    //   同一 Google 账号下【卸载后重装】，sync 的键值随账号保留在云端，
+    //   而 local（用户长列表降级副本）已随卸载清空；此时无条件写入
+    //   会把用户云端的代理地址、端口与绕过列表【全键覆盖】为默认值。
+    //   改为与 update 分支相同的"只补空缺"语义：先读，仅对【确实不存在】的键补默认值。
+    chrome.storage.sync.get(CONFIG_KEYS, function (items) {
+      var installReadErr = chrome.runtime.lastError;
+      if (installReadErr) {
+        // 读不到就什么都不补：与 R7-01 同一条原则 —— 绝不把"读不到"当成"用户没配"。
+        console.warn("首次安装补默认值时读取设置失败，跳过补写:", installReadErr.message);
+        applyProxySerial();
+        return;
+      }
+      var patch = {};
+      // 【为什么不能看 normalizeSettings 的结果】S.normalizeSettings(items) 会用 DEFAULTS
+      //   把缺失键【填满】，因此 cur.proxyHost / cur.proxyPort 永不为空 —— 用它判"空缺"
+      //   会得到"永远没有空缺"（与 update 分支同样的形状）。这里必须看【原始键】：
+      //     键缺失 或 值为空串/纯空白 → 视为空缺，补默认值；
+      //     键存在且非空            → 用户配置，绝不覆盖。
+      var rawHost = items && items.proxyHost;
+      if (typeof rawHost !== 'string' || !rawHost.trim()) patch.proxyHost = S.DEFAULTS.proxyHost;
+      var rawPort = items && items.proxyPort;
+      if (typeof rawPort !== 'string' || !rawPort.trim()) patch.proxyPort = S.DEFAULTS.proxyPort;
+      // bypassList 的三态判据与 update 分支完全一致（键缺失 + local 无值 才算"从未配置"）：
+      //   重装场景下 local 必然为空，但 sync 里【有】用户列表 → 不补，用户配置得以保留。
+      chrome.storage.local.get(['bypassList'], function (localItems) {
+        var localErr = chrome.runtime.lastError;
+        if (localErr) {
+          console.warn("首次安装补默认值时读取 local 失败，跳过绕过列表补写:", localErr.message);
+        } else {
+          var syncHasKey = !!items && Object.prototype.hasOwnProperty.call(items, 'bypassList');
+          var localRaw = localItems && localItems.bypassList;
+          var localHasValue = typeof localRaw === 'string' && localRaw.length > 0;
+          if (!syncHasKey && !localHasValue) patch.bypassList = S.DEFAULTS.bypassList;
+        }
+        if (Object.keys(patch).length) {
+          chrome.storage.sync.set(patch, function () {
+            var setErr = chrome.runtime.lastError;
+            if (setErr) console.warn("首次安装补默认值写回失败:", setErr.message);
+            applyProxySerial();
+          });
+        } else {
+          applyProxySerial();
+        }
+      });
     });
     return;
   }
