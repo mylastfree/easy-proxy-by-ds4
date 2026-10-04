@@ -262,21 +262,83 @@ async function runTest(compare) {
 
 /* ==================== 加载与保存 ==================== */
 
+// 【R8-01】读取失败 = 表单内容不可信，必须同时做到两件事：
+//   ① 不误导显示：绝不把 normalizeSettings 的默认值当作「用户的真实配置」渲染
+//      （开关置为 indeterminate 并禁用整个表单，用户不会把「读不到」读成「我关掉了代理」）；
+//   ② 不放行保存：save() 在 loadFailed 时一律拒绝写入 —— 只改文案而不阻止写入，
+//      缺陷依然存在：用户点一次保存就会把 enableProxy:false 写回 sync，
+//      后台随即 clearProxyScope("regular")，浏览器里仍在生效的代理被真清除。
+var loadFailed = false;
+var READ_FAIL_HINT = "读取设置失败，当前显示可能不是你的真实设置；为避免覆盖你的设置，已禁止保存。请关闭并重新打开弹窗（或等存储恢复后自动刷新）。";
+
+function setFormDisabled(disabled) {
+  el.enableProxy.disabled = disabled;
+  el.proxyType.disabled = disabled;
+  el.proxyHost.disabled = disabled;
+  el.proxyPort.disabled = disabled;
+  el.bypassList.disabled = disabled;
+  el.saveButton.disabled = disabled;
+}
+
+// 表单字段清单：读取失败时统一清空 + 禁用。
+//   清空是必须的 —— 存储里可能是用户上一次的真实配置（sync 与 local 两次读取之间失败时），
+//   留着它就等于让用户在一份【不完整】的显示上继续编辑，那正是本缺陷的误导来源。
+var FORM_FIELDS = ["enableProxy", "proxyType", "proxyHost", "proxyPort", "bypassList"];
+
+function clearForm() {
+  el.enableProxy.checked = false;
+  el.proxyType.value = "";
+  el.proxyHost.value = "";
+  el.proxyPort.value = "";
+  el.bypassList.value = "";
+}
+
+function markLoadFailed() {
+  loadFailed = true;
+  // 刻意【不调用 renderForm】：绝不把 normalizeSettings 的默认值当作真实配置渲染。
+  //   enableProxy 置为 indeterminate —— 视觉上是「不确定」，而不是「未勾选」。
+  clearForm();
+  el.enableProxy.indeterminate = true;
+  setFormDisabled(true);
+  showHint(READ_FAIL_HINT, "error");
+}
+
+function markLoadOk() {
+  var wasFailed = loadFailed;
+  loadFailed = false;
+  el.enableProxy.indeterminate = false;
+  setFormDisabled(false);
+  // 只在「从失败态恢复」时清掉那条提示：正常刷新（onChanged 触发的 load）
+  //   不得覆盖「设置已保存」等既有提示。
+  if (wasFailed) showHint("", "muted");
+}
+
 function load() {
   chrome.storage.sync.get(Object.keys(S.DEFAULTS), function (items) {
-    void chrome.runtime.lastError;
-    var settings = S.normalizeSettings(items);
+    // 【R8-01】此前这里只写「void chrome.runtime.lastError;」：读取失败被静默吞掉，
+    //   items 为空 → normalizeSettings 给出默认值（enableProxy:false）→ 表单显示「未勾选」，
+    //   用户点一次保存就把 enableProxy:false 写回 sync，后台随即清除仍在生效的代理。
+    //   读不到 ≠ 用户关掉了代理，必须显式分支。
+    var syncErr = chrome.runtime.lastError;
+    if (syncErr || !items) { markLoadFailed(); return; }
 
     // 先读 local，再用与 background 完全相同的规则决定取值。
     // 此前是「先 normalizeSettings 再判断是否为空」，而 normalizeSettings
     // 会把缺失的 bypassList 填成默认值，导致回退 local 的分支永不执行，
     // 界面显示与实际下发可能取到不同的列表。
     chrome.storage.local.get(["bypassList"], function (local) {
-      void chrome.runtime.lastError;
+      // 【R8-01】local 失败时 local 为 undefined：若继续走 resolveBypassList，
+      //   长列表（降级存于 local）会被显示成默认值 —— 用户点保存就把默认列表写回，
+      //   并顺手清空 local 里的长列表（与 R7-03 同型）。同样必须显式失败。
+      var localErr = chrome.runtime.lastError;
+      if (localErr || !local) { markLoadFailed(); return; }
+
+      var settings = S.normalizeSettings(items);
       settings.bypassList = S.resolveBypassList(
         items && items.bypassList,
         local && local.bypassList
       );
+      markLoadOk();
       renderForm(settings);
     });
   });
@@ -295,8 +357,11 @@ function refreshStatus() {
 function clearLocalBypassIfAny() {
   return new Promise(function (resolve) {
     chrome.storage.local.get(["bypassList"], function (cur) {
-      void chrome.runtime.lastError;
-      if (cur && typeof cur.bypassList === "string" && cur.bypassList) {
+      // 【R8-01】读取失败时 cur 为 undefined：绝不能把它当成「local 里没有列表」，
+      //   更不能继续走到下面的清除分支 —— 那会把用户的长列表永久清空（与 R7-03 同型）。
+      //   读不到就什么都不做，等下一次存储变化或用户重新打开弹窗。
+      if (chrome.runtime.lastError || !cur) { resolve(); return; }
+      if (typeof cur.bypassList === "string" && cur.bypassList) {
         setStorage("local", { bypassList: "" }).then(resolve, resolve);
       } else {
         resolve();
@@ -306,6 +371,13 @@ function clearLocalBypassIfAny() {
 }
 
 function save() {
+  // 【R8-01】核心安全要求：读取失败后表单内容不可信，必须【拒绝写入】。
+  //   仅提示而不阻止，用户点一次「保存」仍会把默认值写回 sync 并清掉代理。
+  if (loadFailed) {
+    showHint(READ_FAIL_HINT, "error");
+    return;
+  }
+
   var settings = readForm();
   var errors = S.validateSettings(settings);
   if (errors.length) {
@@ -338,6 +410,8 @@ function resetDefaults() {
   setStorage("sync", S.DEFAULTS).then(function () {
     return setStorage("local", { bypassList: "" });
   }).then(function () {
+    // 【R8-01】用户明确要求恢复默认：此时内容可信，解除「读取失败」的禁用态。
+    markLoadOk();
     renderForm(S.normalizeSettings(S.DEFAULTS));
     showHint("已恢复默认设置", "ok");
   }).catch(function (err) {
