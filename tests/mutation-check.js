@@ -116,8 +116,10 @@ const mutations = [
   {
     name: "M9 暂停期间的存储变化不再记脏（接管时丢失待下发标记）",
     target: "bg",
-    from: "  if (touched) {\n    if (suspendDepth > 0) suspendDirty = true;\n    applyProxySerial();\n  }",
-    to: "  if (touched) {\n    applyProxySerial();\n  }",
+    // 【R9-01】锚点随 onChanged 处理函数新增自愈调用而更新：变异语义不变，
+    //   仍然是「暂停期间的存储变化不再记脏」，只删掉 suspendDirty = true 这一行。
+    from: "    if (suspendDepth > 0) suspendDirty = true;\n    // 【R9-01】同步（含另一台设备）带来的",
+    to: "    // 【R9-01】同步（含另一台设备）带来的",
     expectFail: true
   },
   {

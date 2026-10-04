@@ -67,15 +67,21 @@ function readBypassText() {
   });
 }
 
+// 【R9-05】写入失败必须留痕。此前一律用 void chrome.runtime.lastError 抑制，
+//   而 session.set 失败会让前台长期停留在【过期结论】上（真实已经是 error，
+//   界面却还显示上一次的 applied），且没有任何日志可查。
+//   这里只补日志与降级说明，不改变写失败时的控制流（状态本来就没写成功）。
 function writeState(state) {
   chrome.storage.session.set({ lastState: state }, function () {
-    void chrome.runtime.lastError;
+    var err = chrome.runtime.lastError;
+    if (err) console.warn("写入 lastState 失败，前台可能显示过期状态:", err.message);
   });
 }
 
 function writeTest(result) {
   chrome.storage.session.set({ lastTest: result }, function () {
-    void chrome.runtime.lastError;
+    var err = chrome.runtime.lastError;
+    if (err) console.warn("写入 lastTest 失败，前台可能显示过期测试结果:", err.message);
   });
 }
 
@@ -110,6 +116,27 @@ function readProxyDetails() {
   });
 }
 
+// 【R9-02】控制权回读的【有界】重试：把"读不到"与"无人接管"分开。
+//   chrome.proxy.settings.get 的失败是回调 lastError（瞬时故障），
+//   重试必须有限次且带退避——绝不能在扩展启动路径上无限等待。
+//   超过重试仍无法确证时返回 null，由调用方按"未知"处理。
+function readProxyDetailsWithRetry(maxAttempts) {
+  var attempts = maxAttempts || 3;
+  var attempt = 0;
+  function next() {
+    return readProxyDetails().then(function (d) {
+      if (d && d.levelOfControl) return d;
+      attempt++;
+      if (attempt >= attempts) return null;
+      // 退避必须短：这一步在扩展启动/每次下发的关键路径上，
+      //   健康路径第一次就成功（零额外延迟），只有真的读不到时才会等待，
+      //   而那时我们最终也会放弃写入，所以等待总时长上限控制在 75ms 以内。
+      return new Promise(function (r) { setTimeout(r, 25 * attempt); }).then(next);
+    });
+  }
+  return next();
+}
+
 function updateIcon(status, reason) {
   // 只有真正下发成功才显示绿色，避免"绿着但直连"的误导
   var ok = status === 'applied';
@@ -132,6 +159,11 @@ function updateIcon(status, reason) {
   //     「本次未改动代理」直接矛盾（读不到 ≠ 代理没了）。
   if (status === 'error' && reason === 'read_failed') {
     titles.error = '无法读取配置，本次未改动代理';
+  }
+  // 【R9-02】同一条"本次未改动代理"的语义：控制权无法确证时我们什么都没写，
+  //   沿用"可能已回退直连"同样与事实相反。
+  if (status === 'error' && reason === 'control_unknown') {
+    titles.error = '无法确证代理控制权，本次未改动代理';
   }
   chrome.action.setTitle({ title: titles[status] || "代理设置" }, function () {
     void chrome.runtime.lastError;
@@ -295,9 +327,29 @@ async function applyProxyCore() {
   //   对比窗口收尾之后的排队任务会走到这里，此时外部接管仍在，必须跳过。
   //   注意：回读失败（pre 为 null）时不阻断正常下发，否则代理故障期间扩展完全不可用；
   //   "未知即拒绝"的严格判定只用在【对比窗口收尾】那条会造成夺权的路径上。
-  var pre = await readProxyDetails();
+  // 【R9-02】回读失败不再放行。此前 pre 为 null（回读失败）时会跳过本段直接下发，
+  //   而"回读失败"与"无人接管"是两件不同的事：真实企业策略或其它扩展正在接管时，
+  //   一次瞬时回读失败就会让我们把配置写下去——那是夺权，与 isControllableByUs
+  //   白名单策略直接冲突。现在做一次有界重试，仍无法确证就【放弃写入】并如实
+  //   报成"状态未知"。
+  //   这不是新发明的严格策略：对比窗口的两次复查（清除前、收尾前）本来就是
+  //   "未确证即拒绝"，本段此前是唯一的例外。
+  var pre = await readProxyDetailsWithRetry(3);
   var preLevel = pre ? pre.levelOfControl : null;
-  if (preLevel && !isControllableByUs(preLevel)) {
+  if (!preLevel) {
+    var unkMsg = "无法确证代理控制权（回读失败或缺少 levelOfControl），已放弃本次下发以免夺权";
+    console.warn(unkMsg);
+    updateIcon("error", "control_unknown");
+    writeState({
+      status: "error",
+      reason: "control_unknown",
+      message: unkMsg,
+      pendingResubmit: suspendDirty,
+      at: Date.now()
+    });
+    return { ok: false, status: "error", errors: [unkMsg] };
+  }
+  if (!isControllableByUs(preLevel)) {
     updateIcon("overridden");
     // 【R6-03】带上 pendingResubmit：该分支写下的 overridden 会覆盖对比窗口写下的
     //   带 pending 的状态（session 写入是"先发布后覆盖"）。若这里丢掉该字段，
@@ -691,6 +743,73 @@ function isControllableByUs(level) {
          level === "controllable_by_this_extension";
 }
 
+/* ==================== 存量绕过列表污染自愈（R9-01） ==================== */
+
+// 历史缺陷（更早版本的升级补缺）会把内置默认绕过列表写进 sync.bypassList，
+// 而用户真实的长列表只剩 local 一份（超长列表降级保存时 local 是唯一副本）。
+// 此后 resolveBypassList 的「sync 非空优先」让默认 6 条遮蔽用户规则：用户看到
+// 默认值、自己的规则不可见；若此时用户编辑一次并保存，旧实现会把 local 写空——
+// local 没有第二份副本，长列表永久丢失。
+//
+// 【R9-01】此前这段自愈只在 chrome.runtime.onInstalled 的 update 分支执行一次，
+//   覆盖不到两条真实到达路径：
+//     ① 升级那一刻 storage.local.get 瞬时失败，自愈被跳过，而 onInstalled
+//        只在换版本时触发一次，之后不会重试；
+//     ② 另一台设备点了「恢复默认」，默认列表经 storage.sync 同步到本机，本机
+//        local 不参与同步，于是形成同样的污染组合，但【不触发 onInstalled】。
+//   现在把它抽成幂等函数，在冷启动与 storage 变化时都执行：只要污染组合出现，
+//   就在同一个同步周期内被修正。
+//
+// 判据保持【逐字符等于内置默认列表】，不做长度/条数近似匹配——近似判据会把
+//   用户自写的等长列表误判成污染并清掉 sync，那是用一次误伤换一次修复。
+// 写入目标【只有 sync.bypassList】：local 是用户唯一的数据副本，绝不动它。
+var legacyReconciling = false;
+
+function isLegacyShadowed(syncRaw, localRaw) {
+  return typeof syncRaw === 'string' &&
+         syncRaw === S.DEFAULTS.bypassList &&
+         typeof localRaw === 'string' &&
+         localRaw.length > 0 &&
+         localRaw !== S.DEFAULTS.bypassList;
+}
+
+function reconcileLegacyBypass() {
+  if (legacyReconciling) return;
+  legacyReconciling = true;
+  chrome.storage.sync.get(['bypassList'], function (syncItems) {
+    var syncErr = chrome.runtime.lastError;
+    if (syncErr) {
+      // 读不到就什么都不做：宁可晚一轮自愈，也不能在未知状态下写用户数据。
+      console.warn("绕过列表自愈：读取 sync 失败，跳过本轮:", syncErr.message);
+      legacyReconciling = false;
+      return;
+    }
+    chrome.storage.local.get(['bypassList'], function (localItems) {
+      var localErr = chrome.runtime.lastError;
+      if (localErr) {
+        console.warn("绕过列表自愈：读取 local 失败，跳过本轮:", localErr.message);
+        legacyReconciling = false;
+        return;
+      }
+      if (!isLegacyShadowed(syncItems && syncItems.bypassList, localItems && localItems.bypassList)) {
+        legacyReconciling = false;
+        return;
+      }
+      console.warn("检测到存量绕过列表污染（sync 为默认列表、local 为用户规则），正在把 sync 恢复为空串占位以让 local 生效。");
+      // 写空串 = 恢复「已降级到 local」的正常占位形态。写完后条件自然不再成立，
+      // 因此本函数幂等且不会形成写入循环。
+      chrome.storage.sync.set({ bypassList: '' }, function () {
+        var setErr = chrome.runtime.lastError;
+        if (setErr) {
+          console.warn("绕过列表自愈写回失败，将在下次存储变化时重试:", setErr.message);
+        }
+        legacyReconciling = false;
+        applyProxySerial();
+      });
+    });
+  });
+}
+
 /* ==================== 生命周期与事件 ==================== */
 
 chrome.runtime.onInstalled.addListener(function (details) {
@@ -775,12 +894,9 @@ chrome.runtime.onInstalled.addListener(function (details) {
         //   而存量污染要求 sync 里该键存在且逐字符等于默认列表；两者不可能同时成立，
         //   因此这两处赋值不会互相覆盖，正常用户的行为一字不变。
         var syncRaw = items && items.bypassList;
-        var legacyShadowed =
-          !localErr &&
-          localHasValue &&
-          typeof syncRaw === 'string' &&
-          syncRaw === S.DEFAULTS.bypassList &&
-          localRaw !== S.DEFAULTS.bypassList;
+        // 【R9-01】判据改为与冷启动 / 存储变化时的连续自愈共用同一个函数，
+        //   避免两份实现随时间漂移（此前这里是一段内联表达式）。
+        var legacyShadowed = !localErr && localHasValue && isLegacyShadowed(syncRaw, localRaw);
         if (legacyShadowed) patch.bypassList = '';
 
         if (Object.keys(patch).length) {
@@ -948,6 +1064,9 @@ chrome.storage.onChanged.addListener(function (changes, areaName) {
   });
   if (touched) {
     if (suspendDepth > 0) suspendDirty = true;
+    // 【R9-01】同步（含另一台设备）带来的"默认列表 + 本地长列表"组合会在写入前
+    //   就被修正，用户来不及在一次被遮蔽的显示上做出破坏性保存。
+    reconcileLegacyBypass();
     applyProxySerial();
   }
 });
@@ -1000,5 +1119,13 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
   }
 });
 
-// Service Worker 冷启动即对齐一次
+// Service Worker 冷启动即对齐一次。
+// 【R9-01】先做一轮幂等的存量污染自愈：污染组合可能在本次会话之前就已存在
+//   （另一台设备同步来的默认列表，或升级时自愈被瞬时读失败跳过），
+//   而 onInstalled 的一次性自愈覆盖不到这些路径。
+//   自愈成功后会自己触发一次下发；这里仍然调用 applyProxySerial()，
+//   因为"没有污染"才是绝大多数情况，不能依赖自愈来驱动常规冷启动下发。
+//   注意顺序：自愈是异步的，本次 applyProxySerial 可能仍用旧（被遮蔽）的
+//   sync 值下发一次，但自愈完成后的 applyProxySerial 会立刻纠正为 local 真值。
+reconcileLegacyBypass();
 applyProxySerial();

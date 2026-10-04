@@ -28,6 +28,9 @@ var STATUS_TEXT = {
   // 【R7-01-F】error 档的第二种来源：读取配置失败。此时我们什么都没做，
   //   代理未被改动，因此绝不能沿用上面那条「可能已回退直连」的断言。
   error_read_failed: ["无法读取配置，本次未改动代理", "warn"],
+  // 【R9-02】控制权无法确证时同样是"本次未改动代理"；
+  //   不得沿用"代理异常，流量可能已回退直连"——没有写入任何东西时那句话与事实相反。
+  error_control_unknown: ["无法确证代理控制权，本次未改动代理", "warn"],
   // 【R8-04】状态本身没读到（session.get 失败）。与 direct 的区别是本质性的：
   //   这一档下我们【根本不知道】代理现在是什么状态，必须如实说不知道；
   //   用 muted 档的直连文案会把「读不到」谎报成「用户没开代理」。
@@ -93,9 +96,9 @@ function renderStatus(state, readFailed) {
   if (!state) state = readFailed ? { status: "status_read_failed" } : { status: "direct" };
   // 【R7-01-F】读取失败不是「代理坏了」：单独取文案，避免状态条自相矛盾
   //   （前半句说代理可能已回退直连、后半句说本次未改动代理）。
-  var key = (state.status === "error" && state.reason === "read_failed")
-    ? "error_read_failed"
-    : state.status;
+  var key = state.status;
+  if (state.status === "error" && state.reason === "read_failed") key = "error_read_failed";
+  else if (state.status === "error" && state.reason === "control_unknown") key = "error_control_unknown";
   var row = STATUS_TEXT[key] || ["状态未知", "muted"];
   var text = row[0];
   if (state.errors && state.errors.length) text += "：" + state.errors.join("；");
@@ -277,6 +280,12 @@ async function runTest(compare) {
 //      缺陷依然存在：用户点一次保存就会把 enableProxy:false 写回 sync，
 //      后台随即 clearProxyScope("regular")，浏览器里仍在生效的代理被真清除。
 var loadFailed = false;
+// 【R9-01】本次表单内容是否来自「用户规则被内置默认列表遮蔽」的现场。
+//   在那样的现场里，表单显示的默认值并不属于用户；用户哪怕只是照着它改一个字，
+//   保存值也不再等于默认列表，clearLocalBypassIfAny 的原判据就会失效并把 local
+//   唯一副本写空。因此这个标记必须在【渲染表单的那一刻】记录下来，
+//   供保存路径判断"本次保存值能否用来证明 local 是过期副本"。
+var loadedShadowed = false;
 var READ_FAIL_HINT = "读取设置失败，当前显示可能不是你的真实设置；为避免覆盖你的设置，已禁止保存。请关闭并重新打开弹窗（或等存储恢复后自动刷新）。";
 
 function setFormDisabled(disabled) {
@@ -348,6 +357,23 @@ function load() {
       );
       markLoadOk();
       renderForm(settings);
+
+      // 【R9-01】把"历史遗留的绕过列表冲突"显式告诉用户，而不是让默认值静默
+      //   遮蔽他真正的规则。后台的连续自愈会很快把 sync 恢复为空串占位、让 local
+      //   重新生效；在自愈完成之前，用户至少能看到发生了什么，不会把"看到默认值"
+      //   误当成"我的规则丢了"而重新手打一遍。
+      var shadowed =
+        typeof (items && items.bypassList) === "string" &&
+        items.bypassList === S.DEFAULTS.bypassList &&
+        typeof (local && local.bypassList) === "string" &&
+        local.bypassList.length > 0 &&
+        local.bypassList !== S.DEFAULTS.bypassList;
+      loadedShadowed = shadowed;
+      if (shadowed) {
+        console.warn("检测到历史遗留的绕过列表污染现场：本机 local 保存着用户规则，但 sync 是内置默认列表。已标记本次表单，保存时不会据此删除 local。");
+        showHint("检测到历史遗留的绕过列表：本机保存着你自己的规则，但当前生效的是内置默认列表。" +
+          "后台正在自动恢复为你的规则；此提示存在期间请勿保存，或保存后重新打开弹窗确认。", "warn");
+      }
     });
   });
 }
@@ -384,6 +410,10 @@ function refreshStatus() {
 //   不丢数据 —— 保守方向正确。
 function clearLocalBypassIfAny(savedBypassList) {
   // 【R8-02】保存的正是系统默认列表 → 保留 local，不发任何写入。
+  // 【R9-01】本判据（逐字符等于内置默认列表 = 存量污染特征）保持不变：
+  //   R8-02-C 已论证把它放宽成"一律不清"会让过期副本复活，那不可接受。
+  //   本轮把防护前移：污染现场在用户动手之前就被自愈（见 background.js 的
+  //   reconcileLegacyBypass 与 popup 的 loadedShadowed 守卫），而不是在这里放宽。
   if (typeof savedBypassList === "string" && savedBypassList === S.DEFAULTS.bypassList) {
     return Promise.resolve();
   }
@@ -420,6 +450,14 @@ function save() {
   var oversize =
     S.estimateBytes({ bypassList: settings.bypassList }) > S.MAX_SYNC_BYTES_PER_ITEM;
 
+  // 【R9-01】必须在【发起写入之前】快照这个标记。
+  //   写入 sync 会触发 storage.onChanged，popup 自己的 onChanged 监听会重新执行
+  //   load()，而 load() 会用「新值是否等于默认列表」重算 loadedShadowed —— 对刚
+  //   写进去的新值而言恒为 false。若在回调里读 loadedShadowed，守卫会被自己的
+  //   写入冲掉，等同不存在（真实浏览器的 storage 事件同样会触发）。
+  //   因此这里取快照，回调里只读快照。
+  var formWasShadowed = loadedShadowed;
+
   var chain = oversize
     ? setStorage("local", { bypassList: settings.bypassList }).then(function () {
         return setStorage("sync", Object.assign({}, settings, { bypassList: "" }));
@@ -427,6 +465,17 @@ function save() {
         showHint("绕过列表较长，已存于本地（不跨设备同步）", "warn");
       })
     : setStorage("sync", settings).then(function () {
+        // 【R9-01】核心守卫：如果本次表单是在「被默认列表遮蔽」的现场渲染的，
+        //   那么 settings.bypassList 不能用来证明"local 只是过期副本"——
+        //   用户很可能是照着那份【并不属于他】的默认列表改的。
+        //   此时唯一安全的动作是【不删 local】：它可能是用户规则的最后一份副本，
+        //   删掉不可逆且界面只会报「设置已保存」。
+        //   这里刻意不写回 sync（那会覆盖用户刚刚保存的内容）；把 sync 恢复成
+        //   空串占位的自愈由 background 的 reconcileLegacyBypass 负责。
+        if (formWasShadowed) {
+          console.warn("保存时检测到表单来自被遮蔽的现场，保留 storage.local 的绕过列表副本（可能为用户规则唯一副本）。");
+          return undefined;
+        }
         // 【R8-02】把本次写进 sync 的 bypassList 一并交给清理函数：
         //   它据此判断「保存的是系统默认列表」还是「用户自己撰写的列表」。
         return clearLocalBypassIfAny(settings.bypassList);

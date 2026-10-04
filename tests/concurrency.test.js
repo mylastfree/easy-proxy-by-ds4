@@ -297,7 +297,10 @@ function ask(handler, msg) {
     const env = buildEnv({ getFails: true });
     await sleep(60);
     env.sandbox.chrome.storage.sync.set(Object.assign({}, BASE, { proxyPort: "10808" }), function () {});
-    await sleep(300);
+    // 【R9-02】等待窗口由 300ms 放宽到 700ms：控制权回读现在做有界重试
+    //   （最多 3 次、退避 25+50ms，总上限 75ms），且失败后会写 error 状态。
+    //   这是"等异步结果落地"的等待时间，不是断言放宽——断言一字未改。
+    await sleep(700);
 
     var st = env.sessionStore.lastState || {};
     t("回读失败时状态不是 applied",

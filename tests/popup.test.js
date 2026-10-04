@@ -750,9 +750,13 @@ function t(name, cond, extra) {
     await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
     await env.settle(60);
 
-    t("B-1 前置事实：污染现场 —— 界面显示的是内置默认 6 条（用户自己的规则被遮蔽）",
-      env.els.bypassList.value === DEFAULTS_B.bypassList,
-      "界面长度=" + String(env.els.bypassList.value).length + "；默认长度=" + DEFAULTS_B.bypassList.length);
+    // 【R9-01 契约更新】污染组合现在会在后台的存储变化周期内自愈（sync 恢复空串占位），
+    //   于是界面显示的是【用户自己的 950 条规则】而不是被遮蔽的默认 6 条。
+    //   原断言把"界面显示默认值"当作前置事实，修复后必然失败；那正是本修复要消除的状态。
+    //   数据保全语义（local 不被清空）由下面的 B-2/B-4/B-5 继续覆盖。
+    t("B-1 前置事实（已更新）：自愈后界面显示的是用户自己的 950 条规则（不再被默认列表遮蔽）",
+      env.els.bypassList.value === LONG_B,
+      "界面条数=" + String(env.els.bypassList.value || "").split(String.fromCharCode(10)).length + " 期望 950");
     t("B-2 前置事实：local 里是用户的 950 条长列表",
       env.localStore.bypassList === LONG_B,
       "local 条数=" + String(env.localStore.bypassList || "").split("\n").length);

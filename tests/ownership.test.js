@@ -1937,16 +1937,21 @@ function t(name, cond, extra) {
       await drain(envA8);
       await sleep(60);
 
-      t("R8-02-A 前置事实：污染现场 —— sync 逐字符等于默认列表，local 是用户的 950 条长列表",
-        envA8.syncStore.bypassList === DEFAULTS8.bypassList && envA8.localStore.bypassList === LONG8,
-        "sync 长度=" + String(envA8.syncStore.bypassList && envA8.syncStore.bypassList.length) +
+      // 【R9-01 契约更新】污染组合现在会在【写入后的同一个存储变化周期内】被自愈，
+      //   不再需要等待 onInstalled 的 upgrade 事件。原断言把"污染仍然存在"当作
+      //   前置事实，修复后必然失败——而那正是本修复要消除的状态。
+      //   因此这里改为断言【污染不会持续存在】，核心数据保全语义（sync 恢复空串
+      //   占位、local 原封不动、下发用户真实规则）由下面的断言继续覆盖。
+      t("R8-02-A 前置事实（已更新）：污染组合写入后即被自愈，sync 恢复空串占位、local 原封不动",
+        envA8.syncStore.bypassList === "" && envA8.localStore.bypassList === LONG8,
+        "sync=" + JSON.stringify(envA8.syncStore.bypassList) +
         "；local 条数=" + count8(envA8.localStore.bypassList));
 
       const beforeA8 = lastBypass8(envA8);
-      t("R8-02-A 前置事实：污染下发的确实是默认 6 条（用户规则被遮蔽，取值规则本身正常）",
-        beforeA8.length === 6 && beforeA8.indexOf("192.168.0.0/16") >= 0 &&
-        beforeA8.indexOf("legacy-1.internal.example") < 0,
-        "下发的 bypassList=" + JSON.stringify(beforeA8));
+      t("R8-02-A 前置事实（已更新）：自愈后下发的就是用户的 950 条长列表，不再被默认 6 条遮蔽",
+        beforeA8.length === 950 && beforeA8.indexOf("legacy-1.internal.example") >= 0 &&
+        beforeA8.indexOf("192.168.0.0/16") < 0,
+        "下发的 bypassList 条数=" + beforeA8.length);
 
       const setsBeforeA8 = envA8.setConfigs.length;
       fireUpdate8(envA8);
