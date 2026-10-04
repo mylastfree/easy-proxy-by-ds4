@@ -25,7 +25,8 @@ const testFiles = [
   "background.test.js",
   "fix-safety.test.js",
   "concurrency.test.js",
-  "ownership.test.js"
+  "ownership.test.js",
+  "popup.test.js"
 ].map(function (f) { return path.join(__dirname, f); });
 
 // 换行符处理：

@@ -2,6 +2,39 @@
 
 本文件记录本扩展的所有重要变更。
 
+## [2.6.0] - 2026-10-04
+
+修复第六轮审计遗留的 R6-01 / R6-03 / R6-04，以及第七轮复审的 R7-01 / R7-02 / R7-03 / R7-04 / R7-05 / R7-07 / R7-08。本版改变了可观察契约（状态与图标分支、对比测试早退路径、popup 失败文案），按仓库惯例升 minor。
+
+### 修复
+
+- **R6-01（P1）对比收尾必须消费 `applyProxyCore()` 的返回值**：真实 `chrome.proxy.settings.set` 失败走 callback `lastError`，被转成 `{ok:false, status:"error"}` **正常 resolve**，而收尾只 catch 异常（throw），于是把「恢复失败」当成「恢复成功」并顺手清掉脏标记，兜底重放的条件因而恒不成立。现在收尾显式消费返回值：非成功终态即记 `restoreFailed` 并保留脏标记，前台不再给出与状态条相反的绿色结论。
+- **R6-03（P2）脏标记只在确认终态消费**：仅在 `ok === true` 且 `status !== "overridden"` 时清除。此前「返回对象式失败」与「确认成功」两条路径都会清零，使「接管期间记脏、解除后重放成功」这条链把脏标记一路留给后续窗口，一次用户根本没改配置的对比测试会误报「有配置变更待下发」。同时清除前接管分支补上 `pendingResubmit`，不再丢弃待下发标记。
+- **R6-04（P2）注册 `chrome.proxy.settings.onChange` 只读回查**：企业策略或其它扩展接管 / 释放后状态与图标及时对齐。回查严格只读，不写回、不夺权（`set` / `clear` 零调用）。
+- **R7-01（P1）存储读取失败改为显式失败**：`readSettings` / `readBypassText` 此前只抑制 `lastError` 而不产生分支，读取失败被归一成默认配置（`enableProxy:false`），`applyProxyCore` 便在「未启用」分支真清除仍在生效的代理，状态写 `direct`、图标转红、标题报「未启用代理（直连）」。现在读取失败直接写 `status:error` + 非空 `message`，绝不调用 `setProxy` / `clearProxyScope`，绝不写 `direct` / `applied`。
+- **R7-01-F 读取失败的前台与图标文案**：新增 `reason:"read_failed"` 子类型（`status` 仍为 `error`，既有契约不变），图标标题与状态条改用「无法读取配置，本次未改动代理」，不再声称「流量可能已回退直连」；真实代理故障仍保留原文案。
+- **R7-02（P1）对比测试入口绑定实际生效配置**：窗口的第一步就是 `clearProxyScope("regular")`，而收尾的 `applyProxyCore` 会因校验失败直接返回 `saved_not_applied`、一次 `set` 都不发，于是「清除」与「恢复」严重不对称——仍在工作的旧代理被清掉且永不写回。现在进入窗口前同时确认「配置本身有效」与「回读到的实际生效模式确为 `fixed_servers`」，任一不满足即早退并如实报 `compareSkipped` / `compareSkippedReason`，且不写状态、不改图标、不清脏。
+- **R7-03（P1）升级补缺按有效来源判断绕过列表**：超长列表保存时 `sync.bypassList` 被写成空串占位、真值在 `local`，而 `onInstalled` 的 update 分支把占位空串当成「用户没配」并写入默认 6 条，造成遮蔽（长列表失效）、误改（用户主动清空后被改回默认）、永久删除（再点一次保存即触发 `clearLocalBypassIfAny()` 清掉唯一副本）。现在按与 `resolveBypassList` 同源的判据、以【原始键是否存在】而非归一化结果区分四态；`local` 读取失败时宁可不补写也不覆盖用户数据。
+- **R7-05（P2）回声抑制先过控制权检查**：外部扩展以【相同】mode/host/port 接管时值比对同样成立，回调被当成我方回声直接 return，session 仍写 `applied` / 图标留绿，而真实控制权已是 `controlled_by_other_extensions`。改为 `isControllableByUs(level) && isOwnLastIntent(...)`，两条合法回声路径的抑制语义不变。
+- **R7-07 拒绝非 ASCII 代理主机名**：Chrome 要求 `singleProxy.host` 必须是 ASCII（Punycode），IDNA 不受支持。新增 `isAsciiHost` 作为校验链最后一个分支（不改动任何既有分支的顺序与文案），非 ASCII 时给出转 Punycode 的可执行提示；IPv4、主机名、IPv6 字面量与已是 Punycode 的输入继续零错误。
+- **R7-08 popup 异常路径必须复位测试按钮**：`runTest` 里 `await` 之后的两行复位在抛错时永不执行，两个测试按钮停在 `disabled=true`，用户只能关掉重开 popup，其中一种情形还会留下 `Uncaught (in promise)`。改为 `try/catch/finally`，按钮复位放进 `finally`；新增 `renderTestError` 让异常与「后台返回 `{ok:false}`」走同一档失败文案并如实带出原因；两个 click 调用点补 `.catch()`。
+
+### 文档
+
+- **R7-06 版本一致性**：`manifest.json`、三个源文件头（`settings.js` / `popup.js` / `background.js`）、`README.md` 与本文档统一为 2.6.0。
+- **R7-09 README 与事实对齐**：隐私说明补上「绕过列表超过单项 8 KB 时改存 `storage.local`、不跨设备同步」这一例外；测试表补 `concurrency` / `ownership` / `popup` 三行并修正各行为实测断言数，变异行 6 → 16；命令块补全全部功能测试；版本号与套数表述同步。
+
+### 测试
+
+- 新增 `tests/popup.test.js`（28 项）：popup.js 此前无任何测试覆盖。断言对象一律是 popup 自身函数运行后 DOM 元素的真实 `disabled` / `innerHTML`，点击通过真实监听器派发；A/B 为异常路径 RED 断言，C/C2/D 为既有语义防回归，E 为调用点契约。
+- 功能测试断言数由 **220 项增至 418 项**（v2.5.0 六组实测 220：manifest 44 / settings 48 / background 38 / fix-safety 19 / concurrency 29 / ownership 42；本版七组 418：manifest 44 / settings 66 / background 38 / fix-safety 19 / concurrency 33 / ownership 190 / popup 28）。
+- **R7-04（P1）变异门禁锚点失效**：M11 的原 `from` 串在 R6-01 改动后命中 0 次，脚本会以 `injectFail=1` 退出 1，CI 一旦推送即红。现按改动后的文本改写锚点，并把变异数由 **13 项增至 16 项**：新增 M14（窗口收尾恒真清脏）、M15（普通成功路径不再清脏）、M16（只读回查里发生夺权式写回）。
+- `tests/popup.test.js` 接入 CI（`.github/workflows/ci.yml`）与变异脚本的 `testFiles`。
+
+### 验证边界
+
+以上结论均来自零依赖的 Node 桩测试与变异门禁，**未做真实 Chrome 端到端验证**：Service Worker 被强杀、企业策略（`levelOfControl` 为 `controlled_by_other_extensions` 的真实下发结果）、`chrome.storage.sync` 的真实配额与跨设备同步行为，均只按 API 契约在桩上模拟。
+
 ## [2.5.0] - 2026-10-03
 
 修复第五轮评估的 P2。2.4.0 只存在于本地候选提交，没有 tag，也没有推送。
