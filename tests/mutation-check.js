@@ -259,6 +259,47 @@ const mutations = [
     from: "      loadedShadowed = shadowed;",
     to: "      loadedShadowed = false;",
     expectFail: true
+  },
+  {
+    // 【C-2】onProxyError 的处理体被架空：代理运行时错误（含 fatal 透传）不再上报。
+    //   此前 5 套测试环境的该监听器桩全是空 addListener，监听器从未被驱动，
+    //   这条变异在旧护栏下完全 MISS。ownership 的新 C-2 段（fireProxyError 驱动）
+    //   是它的主守门者。
+    name: "M20 onProxyError 处理体失效（C-2 回归：代理错误不再上报）",
+    target: "bg",
+    from: "chrome.proxy.onProxyError.addListener(function (details) {",
+    to: "chrome.proxy.onProxyError.addListener(function (details) {\n  return;",
+    expectFail: true
+  },
+  {
+    // 【C-1】禁用路径不再清理旧版遗留作用域：老版本升级来的安装关闭开关后，
+    //   incognito_persistent / regular_only 的残留继续压制流量而界面宣称直连。
+    //   ownership 的 C-1 段（clearCalls 作用域序列断言）是它的主守门者。
+    name: "M21 禁用路径不再清理遗留作用域（C-1 回归：状态≠事实）",
+    target: "bg",
+    from: "        await clearProxyScope(LEGACY_SCOPES[li]);",
+    to: "        ;",
+    expectFail: true
+  },
+  {
+    // 【M-1】表单重绘的焦点保护失效：storage 变化触发的 load() 会整体重绘表单，
+    //   覆盖用户正在输入的内容（后台自愈写 sync.bypassList='' 即触发）。
+    //   popup 的 M-1 段（activeElement 焦点保护断言）是它的主守门者。
+    name: "M22 表单重绘焦点保护失效（M-1 回归：覆盖用户输入）",
+    target: "popup",
+    from: "function activeEditableId() {\n  var ae = document.activeElement;",
+    to: "function activeEditableId() {\n  return null;\n  var ae = document.activeElement;",
+    expectFail: true
+  },
+  {
+    // 【M-6】含冒号 host 的 IPv6 形态校验失效：example.com:8080:90、host:abc 等
+    //   Chrome 必拒写法重新漏到 set 阶段并被归因为「代理异常」。
+    //   settings 的 M-6 段（validateSettings 拒绝断言）是它的主守门者。
+    name: "M23 含冒号 host 的 IPv6 形态校验失效（M-6 回归：必拒写法漏放）",
+    target: "set",
+    from: "    } else if (s.proxyHost.indexOf(':') >= 0 && !isIpV6Shape(s.proxyHost)) {",
+    to: "    } else if (false) {",
+    expectFail: true
   }
 ];
 

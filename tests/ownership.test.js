@@ -27,7 +27,7 @@ function buildEnv(opts) {
   const syncStore = Object.assign({}, opts.seedSync || {});
   const localStore = {};
   const sessionStore = Object.assign({}, opts.seedSession || {});
-  const listeners = { changed: [], message: [], onChange: [], installed: [] };
+  const listeners = { changed: [], message: [], onChange: [], installed: [], startup: [], proxyError: [] };
   const setCalls = [];       // setProxy 的发起序列
   const setConfigs = [];     // R7-01：每次下发给 chrome.proxy 的完整配置对象
   const clearCalls = [];     // clear 的作用域序列
@@ -51,6 +51,8 @@ function buildEnv(opts) {
   let getHook = null, getCount = 0;
   // R7-01：存储读取故障注入（null = 不干预）。签名 (areaName, keys, items) => null | { error, items }
   let storageHook = null;
+  // 【M-5】session 写失败注入：接下来 N 次 session.set 以 lastError 契约失败（不落库）。
+  let sessionFailRemaining = 0;
   // R6-04：模拟外部扩展 / 企业策略的控制等级（null 表示仍由本扩展控制）。
   let externalLevel = null;
   let setHook = null, clearHook = null;
@@ -76,6 +78,16 @@ function buildEnv(opts) {
       },
       set(obj, cb) {
         if (areaName === "session" && obj && obj.lastState) stateWrites.push(obj.lastState);
+        // 【M-5】session 写失败注入：真实契约 = lastError 置位回调 + 存储内容不变。
+        if (areaName === "session" && sessionFailRemaining > 0) {
+          sessionFailRemaining--;
+          setTimeout(() => {
+            sandbox.chrome.runtime.lastError = { message: "session write failed (injected)" };
+            if (cb) cb();
+            sandbox.chrome.runtime.lastError = undefined;
+          }, 0);
+          return;
+        }
         const changes = {};
         for (const k of Object.keys(obj)) {
           if (JSON.stringify(store[k]) !== JSON.stringify(obj[k])) changes[k] = { newValue: obj[k] };
@@ -139,7 +151,9 @@ function buildEnv(opts) {
   }
   sandbox.chrome = {
     runtime: { lastError: undefined, id: SENDER_ID,
-      onInstalled: { addListener(f) { listeners.installed.push(f); } }, onStartup: { addListener() {} },
+      onInstalled: { addListener(f) { listeners.installed.push(f); } },
+      // 【M-3】onStartup 此前从未被捕获与驱动，冷启动对齐路径零覆盖。
+      onStartup: { addListener(f) { listeners.startup.push(f); } },
       onMessage: { addListener(f) { listeners.message.push(f); } } },
     storage: { sync: makeArea(syncStore, "sync"), local: makeArea(localStore, "local"),
       session: makeArea(sessionStore, "session"), onChanged: { addListener(f) { listeners.changed.push(f); } } },
@@ -190,7 +204,7 @@ function buildEnv(opts) {
         //   缺少该桩会让脚本一加载就抛 TypeError，整套用例连锁失败。
         onChange: { addListener(f) { listeners.onChange.push(f); } }
       },
-      onProxyError: { addListener() {} }
+      onProxyError: { addListener(f) { listeners.proxyError.push(f); } }
     },
     action: {
       setIcon(o, cb) { iconCalls.push(o.path && o.path["16"]); setTimeout(() => cb && cb(), 0); },
@@ -216,6 +230,12 @@ function buildEnv(opts) {
     setClearHook: fn => { clearHook = fn; },
     // R6-04：驱动 chrome.proxy.settings.onChange 的真实回调（外部接管 / 释放）。
     fireProxyChange: details => { for (const fn of listeners.onChange.slice()) fn(details); },
+    // 【C-2】驱动 chrome.proxy.onProxyError 的真实回调（代理运行时错误）。
+    fireProxyError: details => { for (const fn of listeners.proxyError.slice()) fn(details); },
+    // 【M-3】驱动 chrome.runtime.onStartup 的真实回调（浏览器冷启动对齐）。
+    fireStartup: () => { for (const fn of listeners.startup.slice()) fn(); },
+    // 【M-5】注入接下来 N 次 session.set 写失败（真实 lastError 契约，存储内容不变）。
+    setSessionFail: n => { sessionFailRemaining = n; },
     // 【R9-03】显式放行被挂起的下发（放行后 holdPort 不再拦截，窗口收尾的写回照常落地）。
     releaseHeldSets: () => { holdReleased = true; for (const f of heldSets.splice(0)) setTimeout(f, 0); },
     // 模拟外部接管或释放：只改控制等级与实际生效配置，不经过我方任何写路径。
@@ -2302,6 +2322,209 @@ function t(name, cond, extra) {
       !(resp && resp.result && resp.result.ipChanged === false &&
         resp && resp.result && resp.result.direct && resp.result.direct.ok),
       "ipChanged=" + (resp && resp.result && resp.result.ipChanged));
+  }
+
+  console.log("");
+  console.log("== C-1：未启用（禁用）路径同样清理旧版遗留作用域 ==");
+  {
+    // 缺陷：LEGACY_SCOPES 只在启用分支清理；老版本升级来的安装若在
+    // incognito_persistent / regular_only 残留代理配置，关闭开关后界面宣称
+    // direct，隐身流量却仍在走代理（状态≠事实）。断言对象 = clear 的作用域序列。
+    const env = buildEnv({ fetchDelay: 20 });
+    await sleep(60);          // 冷启动默认 enableProxy=false → 走「未启用」分支
+    await drain(env);
+    t("C-1-a 未启用路径清除 regular", env.clearCalls.indexOf("regular") >= 0,
+      "clears=" + JSON.stringify(env.clearCalls));
+    t("C-1-b 未启用路径清除 incognito_persistent", env.clearCalls.indexOf("incognito_persistent") >= 0,
+      "clears=" + JSON.stringify(env.clearCalls));
+    t("C-1-c 未启用路径清除 incognito_session_only", env.clearCalls.indexOf("incognito_session_only") >= 0,
+      "clears=" + JSON.stringify(env.clearCalls));
+    t("C-1-d 未启用路径清除 regular_only", env.clearCalls.indexOf("regular_only") >= 0,
+      "clears=" + JSON.stringify(env.clearCalls));
+    const stA = env.sessionStore.lastState || {};
+    t("C-1-e 全部清理成功时状态如实为 direct", stA.status === "direct",
+      "lastState=" + JSON.stringify(stA));
+    t("C-1-f 无遗留清理失败时不得附失败说明", !stA.legacyClearFailed && !stA.message,
+      "lastState=" + JSON.stringify(stA));
+  }
+  {
+    // 失败降级：遗留作用域清理失败时 regular 已直连的事实不变（仍是 direct），
+    // 但必须如实附上说明 —— 不能一边宣称 direct 一边隐瞒残留。
+    const env = buildEnv({ fetchDelay: 20 });
+    env.setClearHook((o, cb, sb) => {
+      if (o.scope === "incognito_persistent") {
+        setTimeout(() => {
+          sb.chrome.runtime.lastError = { message: "clear failed (injected)" };
+          cb();
+          sb.chrome.runtime.lastError = undefined;
+        }, 0);
+        return;
+      }
+      setTimeout(() => { sb.chrome.runtime.lastError = undefined; cb(); }, 0);
+    });
+    await sleep(60);
+    await drain(env);
+    const stB = env.sessionStore.lastState || {};
+    t("C-1-g 遗留作用域清理失败不推翻 direct 结论（regular 已清干净）",
+      stB.status === "direct", "lastState=" + JSON.stringify(stB));
+    t("C-1-h 失败必须留痕：说明隐身窗口可能仍走代理",
+      typeof stB.message === "string" && stB.message.indexOf("隐身窗口") >= 0,
+      "lastState=" + JSON.stringify(stB));
+    t("C-1-i legacyClearFailed 列出失败的作用域",
+      Array.isArray(stB.legacyClearFailed) && stB.legacyClearFailed.indexOf("incognito_persistent") >= 0,
+      "lastState=" + JSON.stringify(stB));
+  }
+
+  console.log("");
+  console.log("== C-2：onProxyError 监听器必须真实生效（此前桩为空、零覆盖） ==");
+  {
+    const env = buildEnv({ fetchDelay: 20 });
+    await sleep(60);
+    await drain(env);
+    env.fireProxyError({ fatal: true, error: "ERR_PROXY_CONNECTION_FAILED", details: "proxy unreachable" });
+    await sleep(80);
+    const st = env.sessionStore.lastState || {};
+    t("C-2-a fatal 代理错误 → status error", st.status === "error", "lastState=" + JSON.stringify(st));
+    t("C-2-b fatal 标记如实透传", st.fatal === true, "lastState=" + JSON.stringify(st));
+    t("C-2-c 错误消息透传", st.message === "ERR_PROXY_CONNECTION_FAILED", "message=" + JSON.stringify(st.message));
+    t("C-2-d detail 透传", st.detail === "proxy unreachable", "detail=" + JSON.stringify(st.detail));
+    t("C-2-e 图标转红（用户必须看见）",
+      env.iconCalls[env.iconCalls.length - 1] === "icon-red-16.png",
+      "icon=" + JSON.stringify(env.iconCalls));
+    // 非 fatal：fatal=false 恰好表示「已静默回退直连」，必须让用户看见
+    env.fireProxyError({ fatal: false, error: "transient", details: "" });
+    await sleep(80);
+    const st2 = env.sessionStore.lastState || {};
+    t("C-2-f 非 fatal 也写 error 档（静默回退必须可见）", st2.status === "error",
+      "lastState=" + JSON.stringify(st2));
+    t("C-2-g 非 fatal 时 fatal=false", st2.fatal === false, "lastState=" + JSON.stringify(st2));
+    t("C-2-h 空 details 字段安全兜底为空串", st2.detail === "", "detail=" + JSON.stringify(st2.detail));
+    // 缺省字段：不能因 details 缺字段而抛错或写脏状态
+    env.fireProxyError({});
+    await sleep(80);
+    const st3 = env.sessionStore.lastState || {};
+    t("C-2-i 缺省 error 字段兜底为「未知代理错误」", st3.message === "未知代理错误",
+      "lastState=" + JSON.stringify(st3));
+  }
+
+  console.log("");
+  console.log("== M-3：onStartup 冷启动对齐必须真实生效（此前从未被驱动） ==");
+  {
+    const env = buildEnv({ fetchDelay: 20, seedSync: Object.assign({}, BASE, { proxyPort: "10808" }) });
+    await sleep(60);
+    await drain(env);
+    env.setCalls.length = 0; env.clearCalls.length = 0;
+    env.fireStartup();
+    await drain(env);
+    t("M-3-a onStartup 按存储设置真实下发代理", env.getEffective() === "127.0.0.1:10808",
+      "实际=" + env.getEffective() + "；set=" + JSON.stringify(env.setCalls));
+    t("M-3-b 状态如实判 applied", (env.sessionStore.lastState || {}).status === "applied",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState));
+    t("M-3-c 确实发生了新的下发（onStartup 不是空转）", env.setCalls.length >= 1,
+      "set=" + JSON.stringify(env.setCalls));
+    t("M-3-d 末次图标为绿色", env.iconCalls[env.iconCalls.length - 1] === "icon-green-16.png",
+      "icon=" + JSON.stringify(env.iconCalls));
+  }
+
+  console.log("");
+  console.log("== M-2 / C-3：fetchExit 超时语义与多端点容错 ==");
+  {
+    const env = buildEnv({});
+    await sleep(60);
+    const S2 = env.sandbox.EasyProxy;
+    const urls = [];
+    // 场景 1：主端点正常 → 只发一次请求，结果经 schema 校验归一化
+    env.sandbox.fetch = function (url) {
+      urls.push(String(url));
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ ip: "203.0.113.7", org: "O", city: "C", region: "R", country: "CC" }) });
+    };
+    const r1 = await env.sandbox.fetchExit();
+    t("C-3-a 主端点正常时只请求一个端点", urls.length === 1, JSON.stringify(urls));
+    t("C-3-b 请求的是主端点", urls[0].indexOf("ipinfo.io") >= 0, urls[0]);
+    t("C-3-c 归一化字段完整", r1.ok === true && r1.ip === "203.0.113.7" && r1.org === "O" && r1.country === "CC",
+      JSON.stringify(r1));
+    // 场景 2：主端点 HTTP 错误 → 备用端点接管
+    urls.length = 0;
+    env.sandbox.fetch = function (url) {
+      urls.push(String(url));
+      if (String(url).indexOf("ipinfo.io") >= 0) {
+        return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ ip: "198.51.100.5" }) });
+    };
+    const r2 = await env.sandbox.fetchExit();
+    t("C-3-d 主端点失败时尝试备用端点", urls.length === 2, JSON.stringify(urls));
+    t("C-3-e 备用端点结果可用", r2.ok === true && r2.ip === "198.51.100.5", JSON.stringify(r2));
+    t("C-3-f 备用端点缺失字段安全置空", r2.org === "" && r2.city === "", JSON.stringify(r2));
+    // 场景 3：全部端点 schema 不符（缺有效 ip）→ 如实失败，不产出伪造的「成功」
+    env.sandbox.fetch = function () {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ foo: "bar" }) });
+    };
+    const r3 = await env.sandbox.fetchExit();
+    t("C-3-g 全端点 schema 不符 → ok:false", r3.ok === false, JSON.stringify(r3));
+    t("C-3-h 失败信息说明 schema 问题", (r3.error || "").indexOf("ip") >= 0, r3.error);
+    // 场景 4（M-2）：超时（AbortError）→ 如实报超时且不重试备用端点
+    urls.length = 0;
+    env.sandbox.fetch = function (url, init) {
+      urls.push(String(url));
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve({ ok: true, json: () => Promise.resolve({ ip: "1.2.3.4" }) }), 5000);
+        if (init && init.signal) {
+          init.signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            const e = new Error("aborted");
+            e.name = "AbortError";
+            reject(e);
+          });
+        }
+      });
+    };
+    const t0 = Date.now();
+    const r4 = await env.sandbox.fetchExit(1100);
+    const dt = Date.now() - t0;
+    t("M-2-a 超时不重试备用端点（只发一次请求）", urls.length === 1, JSON.stringify(urls));
+    t("M-2-b 超时结果 ok:false 且说明超时", r4.ok === false && (r4.error || "").indexOf("超时") >= 0,
+      JSON.stringify(r4));
+    t("M-2-c 超时语义保留（按时返回，不放大到端点数倍）", dt < 2500, "耗时 " + dt + "ms");
+    // 场景 5：对比窗口直连取样锁定单端点（G5 暴露窗口不被备用端点放大）
+    urls.length = 0;
+    env.sandbox.fetch = function (url) {
+      urls.push(String(url));
+      return Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) });
+    };
+    const r5 = await env.sandbox.fetchExit(S2.COMPARE_EXIT_TIMEOUT_MS, 1);
+    t("C-3-i 直连取样 maxEndpoints=1 时失败不重试", urls.length === 1, JSON.stringify(urls));
+    t("C-3-j 取样失败如实返回", r5.ok === false, JSON.stringify(r5));
+  }
+
+  console.log("");
+  console.log("== M-5：session 状态写入失败的重试与 local 降级标记 ==");
+  {
+    const env = buildEnv({ fetchDelay: 20 });
+    await sleep(60);
+    await drain(env);
+    // 冷启动已成功写入 direct。现在注入连续 2 次 session 写失败（首次 + 重试）。
+    env.setSessionFail(2);
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "51515" }));
+    await drain(env);
+    await sleep(400);         // 重试在 250ms 后
+    const mark = env.localStore.stateWriteFailed;
+    t("M-5-a 双重失败后经 local 下发 stateWriteFailed 标记",
+      !!mark && mark.key === "lastState", JSON.stringify(mark));
+    t("M-5-b 标记带失败信息", typeof (mark || {}).message === "string" && mark.message.length > 0,
+      JSON.stringify(mark));
+    t("M-5-c session 中的状态保持过期结论（未被伪造为已更新）",
+      (env.sessionStore.lastState || {}).status === "direct",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState));
+    // 恢复：写入成功 → 标记必须被清除
+    env.setSessionFail(0);
+    await setSync(env, Object.assign({}, BASE, { proxyPort: "51516" }));
+    await drain(env);
+    await sleep(400);
+    t("M-5-d 恢复成功后 local 标记被清除", env.localStore.stateWriteFailed === undefined,
+      JSON.stringify(env.localStore.stateWriteFailed));
+    t("M-5-e session 状态如实更新为 applied", (env.sessionStore.lastState || {}).status === "applied",
+      "lastState=" + JSON.stringify(env.sessionStore.lastState));
   }
 
   console.log("");

@@ -106,6 +106,27 @@ REGRESS.forEach(function (c) {
   t("R7-07-3 既有拒绝项文案不变：" + JSON.stringify(c[0]), errs.indexOf(c[1]) >= 0, JSON.stringify(errs));
 });
 
+console.log("== M-6：保存前校验收紧 —— Chrome 必拒写法提前拦截 ==");
+// 此前 example.com:8080:90（多冒号）、user:pass@host、host:abc、a,b.com 都能通过
+// 保存前校验，错误被推迟到 set 阶段并归因为「代理异常」，误导排障方向。
+const M6_REJECT = ["example.com:8080:90", "user:pass@host", "host:abc", "a,b.com"];
+M6_REJECT.forEach(function (h) {
+  const errs = S.validateSettings(Object.assign({}, ok, { proxyHost: h }));
+  t("M-6 拒绝：" + h, errs.length > 0, JSON.stringify(errs));
+});
+// 防误伤：合法写法（全部 IPv6 形态与下划线主机名）必须零错误
+const M6_ALLOW = ["::1", "fe80::1", "[::1]", "2001:db8::1", "proxy.example.com", "my_server.local"];
+M6_ALLOW.forEach(function (h) {
+  const errs = S.validateSettings(Object.assign({}, ok, { proxyHost: h }));
+  t("M-6 防误伤：" + h, errs.length === 0, JSON.stringify(errs));
+});
+
+console.log("== C-3：出口检测端点容错配置 ==");
+t("TEST_ENDPOINTS 为多端点数组（≥2）",
+  Array.isArray(S.TEST_ENDPOINTS) && S.TEST_ENDPOINTS.length >= 2, JSON.stringify(S.TEST_ENDPOINTS));
+t("TEST_ENDPOINT 保留为主端点（首个）",
+  S.TEST_ENDPOINTS[0] === S.TEST_ENDPOINT, String(S.TEST_ENDPOINTS[0]));
+
 console.log("== 容量估算 ==");
 t("估算值为正", S.estimateBytes({ bypassList: "abc" }) > 0);
 t("超 8192 可被识别", S.estimateBytes({ bypassList: "x".repeat(9000) }) > S.MAX_SYNC_BYTES_PER_ITEM);

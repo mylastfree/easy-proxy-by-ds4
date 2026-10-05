@@ -2,6 +2,30 @@
 
 本文件记录本扩展的所有重要变更。
 
+## [2.9.0] - 2026-10-05
+
+关闭第二轮生产上线前审计的全部「严重」与「一般」问题：3 项严重（C-1 / C-2 / C-3）、6 项一般（M-1 – M-6）。新增可观察契约（`storage.local` 新键 `stateWriteFailed`、direct 状态新增 `legacyClearFailed` 字段、出口检测新增备用端点 `TEST_ENDPOINTS`），按仓库惯例升 minor。测试从 616 项断言扩至 **683 项**，变异门禁从 19 项扩至 **23 项**。
+
+### 修复（严重）
+
+- **C-1（P0）禁用路径不清理旧版遗留代理作用域**：`LEGACY_SCOPES`（`regular_only` / `incognito_persistent` / `incognito_session_only`）此前只在启用分支清理；老版本升级而来的安装若在遗留作用域上残留代理配置，关闭开关后仅清除 `regular` 就无条件写 `status:"direct"` —— 隐身（或受限）流量仍在走代理，界面却宣称直连，与「状态≠事实」缺陷族同型。修复：未启用分支同样遍历清理遗留作用域（尽力而为）；清理失败时状态仍如实为 `direct`（`regular` 已确证清干净），但必须附上说明（"隐身窗口……可能仍走旧代理"）并带 `legacyClearFailed` 字段留痕，绝不静默隐瞒残留。新增 9 项断言（含失败注入降级路径）并纳入变异门禁（M21）。
+- **C-2（P1）`onProxyError` 监听器零测试覆盖**：全部测试环境的 `chrome.proxy.onProxyError` 桩都是空 `addListener`，监听器从未被驱动 —— `fatal` 透传这一最重要的代理错误告警没有任何断言，也不在变异门禁中。修复：测试环境捕获并真实驱动该监听器（`fireProxyError`），覆盖 fatal / 非 fatal / 缺省字段三条路径（状态、`fatal` 标记、消息、`detail`、图标共 9 项断言），并新增变异 M20 证明护栏承重。
+- **C-3（P1）出口检测单点依赖 `ipinfo.io`**：无备用端点、无响应 schema 校验 —— 端点不可用时出口检测整体失效（可用性单点），端点返回异常结构时会产出 `{ok:true, ip:''}` 的伪造「成功」（信任单点）。修复：①端点改为有序列表 `TEST_ENDPOINTS`（主端点 `ipinfo.io` 不变，备用 `ipapi.co` / `api.ipify.org`，均支持 CORS、始终无需 host 权限），主端点 HTTP 错误 / schema 不符 / 网络拒绝时依次重试；②新增 `normalizeExitPayload` schema 校验（`ip` 必须为非空白、≤45 字符的字符串，其余字段安全置空），不合格响应按端点失败处理；③超时（AbortError）不重试备用端点，对比窗口直连取样额外锁定单端点（`maxEndpoints=1`）—— G5 的「代理已清除」暴露窗口硬上限不被容错机制放大。新增 15 项断言（含超时语义，补上 M-2 的零覆盖）。
+
+### 修复（一般）
+
+- **M-1（P1）popup 的 `storage.onChanged → load()` 整体重绘覆盖用户正在输入的内容**：后台自愈写 `sync.bypassList=''` 或多设备同步都会触发全量 `renderForm`，焦点字段中未保存的输入凭空消失。修复：`renderForm` 增加焦点保护 —— 焦点所在的可编辑字段（开关 / 类型 / 地址 / 端口 / 绕过列表）保持用户输入，其余字段照常刷新；失焦后恢复全量刷新，「界面与存储一致」语义不变。新增 5 项断言并纳入变异门禁（M22）。
+- **M-2（P2）出口检测超时 / AbortError 分支零覆盖**：随 C-3 的 fetchExit 重构补齐 —— 超时如实报「请求超时（N 秒）」、不重试备用端点、按时返回不放大等待（3 项断言）。
+- **M-3（P2）`onStartup` 监听器从未被驱动**：测试环境该桩为空，冷启动对齐路径零覆盖。修复：捕获并真实驱动 `onStartup`，断言按存储设置真实下发、状态判 `applied`、图标转绿（4 项断言）。
+- **M-4（P2）`escapeHtml` 零显式断言、无 XSS 回归用例**：补齐转义契约断言（尖括号 / `&` / 双引号 / `null` / 数字共 5 项）+ 端到端回归（恶意出口 IP 与代理配置字段经真实测试渲染路径注入，断言产物中无可执行原始标签，2 项）。
+- **M-5（P3）状态写入失败仅 console 留痕，前台无感知**：`session.set` 失败会让 popup 长期停留在过期结论上而用户毫无察觉。修复三级处置：①失败后有界重试一次（250ms，绝不在上报路径上无限等待）；②重试仍失败则把失败事实写入 `storage.local` 新键 `stateWriteFailed`（独立于 session 的存储区），popup 的 `local.onChanged` 捕获后显示「状态记录写入失败：当前显示的代理状态可能过期」警示；③任一次写入成功即清除标记。后台新增 5 项断言（含故障注入与恢复清除），popup 侧 3 项（警示呈现与防误报）。
+- **M-6（P2）`looksLikeHostPort` 放行 Chrome 必拒写法**：`example.com:8080:90`（多冒号）、`user:pass@host`、`host:abc`、`a,b.com` 均能通过保存前校验，错误被推迟到 set 阶段并归因为「代理异常」，误导排障方向。修复：`validateSettings` 新增三层拦截 —— `@` 字符拒绝（提示在代理软件侧配置认证）、host 合法字符白名单（字母 / 数字 / 点 / 连字符 / 下划线，IPv6 额外允许冒号与方括号）、含冒号 host 必须整体形如 IPv6 字面量（仅 `[0-9a-fA-F:.]`，允许 `[]` 包裹）。防误伤底线：全部 IPv6 形态（`::1` / `fe80::1` / `[::1]` / `2001:db8::1`）与下划线主机名零错误；全 hex 串（如 `beef:cafe`）无法与 IPv6 区分刻意放行，Chrome 在 set 阶段拒绝并如实报 error，不构成静默失效。新增 10 项断言并纳入变异门禁（M23）。
+
+### 文档
+
+- SECURITY.md：出口检测端点说明更新为多端点容错语义；补充 `storage.local` 新键 `stateWriteFailed` 的用途与生命周期。
+- README：测试断言数与变异门禁数同步（683 项 / 23 项）。
+
 ## [2.8.0] - 2026-10-05
 
 关闭生产上线前审计（基准 `7e5731c`）的全部问题：2 项严重（S1 / S2）、6 项一般（G1–G6）、6 项建议（A1–A6）。本版新增可观察契约（`chrome.storage.session` 新键 `pendingRestore`、状态子类型 `reason:"restore_interrupted"`、对比测试早退原因 `compareSkipped:"sampling_unstable"`、popup 状态条新档「无法与后台通信」、清单新增 `author` / `homepage_url`），按仓库惯例升 minor。公开发布准入的前置条件（S1 + S2 + 文档纠偏）在本版全部关闭。

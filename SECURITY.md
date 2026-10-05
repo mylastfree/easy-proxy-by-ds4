@@ -37,15 +37,23 @@
 
 ### 网络请求
 
-扩展唯一的对外请求发生在你主动点击「测试当前出口」或「对比直连出口」时，访问 `https://ipinfo.io/json` 以获取出口 IP。
+扩展唯一的对外请求发生在你主动点击「测试当前出口」或「对比直连出口」时，访问出口检测端点以获取出口 IP。
 
-- 这是**唯一**的第三方端点，代码中定义为 `TEST_ENDPOINT`（`settings.js`）。
-- 该端点返回 `Access-Control-Allow-Origin: *`，因此扩展无需 host 权限即可读取结果——这正是选择它的原因。
+- 端点在代码中定义为 `TEST_ENDPOINTS`（`settings.js`，自 2.9.0 起）：主端点 `https://ipinfo.io/json`，备用端点 `https://ipapi.co/json/` 与 `https://api.ipify.org?format=json`。仅当主端点失败（HTTP 错误 / 响应结构不符预期）时才按序尝试备用端点；请求超时不重试备用端点。
+- 所有端点都返回 `Access-Control-Allow-Origin: *`，因此扩展无需 host 权限即可读取结果——这正是选择它们的原因。
+- 响应必须通过 schema 校验（包含有效的 `ip` 字段）才被采信；端点返回异常结构时按失败处理并如实上报，不会产出伪造的检测结果。
 - 不点击测试按钮就**不会**发生任何对外请求。扩展没有自建服务器，不上报任何数据。
 
 ### 本地数据
 
 代理地址、端口与绕过列表保存在 `chrome.storage.sync`（若登录 Google 账号则随账号同步）；超长的绕过列表会降级到 `chrome.storage.local`。运行状态（最近错误、测试结果）保存在 `chrome.storage.session`，浏览器会话结束即清除。
+
+**`chrome.storage.local` 的状态键**（自 2.9.0 起）：
+
+| 键 | 内容 | 生命周期 |
+| --- | --- | --- |
+| `bypassList` | 超长绕过列表的降级副本（用户数据） | 用户保存时写入/清除 |
+| `stateWriteFailed` | session 状态写入失败的降级标记（`{at, key, message}`）：session 不可用时经 `local` 通知 popup 显示「状态可能过期」警示 | 任一次 session 写入成功即清除；仅含失败原因文本，不含代理配置 |
 
 **`chrome.storage.session` 的完整键清单**（自 2.8.0 起）：
 

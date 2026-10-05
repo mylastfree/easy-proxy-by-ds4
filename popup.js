@@ -1,5 +1,16 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.8.0]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.9.0]
 var S = window.EasyProxy;
+
+// 【M-1】用户可直接编辑的表单字段。storage 变化触发的表单重绘，
+//   绝不允许覆盖这些字段中【当前持有焦点】的那一个 —— 否则后台自愈
+//   （写 sync.bypassList=''）或多设备同步会让用户正在输入的内容凭空消失。
+var EDITABLE_IDS = ["enableProxy", "proxyType", "proxyHost", "proxyPort", "bypassList"];
+
+function activeEditableId() {
+  var ae = document.activeElement;
+  if (!ae || !ae.id) return null;
+  return EDITABLE_IDS.indexOf(ae.id) >= 0 ? ae.id : null;
+}
 
 var el = {
   enableProxy: document.getElementById("enableProxy"),
@@ -88,11 +99,15 @@ function readForm() {
 }
 
 function renderForm(settings) {
-  el.enableProxy.checked = settings.enableProxy;
-  el.proxyType.value = settings.proxyType;
-  el.proxyHost.value = settings.proxyHost;
-  el.proxyPort.value = settings.proxyPort;
-  el.bypassList.value = settings.bypassList;
+  // 【M-1】焦点保护：焦点所在的字段保持用户正在输入的值，其余字段照常刷新。
+  //   失焦后的存储变化仍然全量刷新（activeEditableId 返回 null），
+  //   「界面与存储一致」的既有语义不变。
+  var focusId = activeEditableId();
+  if (focusId !== "enableProxy") el.enableProxy.checked = settings.enableProxy;
+  if (focusId !== "proxyType") el.proxyType.value = settings.proxyType;
+  if (focusId !== "proxyHost") el.proxyHost.value = settings.proxyHost;
+  if (focusId !== "proxyPort") el.proxyPort.value = settings.proxyPort;
+  if (focusId !== "bypassList") el.bypassList.value = settings.bypassList;
 }
 
 function showHint(message, kind) {
@@ -654,6 +669,12 @@ el.testDirectButton.addEventListener("click", function () { runTest(true).catch(
 
 // 任一入口（含其它窗口 / 同步设备）改动存储，都刷新当前界面
 chrome.storage.onChanged.addListener(function (changes, areaName) {
+  // 【M-5】后台 session 状态写入失败（重试后仍失败）时会经 local 区下发
+  //   stateWriteFailed 标记：此时前台显示的状态可能已过期，必须如实告知用户，
+  //   而不是让界面停留在「看起来一切正常」的过期结论上。
+  if (areaName === "local" && changes && changes.stateWriteFailed) {
+    showHint("状态记录写入失败：当前显示的代理状态可能过期。可关闭并重新打开弹窗重试。", "warn");
+  }
   if (areaName === "sync" || areaName === "local") load();
   if (areaName === "session") refreshStatus();
 });

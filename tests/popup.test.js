@@ -1534,6 +1534,155 @@ function t(name, cond, extra) {
   }
 
   console.log("");
+  // ============================================================
+  // 【M-1 / M-5】专用表单环境：可捕获 popup 的 storage.onChanged 监听器、
+  //   可设置 document.activeElement（焦点保护依赖它）、可配置存储内容。
+  //   与上面 R7-08 / R8-01 段的分工：那两段覆盖「点击与读取失败」路径；
+  //   本段覆盖「存储变化驱动的表单重绘」路径（M-1 输入丢失）与
+  //   「后台状态写入失败标记」（M-5）。
+  //   ============================================================
+  function buildFormEnv(opts) {
+    opts = opts || {};
+    const els = {};
+    const getEl = id => (els[id] = els[id] || makeEl(id));
+    const syncStore = Object.assign({}, opts.syncStore || {});
+    const localStore = Object.assign({}, opts.localStore || {});
+    const storageListeners = [];
+    const sandbox = {
+      console: { log() {}, warn() {}, error() {} },
+      setTimeout, clearTimeout, Promise, Error, JSON, Object, Array,
+      String, Number, Boolean, Math, Date,
+      document: { getElementById: getEl, createElement: tag => makeEl("created:" + tag), activeElement: null },
+      chrome: {
+        runtime: {
+          lastError: undefined,
+          sendMessage(m, cb) { setTimeout(() => cb({ state: { status: "applied" }, test: null }), 0); }
+        },
+        storage: {
+          sync: {
+            get: (keys, cb) => {
+              const out = {};
+              (Array.isArray(keys) ? keys : Object.keys(keys || {})).forEach(k => { if (k in syncStore) out[k] = syncStore[k]; });
+              setTimeout(() => cb(out), 0);
+            },
+            set: (obj, cb) => { Object.assign(syncStore, obj); setTimeout(() => cb && cb(), 0); }
+          },
+          local: {
+            get: (keys, cb) => {
+              const out = {};
+              (Array.isArray(keys) ? keys : Object.keys(keys || {})).forEach(k => { if (k in localStore) out[k] = localStore[k]; });
+              setTimeout(() => cb(out), 0);
+            },
+            set: (obj, cb) => { Object.assign(localStore, obj); setTimeout(() => cb && cb(), 0); }
+          },
+          onChanged: { addListener: f => storageListeners.push(f) }
+        }
+      }
+    };
+    sandbox.self = sandbox;
+    sandbox.globalThis = sandbox;
+    sandbox.window = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(settingsSrc, sandbox);
+    vm.runInContext(popupSrc, sandbox);
+    return {
+      sandbox, els, syncStore, localStore, storageListeners,
+      fireStorageChange: (changes, area) => { for (const f of storageListeners.slice()) f(changes, area); },
+      ready: () => sleep(30),
+      settle: () => sleep(30)
+    };
+  }
+
+  console.log("== M-1：storage 变化触发的表单重绘不得覆盖正在编辑的字段 ==");
+  {
+    const env = buildFormEnv({ syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "10.0.0.1", proxyPort: "10808", bypassList: "stored.local" } });
+    await env.ready();
+    // 用户正在 bypassList 中输入（字段持有焦点），此时外部（后台自愈 / 多设备同步）改写存储
+    env.sandbox.document.activeElement = env.els.bypassList;
+    env.els.bypassList.value = "user-typing.internal";
+    env.syncStore.proxyHost = "10.0.0.2";
+    env.fireStorageChange({ proxyHost: { newValue: "10.0.0.2" }, bypassList: { newValue: "stored.local" } }, "sync");
+    await env.settle();
+    t("M-1-a 焦点字段的用户输入不被重绘覆盖",
+      env.els.bypassList.value === "user-typing.internal", env.els.bypassList.value);
+    t("M-1-b 非焦点字段照常刷新（界面与存储保持一致）",
+      env.els.proxyHost.value === "10.0.0.2", env.els.proxyHost.value);
+    // 失焦后（无焦点）→ 恢复全量刷新语义
+    env.sandbox.document.activeElement = null;
+    env.syncStore.bypassList = "stored-2.local";
+    env.fireStorageChange({ bypassList: { newValue: "stored-2.local" } }, "sync");
+    await env.settle();
+    t("M-1-c 失焦后恢复全量刷新", env.els.bypassList.value === "stored-2.local", env.els.bypassList.value);
+    // 焦点在另一个字段时，该字段同样受保护
+    env.sandbox.document.activeElement = env.els.proxyHost;
+    env.els.proxyHost.value = "typing-host";
+    env.fireStorageChange({ proxyHost: { newValue: "10.0.0.2" } }, "sync");
+    await env.settle();
+    t("M-1-d 焦点在 proxyHost 时其值不被覆盖",
+      env.els.proxyHost.value === "typing-host", env.els.proxyHost.value);
+    // 开关持有焦点时同样受保护（用户正在切换）
+    env.sandbox.document.activeElement = env.els.enableProxy;
+    env.els.enableProxy.checked = false;
+    env.fireStorageChange({ enableProxy: { newValue: true } }, "sync");
+    await env.settle();
+    t("M-1-e 焦点在开关上时不覆盖用户切换",
+      env.els.enableProxy.checked === false, String(env.els.enableProxy.checked));
+    env.sandbox.document.activeElement = null;
+  }
+
+  console.log("== M-5：后台状态写入失败标记必须呈现给用户 ==");
+  {
+    const env = buildFormEnv({});
+    await env.ready();
+    env.fireStorageChange({ stateWriteFailed: { newValue: { at: 1, key: "lastState", message: "quota exceeded" } } }, "local");
+    await env.settle();
+    t("M-5-f 写入失败时给出警示文案",
+      env.els.hint.textContent.indexOf("状态记录写入失败") >= 0, JSON.stringify(env.els.hint.textContent));
+    t("M-5-g 警示为 warn 档（可见且非错误档）",
+      env.els.hint.className.indexOf("warn") >= 0, env.els.hint.className);
+    // 防误报：普通 local 变化不得触发警示
+    const env2 = buildFormEnv({});
+    await env2.ready();
+    env2.fireStorageChange({ proxyPort: { newValue: "1" } }, "local");
+    await env2.settle();
+    t("M-5-h 普通存储变化不误报警示",
+      env2.els.hint.textContent.indexOf("状态记录写入失败") < 0, JSON.stringify(env2.els.hint.textContent));
+  }
+
+  console.log("== M-4：escapeHtml 转义契约与 XSS 回归 ==");
+  {
+    const env = buildFormEnv({});
+    await env.ready();
+    const eh = env.sandbox.escapeHtml;
+    t("M-4-a 尖括号被转义（标签注入失效）",
+      eh("<img src=x onerror=alert(1)>") === "&lt;img src=x onerror=alert(1)&gt;", eh("<img>"));
+    t("M-4-b & 被转义", eh("a&b") === "a&amp;b", eh("a&b"));
+    t("M-4-c 双引号被转义（属性注入失效）", eh('a"b') === "a&quot;b", eh('a"b'));
+    t("M-4-d null 安全兜底为空串", eh(null) === "", String(eh(null)));
+    t("M-4-e 数字输入转字符串", eh(5) === "5", String(eh(5)));
+    // 端到端：恶意出口/配置数据必须被转义后渲染，不得出现可执行的原始标签
+    const env2 = buildEnv();
+    await env2.ready();
+    env2.setSend({
+      resp: {
+        ok: true,
+        result: {
+          exit: { ok: true, ip: "<script>alert(1)</script>", org: "", city: "", region: "", country: "" },
+          settings: { enableProxy: true, proxyType: "socks5", proxyHost: "<b>x</b>", proxyPort: "1" },
+          activeMode: "fixed_servers"
+        }
+      }
+    });
+    env2.click("testButton");
+    await env2.settle();
+    const html = env2.els.testResult.innerHTML;
+    t("M-4-f 恶意出口数据被转义（无原始 <script>）",
+      html.indexOf("&lt;script&gt;") >= 0 && html.indexOf("<script>") < 0, html);
+    t("M-4-g 恶意代理配置字段被转义",
+      html.indexOf("&lt;b&gt;x&lt;/b&gt;") >= 0, html);
+  }
+
+  console.log("");
   // 【G1】文档一致性自检：README 声明的本套件断言数必须与实际通过数一致
 {
   const g1 = require("./g1-consistency.js").g1ConsistencyCheck("tests/popup.test.js", pass);

@@ -1,4 +1,4 @@
-// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.8.0]
+// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.9.0]
 // 刻意不依赖任何 chrome.* API，使 popup 与 Service Worker 可共用同一套逻辑。
 (function (root) {
   'use strict';
@@ -37,8 +37,21 @@
   var MAX_SYNC_BYTES_PER_ITEM = 8192;
 
   // 出口检测端点：必须支持 CORS，否则 popup 读取不到结果。
-  // ipinfo.io 返回 Access-Control-Allow-Origin: *，故无需申请任何 host 权限。
+  // 【C-3】此前单点依赖 ipinfo.io：该端点不可用（区域阻断 / 故障 / 政策变更）时
+  //   出口检测整体失效，用户会得到「出口检测失败」却无从判断是代理问题还是检测端点问题。
+  //   现改为【有序端点列表】：主端点失败（HTTP 错误 / 响应 schema 不符 / 网络拒绝）时
+  //   依次尝试备用端点；超时（AbortError）不重试备用端点 —— 同一网络环境下其它端点
+  //   大概率同样不可达，且对比窗口的直连取样对总时长有硬上限（G5），不允许把
+  //   「代理已清除」的暴露窗口放大 N 倍。各端点均返回 Access-Control-Allow-Origin: *，
+  //   因此始终无需申请任何 host 权限。
+  //   兼容性说明：TEST_ENDPOINT 保留为主端点（既有引用与文档语义不变），
+  //   fetchExit 的实际遍历顺序以 TEST_ENDPOINTS 为准。
   var TEST_ENDPOINT = 'https://ipinfo.io/json';
+  var TEST_ENDPOINTS = [
+    'https://ipinfo.io/json',
+    'https://ipapi.co/json/',
+    'https://api.ipify.org?format=json'
+  ];
   var TEST_TIMEOUT_MS = 12000;
   // 【G5】对比窗口内「取直连出口」的独立短超时。
   //   该请求发生在「代理已被清除（直连）」的区间内，超时越长 = 用户处于真实直连的
@@ -198,6 +211,40 @@
     return host;
   }
 
+  // 【M-6】host 合法字符白名单：字母、数字、点、连字符、下划线；
+  //   IPv6 字面量额外允许冒号与方括号（见 isIpV6Shape 的独立判定）。
+  //   此前 user:pass@host、a,b.com 这类 Chrome 必然拒绝的写法能通过保存前校验，
+  //   错误被推迟到 set 阶段并归因为「代理异常」，误导排障方向 —— 现在提前拦截。
+  function hasInvalidHostChar(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charAt(i);
+      if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          c === '.' || c === '-' || c === '_' || c === ':' || c === '[' || c === ']') {
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // 【M-6】含冒号的 host 必须整体形如 IPv6 字面量（仅 [0-9a-fA-F:.]，允许 [] 包裹）。
+  //   looksLikeHostPort 只识别「单冒号 + 全数字端口」，拦不住 example.com:8080:90
+  //   （两个冒号）与 host:abc（冒号后非数字）—— 这些写法此前一路漏到 set 阶段才失败。
+  //   注意「宁漏勿误伤」的边界：beef:cafe 这类全 hex 串无法与 IPv6 区分，会放行
+  //   （Chrome 在 set 阶段拒绝并如实报 error，不构成静默失效）。
+  function isIpV6Shape(host) {
+    var bare = stripBrackets(host);
+    for (var i = 0; i < bare.length; i++) {
+      var c = bare.charAt(i);
+      if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') ||
+          c === ':' || c === '.') {
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+
   function validateSettings(s) {
     var errors = [];
     if (!s.enableProxy) return errors;
@@ -212,6 +259,17 @@
       errors.push('端口请填在独立的端口输入框中');
     } else if (!isAsciiHost(s.proxyHost)) {
       errors.push('代理地址只能使用 ASCII 字符；中文等非 ASCII 域名请先转换为 Punycode（如 例子.中国 → xn--fsqu00a.xn--fiqs8s）再填写');
+    } else if (s.proxyHost.indexOf('@') >= 0) {
+      // 【M-6】Chrome 的代理 host 不支持 user:pass@host 形式（认证需在代理软件侧配置），
+      //   此前这类写法漏到 set 阶段才被拒绝并报「代理异常」。
+      errors.push('代理地址不能包含 @；如代理需要认证，请在代理软件中配置用户名密码');
+    } else if (hasInvalidHostChar(s.proxyHost)) {
+      // 【M-6】合法字符白名单：字母、数字、点、连字符、下划线（IPv6 另见下一条）。
+      errors.push('代理地址包含无效字符，只允许字母、数字、点、连字符（IPv6 可含冒号与方括号）');
+    } else if (s.proxyHost.indexOf(':') >= 0 && !isIpV6Shape(s.proxyHost)) {
+      // 【M-6】含冒号但不是 IPv6 字面量：example.com:8080:90、host:abc 等
+      //   Chrome 必拒写法在此拦截（注意必须放在 isAsciiHost 之后，且合法 IPv6 不得误伤）。
+      errors.push('代理地址含冒号时只能是 IPv6 地址字面量（如 ::1、fe80::1）；请检查是否误写了 host:port');
     }
 
     var portNum = Number(s.proxyPort);
@@ -284,6 +342,7 @@
     PROXY_TYPES: PROXY_TYPES,
     MAX_SYNC_BYTES_PER_ITEM: MAX_SYNC_BYTES_PER_ITEM,
     TEST_ENDPOINT: TEST_ENDPOINT,
+    TEST_ENDPOINTS: TEST_ENDPOINTS,
     TEST_TIMEOUT_MS: TEST_TIMEOUT_MS,
     COMPARE_EXIT_TIMEOUT_MS: COMPARE_EXIT_TIMEOUT_MS,
     normalizeSettings: normalizeSettings,

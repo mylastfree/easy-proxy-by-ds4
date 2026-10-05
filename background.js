@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.8.0]
+// background.js —— MV3 Service Worker  [v2.9.0]
 importScripts("settings.js");
 
 var S = self.EasyProxy;
@@ -67,22 +67,64 @@ function readBypassText() {
   });
 }
 
-// 【R9-05】写入失败必须留痕。此前一律用 void chrome.runtime.lastError 抑制，
+// 【R9-05 / M-5】写入失败必须留痕，且必须让用户【看见】。此前一律用
+//   void chrome.runtime.lastError 抑制（R9-05 只补了 console 留痕），
 //   而 session.set 失败会让前台长期停留在【过期结论】上（真实已经是 error，
-//   界面却还显示上一次的 applied），且没有任何日志可查。
-//   这里只补日志与降级说明，不改变写失败时的控制流（状态本来就没写成功）。
-function writeState(state) {
-  chrome.storage.session.set({ lastState: state }, function () {
-    var err = chrome.runtime.lastError;
-    if (err) console.warn("写入 lastState 失败，前台可能显示过期状态:", err.message);
+//   界面却还显示上一次的 applied），console 又只有扩展调试时才可见。
+//   【M-5】三级处置：
+//     1) 失败后做一次有界重试（250ms 后）—— session 写失败多为瞬时故障；
+//     2) 重试仍失败：把失败事实写入 storage.local 的 stateWriteFailed 标记 ——
+//        local 与 session 是独立存储区，session 不可用时 local 通常仍可用；
+//        popup 的 local.onChanged 监听会捕获该标记并向用户显示「状态可能过期」警示；
+//     3) 任一次写入成功：清除 local 标记（若有），警示随之解除。
+//   返回 { ok, retried?, error? } 供调用方观测（现有调用方均 fire-and-forget）。
+var STATE_WRITE_FAIL_KEY = "stateWriteFailed";
+
+function clearStateWriteFailMark() {
+  chrome.storage.local.get([STATE_WRITE_FAIL_KEY], function (items) {
+    if (chrome.runtime.lastError) return;   // 读不到标记 ≠ 没有标记；仅影响清除时机
+    if (items && items[STATE_WRITE_FAIL_KEY]) {
+      chrome.storage.local.remove([STATE_WRITE_FAIL_KEY], function () {
+        void chrome.runtime.lastError;
+      });
+    }
   });
 }
 
-function writeTest(result) {
-  chrome.storage.session.set({ lastTest: result }, function () {
-    var err = chrome.runtime.lastError;
-    if (err) console.warn("写入 lastTest 失败，前台可能显示过期测试结果:", err.message);
+function writeSessionValue(key, value, warnMsg) {
+  return new Promise(function (resolve) {
+    var pair = {};
+    pair[key] = value;
+    chrome.storage.session.set(pair, function () {
+      var err = chrome.runtime.lastError;
+      if (!err) { clearStateWriteFailMark(); resolve({ ok: true }); return; }
+      console.warn(warnMsg + ":", err.message);
+      // 一次有界重试：绝不能在状态上报路径上无限等待。
+      setTimeout(function () {
+        chrome.storage.session.set(pair, function () {
+          var err2 = chrome.runtime.lastError;
+          if (!err2) { clearStateWriteFailMark(); resolve({ ok: true, retried: true }); return; }
+          console.error(warnMsg + "（重试后仍失败）:", err2.message);
+          // 降级通道：把失败事实写到 local（独立于 session 的存储区），
+          // 由 popup 的 local.onChanged 呈现给用户。
+          var mark = {};
+          mark[STATE_WRITE_FAIL_KEY] = { at: Date.now(), key: key, message: err2.message };
+          chrome.storage.local.set(mark, function () {
+            void chrome.runtime.lastError;
+          });
+          resolve({ ok: false, error: err2.message });
+        });
+      }, 250);
+    });
   });
+}
+
+function writeState(state) {
+  return writeSessionValue("lastState", state, "写入 lastState 失败，前台可能显示过期状态");
+}
+
+function writeTest(result) {
+  return writeSessionValue("lastTest", result, "写入 lastTest 失败，前台可能显示过期测试结果");
 }
 
 /* ==================== 对比窗口恢复意图的持久化（S2） ==================== */
@@ -230,16 +272,32 @@ function updateIcon(status, reason) {
 
 /* ==================== 出口检测 ==================== */
 
-// 检测当前网络出口。端点支持 CORS，因此无需申请任何 host 权限。
-// 【G5】timeoutMs：可选的独立超时上限。全局默认 S.TEST_TIMEOUT_MS（12 秒）适用于
-//   「代理仍在生效」的普通出口检测；对比窗口内的直连取样必须传入
-//   S.COMPARE_EXIT_TIMEOUT_MS（4 秒）—— 那段时间代理已被清除、流量真实直连，
-//   超时越长 = 用户暴露在直连下的时间越长，也直接放大 S2 的暴露窗口。
-function fetchExit(timeoutMs) {
-  var limit = timeoutMs || S.TEST_TIMEOUT_MS;
+// 【C-3】出口检测响应的 schema 校验与归一化。
+//   此前直接信任 resp.json() 的形状（data.ip || '' 兜底），端点被劫持/改版返回
+//   缺 ip 或非对象 JSON 时会得到 {ok:true, ip:''} 的「成功」结果，误导测试结论。
+//   现在：ip 必须是非空白、长度合理（≤45，IPv6 最长 39 + 容差）的字符串，否则判为
+//   端点失败并触发备用端点。其余字段缺失时安全地置空串（备用端点如 ipify 只返回 ip）。
+function normalizeExitPayload(data) {
+  if (!data || typeof data !== 'object') return null;
+  var ip = typeof data.ip === 'string' ? data.ip.trim() : '';
+  if (!ip || ip.length > 45 || /\s/.test(ip)) return null;
+  function s(v) { return typeof v === 'string' ? v : ''; }
+  return {
+    ok: true,
+    ip: ip,
+    org: s(data.org),
+    city: s(data.city),
+    region: s(data.region),
+    country: s(data.country)
+  };
+}
+
+// 单端点请求 + 独立超时。失败不抛出，返回 { ok:true, ... } 或
+// { aborted:boolean, error:string }，由 fetchExit 决定是否换端点重试。
+function fetchOneExit(endpoint, limit) {
   var controller = new AbortController();
   var timer = setTimeout(function () { controller.abort(); }, limit);
-  var url = S.TEST_ENDPOINT + (S.TEST_ENDPOINT.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now();
+  var url = endpoint + (endpoint.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now();
 
   return fetch(url, { cache: "no-store", signal: controller.signal })
     .then(function (resp) {
@@ -247,22 +305,54 @@ function fetchExit(timeoutMs) {
       return resp.json();
     })
     .then(function (data) {
-      return {
-        ok: true,
-        ip: data.ip || '',
-        org: data.org || '',
-        city: data.city || '',
-        region: data.region || '',
-        country: data.country || ''
-      };
+      var norm = normalizeExitPayload(data);
+      if (!norm) throw new Error('端点响应不符合预期结构（缺少有效 ip 字段）');
+      return norm;
     })
     .catch(function (err) {
-      var msg = (err && err.name === 'AbortError')
-        ? '请求超时（' + Math.round(limit / 1000) + ' 秒）'
-        : ((err && err.message) || String(err));
-      return { ok: false, error: msg };
+      var aborted = !!(err && err.name === 'AbortError');
+      return {
+        aborted: aborted,
+        error: aborted
+          ? '请求超时（' + Math.round(limit / 1000) + ' 秒）'
+          : ((err && err.message) || String(err))
+      };
     })
     .finally(function () { clearTimeout(timer); });
+}
+
+// 检测当前网络出口。端点支持 CORS，因此无需申请任何 host 权限。
+// 【C-3】有序端点容错：主端点失败（HTTP 错误 / schema 不符 / 网络拒绝）时依次尝试
+//   S.TEST_ENDPOINTS 中的备用端点；全部失败时汇总各端点错误如实返回。
+//   【G5】timeoutMs：可选的独立超时上限（单端点）。全局默认 S.TEST_TIMEOUT_MS（12 秒）
+//   适用于「代理仍在生效」的普通出口检测；对比窗口内的直连取样必须传入
+//   S.COMPARE_EXIT_TIMEOUT_MS（4 秒）—— 那段时间代理已被清除、流量真实直连，
+//   超时越长 = 用户暴露在直连下的时间越长。同时对比窗口采样必须传 maxEndpoints=1：
+//   超时（AbortError）本来就不换端点，禁用备用端点进一步保证暴露窗口不被放大。
+function fetchExit(timeoutMs, maxEndpoints) {
+  var limit = timeoutMs || S.TEST_TIMEOUT_MS;
+  var endpoints = S.TEST_ENDPOINTS;
+  var tries = typeof maxEndpoints === 'number'
+    ? Math.max(1, Math.min(endpoints.length, maxEndpoints))
+    : endpoints.length;
+  var firstError = '';
+  var idx = 0;
+
+  function attempt() {
+    return fetchOneExit(endpoints[idx], limit).then(function (res) {
+      if (res && res.ok === true) return res;
+      var msg = (res && res.error) || '未知错误';
+      firstError = firstError ? (firstError + '；' + msg) : msg;
+      // 超时不换端点：同一网络环境下其它端点大概率同样不可达，
+      // 且对比窗口的直连取样对总时长有硬上限（G5），不允许放大暴露窗口。
+      if (res && res.aborted) return { ok: false, error: firstError };
+      idx++;
+      if (idx < tries) return attempt();
+      return { ok: false, error: firstError };
+    });
+  }
+
+  return attempt();
 }
 
 /* ==================== 主流程 ==================== */
@@ -362,9 +452,33 @@ async function applyProxyCore() {
       writeState({ status: "error", message: "清除代理设置失败：" + cmsg, at: Date.now() });
       return { ok: false, status: "error", errors: [cmsg] };
     }
+
+    // 【C-1】未启用分支同样必须清理旧版遗留作用域。
+    //   LEGACY_SCOPES 此前只在启用分支（下方第 3 步）清理；老版本升级而来的安装若在
+    //   incognito_persistent / regular_only 上残留代理配置，关闭开关后这里只清了
+    //   regular 就无条件写 status:"direct" —— 隐身（或受限）流量仍在走代理，
+    //   界面却宣称直连，与项目反复修复的「状态≠事实」缺陷族同型。
+    //   处置与启用分支保持同一基调：尽力清理（清理动作不影响 regular 已直连的事实），
+    //   失败【必须留痕并如实告知】—— 不能一边宣称 direct 一边隐瞒残留。
+    var legacyFailures = [];
+    for (var li = 0; li < LEGACY_SCOPES.length; li++) {
+      try {
+        await clearProxyScope(LEGACY_SCOPES[li]);
+      } catch (legacyErr2) {
+        legacyFailures.push(LEGACY_SCOPES[li]);
+        console.warn("禁用路径清理遗留作用域失败:", LEGACY_SCOPES[li], legacyErr2);
+      }
+    }
+
     updateIcon("direct");
-    writeState({ status: "direct", at: Date.now() });
-    return { ok: true, status: "direct" };
+    if (legacyFailures.length) {
+      var lfmsg = "已回到直连，但清理旧版遗留代理作用域失败（" + legacyFailures.join("、") +
+        "），隐身窗口或受限场景可能仍走旧代理，建议重启浏览器";
+      writeState({ status: "direct", message: lfmsg, legacyClearFailed: legacyFailures, at: Date.now() });
+    } else {
+      writeState({ status: "direct", at: Date.now() });
+    }
+    return { ok: true, status: "direct", legacyClearFailed: legacyFailures };
   }
 
   // 2) 校验：明确回报，不静默跳过
@@ -711,7 +825,9 @@ async function runCompareWindow(result) {
     }
     // 【G5】直连取样用独立短超时（4 秒）：这段区间代理已被清除、流量真实直连，
     //   不允许沿用 12 秒的全局上限把暴露窗口拉长一个数量级。
-    result.direct = await fetchExit(S.COMPARE_EXIT_TIMEOUT_MS);
+    //   【C-3】同时锁定单端点（maxEndpoints=1）：备用端点重试会把「已清除」区间的
+    //   总时长放大 N 倍，直连取样宁可如实失败也不能延长暴露。
+    result.direct = await fetchExit(S.COMPARE_EXIT_TIMEOUT_MS, 1);
 
     // 第二步：收尾复核控制权。
     //   白名单判定（R3-04）：只有确证"本扩展控制"或"当前无人控制（可被我方控制）"
