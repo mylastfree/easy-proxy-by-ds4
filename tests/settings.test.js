@@ -159,6 +159,18 @@ console.log("== 容量估算 ==");
 t("估算值为正", S.estimateBytes({ bypassList: "abc" }) > 0);
 t("超 8192 可被识别", S.estimateBytes({ bypassList: "x".repeat(9000) }) > S.MAX_SYNC_BYTES_PER_ITEM);
 t("默认绕过列表未超配额", S.estimateBytes({ bypassList: S.DEFAULTS.bypassList }) < S.MAX_SYNC_BYTES_PER_ITEM);
+// 【L-1·审计修复】estimateBytes 里有一个 catch 分支长期未被覆盖，审计据此判它
+//   「不可达的死代码」。它确实可达，也是有意为之的保守兜底（宁可判超限、不可漏放），
+//   只是此前没人喂过会让 JSON.stringify 抛错的输入。这里用循环引用把它钉住，
+//   使其从「不可达」变成「有契约的防御分支」：删掉 try/catch 后本行会直接抛错，
+//   测试文件以非 0 退出 —— 该分支从此有护栏。
+{
+  var circular = { bypassList: "x" };
+  circular.self = circular;
+  t("循环引用（JSON.stringify 必抛）时落到安全上界且自身不抛出",
+    S.estimateBytes(circular) === Number.MAX_SAFE_INTEGER,
+    String(S.estimateBytes(circular)));
+}
 
 
 console.log("");

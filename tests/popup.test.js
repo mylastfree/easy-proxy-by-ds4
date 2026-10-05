@@ -1316,7 +1316,8 @@ function t(name, cond, extra) {
     await env.settle(60);
     const stEnv = env.popupCtx.el.statusBar;
     t("C-前置：全新安装、后台还没写下任何状态时，界面显示的是「直连」兜底",
-      stEnv.textContent === "未启用代理（直连）",
+      // 【L-7】状态条自本轮起前置严重度符号（muted 档 = 「·」）；等式断言保持严格。
+      stEnv.textContent === "· 未启用代理（直连）",
       "状态条=" + JSON.stringify(stEnv.textContent));
 
     env.setSessionState({ lastState: { status: "applied", mode: "fixed_servers" } });
@@ -1326,8 +1327,8 @@ function t(name, cond, extra) {
       "状态条=" + JSON.stringify(stEnv.textContent));
     t("C-2 防回归：applied 档的样式类是 ok",
       stEnv.className === "status ok", "className=" + JSON.stringify(stEnv.className));
-    t("C-3 防回归：applied 的文案逐字符等于既有 STATUS_TEXT，未追加任何后缀",
-      stEnv.textContent === "代理已生效", "状态条=" + JSON.stringify(stEnv.textContent));
+    t("C-3 防回归：applied 的文案逐字符等于「严重度符号 + STATUS_TEXT 原文」，未追加任何其它后缀",
+      stEnv.textContent === "✓ 代理已生效", "状态条=" + JSON.stringify(stEnv.textContent));
   }
 
   console.log("");
@@ -1357,7 +1358,7 @@ function t(name, cond, extra) {
       env.sessionStore.lastState === undefined && env.sessionStore.lastTest === undefined,
       "sessionStore=" + JSON.stringify(env.sessionStore));
     t("D-1 关键：读取正常但确实没有状态时，显示「未启用代理（直连）」（该行为必须保留）",
-      stEnv.textContent === "未启用代理（直连）",
+      stEnv.textContent === "· 未启用代理（直连）",
       "状态条=" + JSON.stringify(stEnv.textContent));
     t("D-2 关键：不得谎报成「状态未知 / 无法读取」",
       !/状态未知|无法读取/.test(stEnv.textContent),
@@ -2027,6 +2028,97 @@ function t(name, cond, extra) {
     t("L-08-h session 读取失败时 ok:false 且带 error（读不到 ≠ 没有）",
       failText.indexOf("\"ok\": false") >= 0 && failText.indexOf("\"error\":") >= 0,
       failText.slice(0, 220));
+  }
+
+  console.log("");
+  console.log("== L-5：出口检测结论的判定链必须逐分支可测（用户唯一看到的结论面）==");
+  {
+    // 【L-5·审计修复】这条判定链此前是 renderTest 内部的 90 行分支，只能通过
+    //   「点按钮 → 等异步 → 读 innerHTML」间接覆盖；覆盖率报告里
+    //   popup.js L255-307 与 L319-323 整段为空 —— 而历次修复（R6-01 / 第 4 条 /
+    //   第 6 条 / R7-02 / G4）的文案全部落在这里。M-2 把它抽成纯函数后，
+    //   每个分支都可以被直接断言，不必再依赖任何异步时序。
+    const env = buildEnv();
+    await env.ready();
+    const classify = env.sandbox.classifyTestResult;
+    t("classifyTestResult 已抽出为可单测的纯函数（M-2 抽取的可验证性前提）",
+      typeof classify === "function", typeof classify);
+
+    const OK_EXIT = { ok: true, ip: "203.0.113.9" };
+    // [ 用例名, 输入, 期望 kind, verdict 必含子串 ]
+    const rows = [
+      ["并发互斥拒绝 → 提示（不是「检测失败」）",
+        { ok: false, skipped: true, message: "已有测试在进行中，请稍候再试。" }, "warn", "已有测试在进行中"],
+      ["真正的失败 → 如实报错",
+        { ok: false, message: "后台炸了" }, "error", "后台炸了"],
+      ["恢复原配置失败 → 报错",
+        { ok: true, restoreFailed: true }, "error", "恢复原代理配置失败"],
+      ["收尾被外部接管 → 放弃写回（第 6 条）",
+        { ok: true, overriddenDuringRestore: "controlled_by_other_extensions" }, "warn", "被外部接管"],
+      ["测试期间被外部接管 → 放弃写回",
+        { ok: true, overriddenDuringTest: "controlled_by_other_extensions" }, "warn", "被外部接管"],
+      ["清除代理失败 → 直连基准不可信",
+        { ok: true, directClearFailed: "clear boom" }, "error", "不可信"],
+      ["控制权未知 → 跳过对比", { ok: true, compareSkipped: "unknown_control" }, "warn", "无法确认当前代理控制权"],
+      ["清除前控制权已变更 → 放弃对比",
+        { ok: true, compareSkipped: "control_changed_before_clear" }, "warn", "清除前代理控制权已变更"],
+      ["未由本扩展控制 → 不干扰外部接管方",
+        { ok: true, compareSkipped: "not_controlled_by_this_extension" }, "warn", "不由本扩展控制"],
+      ["配置无效 → 未改动现有代理（R7-02）",
+        { ok: true, compareSkipped: "invalid_settings", compareSkippedReason: "端口缺失" }, "warn", "未改动现有代理"],
+      ["生效的不是本扩展下发的配置 → 跳过",
+        { ok: true, compareSkipped: "not_fixed_servers" }, "warn", "不是本扩展下发的配置"],
+      ["无法确认生效模式 → 跳过",
+        { ok: true, compareSkipped: "unknown_active_mode" }, "warn", "无法确认当前实际生效"],
+      ["取样期间配置变化 → 基准不可信（G4）",
+        { ok: true, compareSkipped: "sampling_unstable" }, "warn", "不可信"],
+      ["出口检测本身失败 → 报错",
+        { ok: true, exit: { ok: false } }, "error", "出口检测失败"],
+      ["出口不同且恢复成功 → 确证生效",
+        { ok: true, exit: OK_EXIT, direct: { ok: true }, ipChanged: true, restoreFailed: false }, "ok", "代理确实生效"],
+      ["对比期间控制权变更 → 保留接管结论",
+        { ok: true, exit: OK_EXIT, direct: { ok: true }, ipChanged: false, stateSuperseded: true },
+        "warn", "保留接管结论"],
+      ["出口相同但配置仍在 → 未回退直连（R6-01）",
+        { ok: true, exit: OK_EXIT, direct: { ok: true }, ipChanged: false, activeMode: "fixed_servers" },
+        "warn", "并未回退直连"],
+      ["出口相同且配置不在 → 代理很可能未生效",
+        { ok: true, exit: OK_EXIT, direct: { ok: true }, ipChanged: false, activeMode: "system" },
+        "error", "代理很可能未生效"],
+      ["未启用代理 → 结果即直连出口",
+        { ok: true, exit: OK_EXIT, settings: { enableProxy: false } }, "warn", "当前未启用代理"],
+      ["已启用但未对比 → 引导做对比",
+        { ok: true, exit: OK_EXIT, settings: { enableProxy: true } }, "warn", "可确认代理是否真的改变了出口"]
+    ];
+    for (const row of rows) {
+      const got = classify(row[1]);
+      t("L-5 " + row[0],
+        !!got && got.kind === row[2] && String(got.verdict).indexOf(row[3]) >= 0,
+        "kind=" + (got && got.kind) + " verdict=" + (got && got.verdict));
+    }
+  }
+
+  console.log("");
+  console.log("== L-7：状态呈现不得只靠颜色（色觉障碍 / 灰度下仍可分辨）==");
+  {
+    // 【L-7·审计修复】图标早已用字形区分（绿=代 / 红=直，见 README 图例），
+    //   但状态条此前【只靠 CSS 颜色类】表达严重度。这里把「每种严重度都带一个
+    //   一一对应的前置符号」钉住 —— 去掉符号（即退回单靠颜色）本组即变红。
+    const env = buildEnv();
+    await env.ready();
+    const cases = [
+      [{ status: "applied" }, "✓", "ok"],
+      [{ status: "overridden" }, "⚠", "warn"],
+      [{ status: "error" }, "✗", "error"],
+      [{ status: "direct" }, "·", "muted"]
+    ];
+    for (const c of cases) {
+      env.sandbox.renderStatus(c[0]);
+      const text = env.els.statusBar.textContent;
+      t("L-7 " + c[0].status + " 档带前置符号 " + c[1] + "（不只靠颜色）",
+        text.indexOf(c[1]) === 0 && env.els.statusBar.className === "status " + c[2],
+        "text=" + JSON.stringify(text) + " class=" + env.els.statusBar.className);
+    }
   }
 
   console.log("");

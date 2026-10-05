@@ -30,6 +30,9 @@ function buildEnv(opts) {
   const sessionStore = {};
   const listeners = { changed: [], installed: [], startup: [], message: [], onChange: [] };
   const applied = [];        // 按「完成时刻」记录真正写入浏览器的配置
+  const warns = [];          // 【L-4】记录 console.warn，用于断言「某个保守分支确实被走到」
+  const titles = [];         // 【L-7】记录 action.setTitle，用于断言图标标题与状态条同档
+  let proxySetCount = 0;     // 【L-3】已完成的 chrome.proxy.settings.set 次数（回读注入用）
   let proxyActive = false;   // 当前是否挂着代理（决定 fetch 返回哪个出口 IP）
   let fetchCount = 0;
   let proxyActiveAtDirectFetch = null;   // 「取直连出口」时刻的代理状态
@@ -37,6 +40,19 @@ function buildEnv(opts) {
   function makeArea(store, areaName) {
     return {
       get(keys, cb) {
+        // 【L-4】可控的读取失败注入：用于覆盖 background.js 两处「读不到 ≠ 没有」的
+        //   保守分支（存量污染自愈跳过本轮、待恢复对账仍照常下发）。
+        //   默认不注入 —— 既有用例的桩行为逐字节不变。
+        if (opts.storageGetError && opts.storageGetError(areaName, keys)) {
+          setTimeout(() => {
+            sandbox.chrome.runtime.lastError = { message: "simulated storage read failure (" + areaName + ")" };
+            cb(undefined);
+            // 与真实 Chrome 一致：lastError 只在本次回调期间可见，回调返回即清除
+            // （否则会污染后续无关的 storage 回调，让它们误判为失败）。
+            sandbox.chrome.runtime.lastError = undefined;
+          }, 0);
+          return;
+        }
         const out = {};
         const ks = Array.isArray(keys) ? keys : Object.keys(keys || {});
         for (const k of ks) if (k in store) out[k] = store[k];
@@ -70,7 +86,7 @@ function buildEnv(opts) {
   }
 
   const sandbox = {
-    console: { log() {}, warn() {}, error() {} },
+    console: { log() {}, warn(...a) { warns.push(a.map(String).join(" ")); }, error() {} },
     TextEncoder, setTimeout, clearTimeout, Date, Promise, Object, Array, JSON,
     Number, String, Math, Boolean, Error, AbortController
   };
@@ -131,6 +147,7 @@ function buildEnv(opts) {
     proxy: {
       settings: {
         set(o, cb) {
+          proxySetCount++;
           const sp = (o.value.rules || {}).singleProxy || {};
           const label = sp.scheme + " " + sp.host + ":" + sp.port;
           const delay = (Number(sp.port) === slowPort) ? slowMs : 0;
@@ -149,10 +166,30 @@ function buildEnv(opts) {
           }, 0);
         },
         get(o, cb) {
-          setTimeout(() => cb({
-            value: proxyActive ? { mode: "fixed_servers" } : { mode: "system" },
-            levelOfControl: "controlled_by_this_extension"
-          }), 0);
+          setTimeout(() => {
+            // 【L-3】可控的代理回读注入：覆盖 applyProxyCore 的三条失败分支
+            //   （回读失败 / 回读缺 levelOfControl / 被外部接管）。
+            //   回调收到 proxySetCount，便于按「是否已下发过」切换返回值，
+            //   而不依赖绝对调用序号（启动路径本身也会调用本接口）。
+            //   返回 null 表示模拟 lastError → readProxyDetails 解析为 null。
+            if (typeof opts.proxyGet === "function") {
+              const payload = opts.proxyGet(proxySetCount);
+              if (payload === null) {
+                sandbox.chrome.runtime.lastError = { message: "simulated proxy read failure" };
+                cb(undefined);
+                // 同 storage 桩：lastError 只在本次回调期间可见
+                sandbox.chrome.runtime.lastError = undefined;
+                return;
+              }
+              sandbox.chrome.runtime.lastError = undefined;
+              cb(payload);
+              return;
+            }
+            cb({
+              value: proxyActive ? { mode: "fixed_servers" } : { mode: "system" },
+              levelOfControl: "controlled_by_this_extension"
+            });
+          }, 0);
         },
         // R6-04：background.js 会注册 chrome.proxy.settings.onChange；
         //   缺少该桩会让脚本一加载就抛 TypeError，整套用例连锁失败。
@@ -162,7 +199,8 @@ function buildEnv(opts) {
     },
     action: {
       setIcon: (o, cb) => setTimeout(() => cb && cb(), 0),
-      setTitle: (o, cb) => setTimeout(() => cb && cb(), 0)
+      // 【L-7】记录标题：用于断言图标档位与状态条同档（含 M-1 的直连三档）。
+      setTitle: (o, cb) => { titles.push(o); setTimeout(() => cb && cb(), 0); }
     }
   };
 
@@ -170,11 +208,26 @@ function buildEnv(opts) {
   vm.runInContext(bgSrc, sandbox, { filename: path.join(__dirname, '..', 'background.js') });
 
   return { sandbox, syncStore, localStore, sessionStore, applied, listeners,
+           warns, titles,
            getProxyActive: () => proxyActive,
            getProxyActiveAtDirectFetch: () => proxyActiveAtDirectFetch };
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// 【L-3/L-4·测试加固】等待「完成信号」而不是固定 sleep。
+//   固定等待在负载下会假红：CI 三矩阵并发、本机同时跑覆盖率时，同样的 sleep 可能
+//   不够。本项目已有明确教训（popup 预算 150/240/260 ms vs 实测往返 166–270 ms，
+//   10 次采样出现 2 次假红）——因此新增用例一律用「轮询谓词」判定完成。
+//   超时后仍返回最终谓词结果，失败时由断言给出真实观测值，不静默放行。
+async function waitFor(pred, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 5000);
+  for (;;) {
+    if (pred()) return true;
+    if (Date.now() >= deadline) return pred();
+    await sleep(5);
+  }
+}
 let pass = 0, fail = 0;
 function t(name, cond, extra) {
   if (cond) { pass++; console.log("  PASS  " + name); }
@@ -329,6 +382,89 @@ function t(name, cond, extra) {
       JSON.stringify(S.parseBypassList("192.168.0.0/16\uff0c10.0.0.0/8")) ===
         JSON.stringify(["192.168.0.0/16", "10.0.0.0/8"]),
       JSON.stringify(S.parseBypassList("192.168.0.0/16\uff0c10.0.0.0/8")));
+  }
+
+  console.log("");
+  console.log("== L-3：applyProxyCore 的三条失败分支必须有正向用例（R3-04 承重分支）==");
+  {
+    // 【L-3·审计修复】这三条分支是 R3-04「失败开放」修复的承重分支
+    //   （回读失败 / 回读缺 levelOfControl / 回读发现被外部接管）。
+    //   此前它们只有变异间接保证（M 系列），没有任何正向用例走过 ——
+    //   覆盖率报告里 background.js L693-717 整段为空。
+    //   这里用 proxyGet 注入：下发前（proxySetCount===0）返回正常回读，
+    //   下发后（>=1）返回三种异常形态之一，正好落在「第 5 步回读控制等级」。
+    const GOOD = { value: { mode: "system" }, levelOfControl: "controlled_by_this_extension" };
+    const ENABLED = { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1",
+                      proxyPort: "10808", bypassList: "x" };
+    const cases = [
+      { name: "回读失败（details 为 null）→ error，绝不宣称已生效",
+        post: null,
+        check: s => !!s && s.status === "error" &&
+          /无法回读代理设置/.test(s.message || "") && !s.levelOfControl },
+      { name: "回读缺少 levelOfControl → error（未知不等于已生效，失败开放已收口）",
+        post: { value: { mode: "fixed_servers" } },
+        check: s => !!s && s.status === "error" &&
+          /缺少 levelOfControl/.test(s.message || "") },
+      { name: "回读发现被外部接管 → overridden（不夺权、不宣称生效）",
+        post: { value: { mode: "fixed_servers" }, levelOfControl: "controlled_by_other_extensions" },
+        check: s => !!s && s.status === "overridden" &&
+          s.levelOfControl === "controlled_by_other_extensions" }
+    ];
+    for (const c of cases) {
+      const env = buildEnv({ proxyGet: n => (n === 0 ? GOOD : c.post) });
+      // 等冷启动下发跑到终态（默认未启用 → direct），而不是拍一个 sleep：
+      //   这保证下面的 sync.set 发生时 proxySetCount 仍为 0，回读注入的基准才成立。
+      await waitFor(() => env.sessionStore.lastState &&
+        env.sessionStore.lastState.status === "direct");
+      env.sandbox.chrome.storage.sync.set(ENABLED, () => {});
+      await waitFor(() => {
+        const s = env.sessionStore.lastState;
+        return !!s && s.status !== "direct";
+      });
+      t("L-3 " + c.name, c.check(env.sessionStore.lastState),
+        "lastState = " + JSON.stringify(env.sessionStore.lastState));
+    }
+  }
+
+  console.log("");
+  console.log("== L-4：两处「读不到即按保守路径继续」的分支必须有正向用例 ==");
+  {
+    // 【L-4·审计修复】background.js 有两处「读取失败 ≠ 没有」的保守分支，
+    //   此前同样零覆盖：
+    //     · reconcileLegacyBypass 的 sync 读失败 → 本轮自愈整个跳过（绝不写用户数据）；
+    //     · reconcilePendingRestore 的 session 读失败 → 如实留痕后【照常下发】。
+    //   两者的取舍方向刻意相反，因此必须分别钉住：一个「宁可不动」，一个「不能不动」。
+    {
+      // 只让【自愈那一次】sync 读取失败（SW 冷启动的第一个 sync 读就是它），
+      //   后续读取恢复正常 —— 这样既精确覆盖该分支，又能验证「失败不阻断
+      //   常规冷启动下发」，而不是把整条 sync 通道都打瘸（那会变成 read_failed）。
+      let syncGetCount = 0;
+      const env = buildEnv({
+        storageGetError: area => area === "sync" && (++syncGetCount === 1)
+      });
+      // 完成信号 = 下发跑到终态（而非固定 sleep —— 负载下固定等待会假红）。
+      await waitFor(() => env.sessionStore.lastState &&
+        env.sessionStore.lastState.status === "direct");
+      t("L-4 sync 读失败时自愈整个跳过：不写 sync（宁可晚一轮，也不动用户数据）",
+        !("bypassList" in env.syncStore), JSON.stringify(env.syncStore));
+      t("L-4 sync 读失败被如实留痕（console.warn 说明跳过原因）",
+        env.warns.some(w => /读取 sync 失败/.test(w)), JSON.stringify(env.warns.slice(0, 3)));
+      // 观察点是「下发跑到终态」而不是 applied：默认配置为未启用，禁用路径走的是
+      //   clearProxyScope（不进 applied），写下的终态是 direct。
+      t("L-4 sync 读失败不影响冷启动下发（仍跑到终态 direct）",
+        !!(env.sessionStore.lastState && env.sessionStore.lastState.status === "direct"),
+        JSON.stringify(env.sessionStore.lastState));
+    }
+    {
+      const env = buildEnv({ storageGetError: area => area === "session" });
+      await waitFor(() => env.warns.some(w => /读取恢复意图失败/.test(w)) &&
+        env.sessionStore.lastState && env.sessionStore.lastState.status === "direct");
+      t("L-4 session 读失败被如实留痕（读不到 ≠ 没有标记）",
+        env.warns.some(w => /读取恢复意图失败/.test(w)), JSON.stringify(env.warns.slice(0, 3)));
+      t("L-4 session 读失败时仍照常下发（绝不因对账失败而不下发）",
+        !!(env.sessionStore.lastState && env.sessionStore.lastState.status === "direct"),
+        JSON.stringify(env.sessionStore.lastState));
+    }
   }
 
   console.log("");

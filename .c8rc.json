@@ -1,7 +1,7 @@
 {
   "all": false,
-  "include": ["**/background.js", "**/settings.js", "**/popup.js"],
-  "exclude": ["**/node_modules/**", "**/tests/**", "**/tools/**"],
+  "include": ["**/background.js", "**/settings.js", "**/popup.js", "**/tools/package.js"],
+  "exclude": ["**/node_modules/**", "**/tests/**"],
   "reporter": ["text", "lcov"],
   "check-coverage": true,
   "lines": 85,

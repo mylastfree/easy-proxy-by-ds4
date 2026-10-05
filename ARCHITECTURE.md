@@ -73,7 +73,36 @@ readSettings/readBypassText ──失败──▶ error(reason:"read_failed")   
 
 | 护栏 | 文件 |
 | --- | --- |
-| 7 套功能测试（788 项断言，`tests/run-all.js` 统一入口，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
+| 7 套功能测试（839 项断言，`tests/run-all.js` 统一入口，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
+| 真实浏览器 E2E 冒烟（22 项断言，opt-in `npm run e2e`；Playwright 驱动真实 Chromium 加载**打包产物**，覆盖「启用 → applied」「禁用 → 未残留 + 回到基线」「外部接管 → overridden 且不夺权」三条主干。刻意与 `npm test` / CI 门禁解耦：需要可选依赖 `playwright-core` 与 Chromium 二进制，属于发布前人工门禁而非零依赖门禁） | `tests/e2e-smoke.js` + `tests/e2e/fixtures/interloper/` |
 | 变异门禁（34 项：每个修复点被故意破坏后护栏必须变红；S-1 加固后任何退出路径（含信号与未捕获异常）均幂等还原源文件，并以运行前后工作区快照比对判定污染；B-3 起改写源文件前落哨兵 `.mutation-in-progress`，`tools/package.js` 见到即拒绝打包 —— 例外仅在「显式 `selfCheck` + 目标位于系统临时目录」两条件同时满足时生效，发布 CLI 永不满足） | `tests/mutation-check.js` |
 | 文档一致性（断言数/变异数声明 vs 实际） | `tests/g1-consistency.js` + `tests/manifest.test.js` |
 | CI（lint → 7 套测试 → 变异 → 工作区洁净核验） | `.github/workflows/ci.yml` |
+
+## 7. 缺陷 / 修复编号索引（L-6）
+
+源码与测试里散布着形如 `【X-NN】` / `【XNN】` 的注释标注，用来把某段代码与「它是在修哪个缺陷」绑在一起。此前这些编号**没有集中登记**：`X` 是哪一族、到哪一号、有没有冲突，全靠人工记忆，跨文件引用无法机械定位。
+
+**编号规则（重要）**：编号是**分轮次（审计批次）作用域的，不跨轮唯一**。同一个符号在不同轮次完全可能指不同的缺陷 —— 例如 `M-1` 在 v2.10.0 一轮指「表单重绘丢失焦点」，在 v2.13.0 一轮指「缺 `.gitattributes` 导致产物不可复现」。因此：
+
+- 解读编号必须**连轮次一起读**；本仓库的约定是在标注里带 `·审计修复` / `·上线准入修复` 等来源后缀，本轮（v2.13.0 审计）修复统一使用 `·审计修复`。
+- **`M` 族与变异编号同符号但不同域**：`tests/mutation-check.js` 的变异体名叫 `M1`…`M34`（裸写，不带 `【】`），而 `【M-1】`…`【M-7】` 是审计「中」级缺陷编号。二者语义无关，勿混。
+
+编号族（机械校验用，勿删）：A · B · C · G · L · M · R · S · V · W
+
+| 族 | 含义 | 典型编号 | 主要出处 |
+| --- | --- | --- | --- |
+| **A** | 代码审计 / 整改条目（早期轮次） | A-1…A-6、A1…A6 | `background.js`、`popup.js`、`popup.html`、`ci.yml` |
+| **B** | 上线准入整改条目 | B-2…B-5 | `tools/package.js`、`tests/manifest.test.js`、`tests/mutation-check.js` |
+| **C** | 并发 / 契约（存储与所有权）整改条目 | C-1…C-3 | `settings.js`、`background.js` |
+| **G** | 门禁与文档一致性自检编号（G1 = 文档声明数自检） | G1…G6 | `tests/*.test.js`、`popup.js`、`background.js` |
+| **L** | 审计「低」级问题（含 `L-05` 与 `L-5` 两种写法并存） | L-01…L-12、L-1…L-8 | 全仓 |
+| **M** | 审计「中」级问题（**与变异编号 M1…M34 同名不同域**） | M-1…M-7 | 全仓 |
+| **R** | 各轮复审缺陷编号（数字即轮次：R6/R7/R8/R9） | R6-01…R9-05 | `background.js`、`popup.js` |
+| **S** | 场景 / 步骤编号（S1 存量编辑形态、S2 冷启动对账） | S1、S2、S-1、S-2 | `background.js`、`tests/*.test.js` |
+| **V** | 验证 / 变异构造编号 | V-01…V-05 | `popup.js`、`tests/*.test.js` |
+| **W** | 警示 / 待办编号 | W-01…W-03 | `popup.js`、`tests/popup.test.js` |
+
+**已知的历史遗留（如实记录，不假装整洁）**：① 序号 0 填充不一致（`L-05` 与 `L-5` 并存）；② 族内序号存在跳号（如 L 族无 L-09/L-10 的 `L-1x` 标注）；③ 同一轮内不同族可能撞号。这些不影响可读性，但**新增标注请务必带来源后缀**，并优先复用既有族。
+
+> `tests/manifest.test.js` 会解析上面那行「编号族（机械校验用，勿删）」并与全仓实际出现的族比对：新增一个族却忘了登记，CI 即变红。

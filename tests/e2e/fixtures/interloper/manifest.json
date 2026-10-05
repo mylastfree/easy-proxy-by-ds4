@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Easy Proxy E2E Interloper",
+  "version": "1.0.0",
+  "description": "E2E 冒烟专用夹具：模拟「其它扩展接管 chrome.proxy」的外部接管场景。不参与产品打包。",
+  "permissions": ["proxy"],
+  "background": {
+    "service_worker": "sw.js"
+  }
+}

@@ -40,14 +40,19 @@ jobs:
 
     steps:
       # 【A2】Actions 固定到 commit SHA（供应链最小信任）：
-      #   checkout@v4.2.2 = 11bd71901bbe5b1630ceea73d27597364c9af683
-      #   setup-node@v4.4.0 = 49933ea5288caeca8642d1e84afbd3f7d6820020
+      #   checkout@v7.0.1 = 3d3c42e5aac5ba805825da76410c181273ba90b1
+      #   setup-node@v7.0.0 = 820762786026740c76f36085b0efc47a31fe5020
       #   可变标签可能被上游劫持后指向任意代码；SHA 不可变，升级交给 dependabot。
+      # 【L-8·审计修复】两个 action 由 v4 系一次性升到 v7 系（跨大版本长期挂起）——
+      #   刻意不通过合并 dependabot 的跨版本 PR 完成，而是按 audit 建议单独核实后手改：
+      #   · 升级前先确认本仓库用到的输入（node-version、cache）在 v7 中仍受支持；
+      #   · 仍固定到 release tag 对应的 commit SHA，注释同步写成实际 tag，
+      #     避免出现「注释写 v4.2.2、SHA 已是 v7」这种名实不符。
       - name: 检出代码
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 设置 Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
           # 【A6·审计修复】缓存 npm 的下载目录，避免三个矩阵节点各自重下依赖。
@@ -56,10 +61,13 @@ jobs:
           cache: npm
 
       # 【A1】静态 lint 作为 CI 的首个失败点（核心规则：no-undef / no-unused-vars 等；
-      #   本仓库曾靠它抓到一处真实的块级作用域逃逸）。devDependencies 仅含 eslint 与
-      #   c8（覆盖率），运行时依旧零依赖。
+      #   本仓库曾靠它抓到一处真实的块级作用域逃逸）。devDependencies 只含开发工具
+      #   （eslint 静态检查、c8 覆盖率、playwright-core 供 opt-in 的 E2E），运行时依旧零依赖。
       # 【M-5·审计修复】npm install → npm ci：严格按 package-lock 安装，
       #   与「可复现」声明一致；lockfile 不同步时直接失败而不是静默解析新版本。
+      # 【M-3·审计修复】本 job 刻意【不】运行 `npm run e2e`：真实浏览器冒烟需要
+      #   Chromium 二进制与图形/进程环境，属发布前人工门禁。CI 只做「零依赖 + 环境无关」
+      #   的部分，保证同一提交在任何 runner 上结论一致。
       - name: Lint（ESLint）
         run: |
           npm ci --no-fund --no-audit

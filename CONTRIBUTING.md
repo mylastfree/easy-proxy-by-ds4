@@ -2,7 +2,7 @@
 
 ## 基本约定
 
-- **运行时零依赖、零构建**：源码保持纯 JavaScript（MV3），不引入框架或打包工具。devDependencies 只允许开发工具（当前：ESLint 静态检查、c8 覆盖率）。
+- **运行时零依赖、零构建**：源码保持纯 JavaScript（MV3），不引入框架或打包工具。devDependencies 只允许开发工具（当前：ESLint 静态检查、c8 覆盖率、playwright-core 供 opt-in 的真实浏览器 E2E。**注意**：`playwright-core` 只被 `tests/e2e-smoke.js` 使用，不进 `npm test`、不进 CI 门禁，因此不影响「测试零依赖」这条约束本身）。
 - **单一实现原则**：业务判据与取值规则只允许在 `settings.js` 存在一份实现，popup 与 background 共用。发现第二份内联实现 = 缺陷。
 - **「读不到 ≠ 没有」**：任何 `chrome.storage` / `chrome.proxy.settings.get` 读取失败都必须显式分支上报，绝不归一成默认值继续走写路径。
 - **绝不写 `local` 的唯一副本**：自动逻辑不得触碰 `storage.local.bypassList`；清空只能发生在用户明确知情并确认的操作里。
@@ -24,18 +24,21 @@
    - 评估是否需要新增变异项（`tests/mutation-check.js`）证明该断言承重。
 2. **改测试必须同步 README**：每个测试文件结尾有 G1 运行期自检，README 表格中声明的断言数与实际通过数不一致时 CI 直接变红；合计与变异数由 `tests/manifest.test.js` 把守。
 3. **改 storage.session 键集必须同步 SECURITY.md** 的键清单表格。
+4. **改了「下发 / 回读 / 控制权」相关行为要过一遍 E2E**：`npm run e2e` 是唯一在真实 Chromium 里验证 `chrome.proxy.settings` 语义的护栏。新增一条主干（例如新的控制权取值、新的禁用态模式）时，同步在 `tests/e2e-smoke.js` 补一条流程；只改内部结构（拆函数、改注释）则不需要——E2E 断言的是**可观察行为**，不是实现形状。
+   - E2E 的断言数**不进** README 表格与合计（G1 只把守七套零依赖套件），因此无需同步 `manifest.test.js` 的数值守卫。
 
 ## 提交前自检
 
 ```powershell
 npm run lint        # ESLint（CI 首个失败点）
-npm test            # 七套功能测试（788 项断言，tests/run-all.js 统一入口）
+npm test            # 七套功能测试（839 项断言，tests/run-all.js 统一入口）
 npm run coverage    # 可选：c8 覆盖率报告
 npm run mutation    # 变异门禁（34 项，本机约 36 分钟）
 npm run package     # 可选：验证打包清单
+npm run e2e         # 发布前必跑：真实浏览器冒烟（opt-in，22 项；退出码 2 = 环境未就绪，不计失败）
 ```
 
-发布前另须完成 `docs/E2E-SMOKE.md` 的真实浏览器冒烟清单。
+发布前另须完成 `docs/E2E-SMOKE.md` 的**人工**冒烟残余项——`npm run e2e` 已把其中三条主干（启用 / 禁用 / 外部接管的状态回读与控制权归属）脚本化，但真实代理链路连通性、安装升级路径、隐身窗口与存储配额仍只有人工清单能兜底。
 
 全部通过且 `git status --porcelain` 为空后再提交（变异脚本会临时改写源文件，CI 会核验工作区洁净）。
 

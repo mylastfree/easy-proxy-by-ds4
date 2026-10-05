@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.13.0]
+// background.js —— MV3 Service Worker  [v2.14.0]
 // 【L-06·审计修复】补上全局严格模式：本文件是 classic service worker（非 module），
 //   默认处于非严格模式，隐式全局赋值、静默失败的写入、`this` 装箱等都无法被
 //   静态规则拦住。settings.js 早已声明（在 IIFE 内），此处与 popup.js 补齐一致。
@@ -492,7 +492,24 @@ async function applyProxyCore() {
   }
 
   // 1) 未启用：清除常规作用域
+  //   【M-2·审计修复】「未启用」与「已启用」是两条完全独立的流程，各自抽到独立函数
+  //   （逐字搬移）。抽出的理由：合在一起使 applyProxyCore 达 263 行，两条分支的失败
+  //   语义与状态文案完全不同，却无法被独立定位测试；抽开后 applyProxyCore 退化为
+  //   「读配置 + 二选一」。
   if (!settings.enableProxy) {
+    return applyDisabledSettings(settings);
+  }
+  return applyEnabledSettings(settings);
+}
+
+// 【M-2·审计修复】applyProxyCore 的「未启用」分支（原步骤 1，逐字搬移）。
+//   这是「关闭开关」这条路径的全部处理：写前控制权确证 → 清除 regular →
+//   尽力清理旧版遗留作用域 → 回读实际模式 → 如实陈述（只有确证 direct 才说直连）。
+//   【缩进约定】函数体刻意保留 4 空格缩进：原语句位于 applyProxyCore 的 if 块内，
+//   提到 2 空格会让变异门禁的锚点（含缩进）失配；本仓库对「锚点即契约」的处置是
+//   保持原缩进（与 judgeApplyOutcome / windowFinalizeCommit 同款说明），
+//   而不是去改 tools/mutation-check.js。
+async function applyDisabledSettings(settings) {
     // 【M-1·审计修复】写前控制权确证（与下方启用分支 3.5 同一基调）：
     //   此前禁用分支不做任何控制权检查就 clearProxyScope("regular") 并宣称 direct。
     //   若此刻代理已被企业策略或其它扩展接管，这次 clear 要么无效、要么构成夺权式
@@ -596,6 +613,11 @@ async function applyProxyCore() {
     };
   }
 
+// 【M-2·审计修复】applyProxyCore 的「启用」路径（原步骤 2~5，逐字搬移）。
+//   调用前提：settings 已确认 enableProxy === true，且已完成读取失败的早退。
+//   顺序：校验配置 → 清理遗留作用域 → 下发前控制权门 → 原生 fixed_servers 下发
+//   → 回读控制等级与落实校验。每一句文案、每一个 return 结构与状态字段逐字未改。
+async function applyEnabledSettings(settings) {
   // 2) 校验：明确回报，不静默跳过
   var errors = S.validateSettings(settings);
   if (errors.length) {
@@ -614,7 +636,44 @@ async function applyProxyCore() {
     }
   }
 
-  // 3.5) 下发前的控制权保护（不夺权）：
+  // 3.5) 下发前的控制权保护（【M-2 抽取】判定移至 ensureControlBeforeApply）。
+  //   null = 可以继续下发；返回结果对象 = 就此返回（不夺权 / 状态未知）。
+  var gate = await ensureControlBeforeApply();
+  if (gate) return gate;
+
+  // 4) 原生 fixed_servers 下发（不生成 PAC 脚本）
+  var config = buildProxyConfig(settings);
+
+  try {
+    // R6-04：记录本次下发意图，供 onChange 回声抑制按值比对。
+    // 【R8-03】必须连【协议】一起记：同 host/port、只把 scheme 换成别的外部写入
+    //   （socks5 → https）在只比 host/port 时会被判成我方回声，整次变化被吞掉，
+    //   界面继续宣称已生效，而真实生效的协议早已不是我方下发的那个。
+    lastIntent = {
+      mode: "fixed_servers",
+      host: config.rules.singleProxy.host,
+      port: String(config.rules.singleProxy.port),
+      scheme: config.rules.singleProxy.scheme
+    };
+    await setProxy(config);
+  } catch (err) {
+    var msg = (err && err.message) || String(err);
+    updateIcon("error");
+    writeState({ status: "error", message: msg, at: Date.now() });
+    return { ok: false, status: "error", errors: [msg] };
+  }
+
+  // 5) 回读控制等级与落实校验（【M-2 抽取】整段移到 judgeApplyOutcome）
+  var details = await readProxyDetails();
+  return judgeApplyOutcome(details, suspendDirty);
+}
+
+// 【M-2·审计修复】下发前的控制权门（原 applyProxyCore 步骤 3.5，逐字搬移）。
+//   返回值约定：null = 可以继续下发；否则该对象就是 applyProxyCore 应当返回的结果
+//   （「未确证即拒绝」的两种表现：状态未知 / 已被外部接管）。这是纯搬迁，
+//   判定顺序、返回结构、每一句文案与 pendingResubmit 字段逐字未改。
+async function ensureControlBeforeApply() {
+  // 下发前的控制权保护（不夺权）：
   //   若当前代理设置已【确证】被企业策略或其它扩展接管，再写下去就是夺权 ——
   //   对比窗口收尾之后的排队任务会走到这里，此时外部接管仍在，必须跳过。
   //   注意：回读失败（pre 为 null）时不阻断正常下发，否则代理故障期间扩展完全不可用；
@@ -649,9 +708,14 @@ async function applyProxyCore() {
     writeState({ status: "overridden", levelOfControl: preLevel, pendingResubmit: suspendDirty, at: Date.now() });
     return { ok: true, status: "overridden", levelOfControl: preLevel };
   }
+  return null;
+}
 
-  // 4) 原生 fixed_servers 下发（不生成 PAC 脚本）
-  var config = {
+// 【M-2·审计修复】「设置 → chrome.proxy 配置」的纯映射（原 applyProxyCore 步骤 4）。
+//   纯函数：无副作用、不读存储、不碰 chrome.*，因此可以脱离运行环境直接单测。
+//   逐字搬移取值方式（含 IPv6 去方括号、绕过列表解析），未改任何语义。
+function buildProxyConfig(settings) {
+  return {
     mode: "fixed_servers",
     rules: {
       singleProxy: {
@@ -663,29 +727,16 @@ async function applyProxyCore() {
       bypassList: S.parseBypassList(settings.bypassList)
     }
   };
+}
 
-  try {
-    // R6-04：记录本次下发意图，供 onChange 回声抑制按值比对。
-    // 【R8-03】必须连【协议】一起记：同 host/port、只把 scheme 换成别的外部写入
-    //   （socks5 → https）在只比 host/port 时会被判成我方回声，整次变化被吞掉，
-    //   界面继续宣称已生效，而真实生效的协议早已不是我方下发的那个。
-    lastIntent = {
-      mode: "fixed_servers",
-      host: config.rules.singleProxy.host,
-      port: String(config.rules.singleProxy.port),
-      scheme: config.rules.singleProxy.scheme
-    };
-    await setProxy(config);
-  } catch (err) {
-    var msg = (err && err.message) || String(err);
-    updateIcon("error");
-    writeState({ status: "error", message: msg, at: Date.now() });
-    return { ok: false, status: "error", errors: [msg] };
-  }
-
-  // 5) 回读控制等级，识别被策略或其它扩展接管的场景
-  var details = await readProxyDetails();
-
+// 【M-2·审计修复】下发后的「回读失败 / 控制权判定 / 落实校验」整段。
+//   原来这 47 行压在 applyProxyCore 尾部，使该函数膨胀到 263 行（全仓最大），
+//   而它是【下发结果判定的唯一出口】，改动频率高、分支密度大 —— 混在一起
+//   既读不动也无法单独测试（覆盖率报告里这一整段此前为空）。
+//   本次为纯搬迁：判定顺序、return 结构、每一句文案逐字未改。
+//   注意：这里的 if/else 结构刻意保持原缩进，使变异门禁的锚点
+//   （M3 的 `if (actualMode && actualMode !== "fixed_servers") {`）继续逐字节命中。
+function judgeApplyOutcome(details, suspendDirty) {
   // 回读失败（details 为 null）意味着"下发调用返回了成功，但我们无法确认控制权"。
   // 这种情况下显示绿色 applied 是在宣称一个未经证实的结论（R3-04）：
   // 必须判为 error，让用户看到"状态未知"而不是"已生效"。
@@ -781,32 +832,11 @@ async function testConnection(compare) {
   }
 }
 
-// 实际的测试实现（由 testConnection 包裹互斥后调用）
-async function runConnectionTest(compare) {
-  var settings = await readSettings();
-  settings.bypassList = await readBypassText();
-
-  var before = await readProxyDetails();
-  var currentExit = await fetchExit();
-
-  var result = {
-    at: Date.now(),
-    compare: !!compare,
-    settings: {
-      enableProxy: settings.enableProxy,
-      proxyType: settings.proxyType,
-      proxyHost: settings.proxyHost,
-      proxyPort: settings.proxyPort
-    },
-    activeMode: before && before.value ? before.value.mode : null,
-    levelOfControl: before ? before.levelOfControl : null,
-    exit: currentExit,
-    direct: null,
-    restoreFailed: false,
-    compareSkipped: null,
-    compareSkippedReason: null
-  };
-
+// 【M-2·审计修复】进入对比窗口「之前」的前置判据（原 runConnectionTest 内联块，逐字搬移）。
+//   抽出的理由：runConnectionTest 曾达 108 行，把「能不能进对比窗口」这段纯判定与
+//   「怎么进窗口」的执行流程混在一条函数里，分支无法被独立定位测试。
+//   返回值 = controlledByUs，调用方仍需它来决定是否进入窗口（语义与原内联写法一致）。
+function judgeCompareEntry(compare, settings, before, result) {
   // 与窗口、下发前检查共用 isControllableByUs。
   // 缺字段不是“可以由本扩展控制”。
   var controlledByUs = isControllableByUs(result.levelOfControl);
@@ -845,6 +875,37 @@ async function runConnectionTest(compare) {
         "，不是本扩展下发的 fixed_servers";
     }
   }
+
+  return controlledByUs;
+}
+
+// 实际的测试实现（由 testConnection 包裹互斥后调用）
+async function runConnectionTest(compare) {
+  var settings = await readSettings();
+  settings.bypassList = await readBypassText();
+
+  var before = await readProxyDetails();
+  var currentExit = await fetchExit();
+
+  var result = {
+    at: Date.now(),
+    compare: !!compare,
+    settings: {
+      enableProxy: settings.enableProxy,
+      proxyType: settings.proxyType,
+      proxyHost: settings.proxyHost,
+      proxyPort: settings.proxyPort
+    },
+    activeMode: before && before.value ? before.value.mode : null,
+    levelOfControl: before ? before.levelOfControl : null,
+    exit: currentExit,
+    direct: null,
+    restoreFailed: false,
+    compareSkipped: null,
+    compareSkippedReason: null
+  };
+
+  var controlledByUs = judgeCompareEntry(compare, settings, before, result);
 
   if (compare && settings.enableProxy && controlledByUs && !result.compareSkipped) {
     // 【G4】取样可信度复核：currentExit 的取样发生在 before 回读与本次回读之间。
@@ -927,32 +988,10 @@ async function runCompareWindow(result) {
       return result;
     }
 
-    // 【S2】清除之前先持久化「待恢复意图」：从这里到收尾提交之间 SW 随时可能被
-    //   回收，标记在位 = 冷启动能识别「恢复未完成」并重新下发。窗口正常收尾时
-    //   由 finally 清除；只有「SW 在窗口中途死亡」时标记才会残留到冷启动。
-    writePendingRestore();
-
-    try {
-      await clearProxyScope("regular");
-    } catch (directClearErr) {
-      // 清除失败就无法取得可信的直连出口，必须如实标记，不能假装测过直连。
-      result.directClearFailed = (directClearErr && directClearErr.message) || String(directClearErr);
-    }
-    // 【第 4 条·审计修复】clear 之后必须确证「现在到底是不是直连」。
-    //   下面的取样此前被直接称为「直连出口」，但 clear() 只是让【下层设置重新生效】：
-    //   若下层是系统代理 / PAC / 自动检测，这一段的出口走的是那条链路，并不是直连。
-    //   把实际模式如实带回前台（result.afterClearMode），由前台据实标注这一行的含义，
-    //   避免把一个被污染的基准当成「直连出口」而给出错误结论。
-    if (!result.directClearFailed) {
-      var afterClearForSample = await readProxyDetails();
-      result.afterClearMode = (afterClearForSample && afterClearForSample.value &&
-        afterClearForSample.value.mode) || null;
-    }
-    // 【G5】直连取样用独立短超时（4 秒）：这段区间代理已被清除、流量真实直连，
-    //   不允许沿用 12 秒的全局上限把暴露窗口拉长一个数量级。
-    //   【C-3】同时锁定单端点（maxEndpoints=1）：备用端点重试会把「已清除」区间的
-    //   总时长放大 N 倍，直连取样宁可如实失败也不能延长暴露。
-    result.direct = await fetchExit(S.COMPARE_EXIT_TIMEOUT_MS, 1);
+    // 【M-2·审计修复】清除 → 确证实际模式 → 取直连出口（整段移至 windowClearAndSampleDirect）。
+    //   这三步构成「暴露窗口」的全部内容（代理已被清除、流量真实直连），是安全性讨论
+    //   最集中的一段；抽开后 runCompareWindow 只负责流程编排与控制权判定。
+    await windowClearAndSampleDirect(result);
 
     // 第二步：收尾复核控制权。
     //   白名单判定（R3-04）：只有确证"本扩展控制"或"当前无人控制（可被我方控制）"
@@ -981,6 +1020,60 @@ async function runCompareWindow(result) {
       return result;
     }
 
+    // 【M-2·审计修复】按最新 settings 提交 + 兜底重放（整段移至 windowFinalizeCommit）。
+    await windowFinalizeCommit(result);
+
+    return result;
+  } finally {
+    // 【S2】窗口结束（含任何早退路径）即清除恢复意图：SW 存活期间，恢复与上报
+    //   由窗口逻辑自己负责；标记只在「SW 于窗口中途死亡」时残留到冷启动对账。
+    //   放在 suspendDepth 递减之前，保证任何异常路径下标记都不晚于窗口关闭被清理。
+    clearPendingRestore();
+    // 暂停贯穿收尾：直到恢复与重放全部结束才递减（R3-01 根因之二）。
+    suspendDepth--;
+    if (suspendDepth < 0) suspendDepth = 0;   // 防御性归零，避免异常路径下变负
+  }
+}
+
+// 【M-2·审计修复】对比窗口的「清除 → 确证实际模式 → 取直连出口」整段
+//   （原 runCompareWindow 内联，逐字搬移）。
+//   【缩进约定】函数体刻意保留 4 空格缩进：原语句位于 runCompareWindow 的 try 块内，
+//   若提到 2 空格会让变异门禁的锚点（含缩进）失配。本仓库对「锚点即契约」的处置是
+//   保持原缩进（与 judgeApplyOutcome 同款说明），而不是去改 tools/mutation-check.js。
+async function windowClearAndSampleDirect(result) {
+    // 【S2】清除之前先持久化「待恢复意图」：从这里到收尾提交之间 SW 随时可能被
+    //   回收，标记在位 = 冷启动能识别「恢复未完成」并重新下发。窗口正常收尾时
+    //   由 finally 清除；只有「SW 在窗口中途死亡」时标记才会残留到冷启动。
+    writePendingRestore();
+
+    try {
+      await clearProxyScope("regular");
+    } catch (directClearErr) {
+      // 清除失败就无法取得可信的直连出口，必须如实标记，不能假装测过直连。
+      result.directClearFailed = (directClearErr && directClearErr.message) || String(directClearErr);
+    }
+    // 【第 4 条·审计修复】clear 之后必须确证「现在到底是不是直连」。
+    //   下面的取样此前被直接称为「直连出口」，但 clear() 只是让【下层设置重新生效】：
+    //   若下层是系统代理 / PAC / 自动检测，这一段的出口走的是那条链路，并不是直连。
+    //   把实际模式如实带回前台（result.afterClearMode），由前台据实标注这一行的含义，
+    //   避免把一个被污染的基准当成「直连出口」而给出错误结论。
+    if (!result.directClearFailed) {
+      var afterClearForSample = await readProxyDetails();
+      result.afterClearMode = (afterClearForSample && afterClearForSample.value &&
+        afterClearForSample.value.mode) || null;
+    }
+    // 【G5】直连取样用独立短超时（4 秒）：这段区间代理已被清除、流量真实直连，
+    //   不允许沿用 12 秒的全局上限把暴露窗口拉长一个数量级。
+    //   【C-3】同时锁定单端点（maxEndpoints=1）：备用端点重试会把「已清除」区间的
+    //   总时长放大 N 倍，直连取样宁可如实失败也不能延长暴露。
+    result.direct = await fetchExit(S.COMPARE_EXIT_TIMEOUT_MS, 1);
+}
+
+// 【M-2·审计修复】对比窗口的「按最新 settings 提交 + 兜底重放」（原内联，逐字搬移）。
+//   这是窗口的收尾闸门：清脏与否、restoreFailed 与否、pendingResubmit 是否保留，
+//   全部在此决定，也是 R3-01 三轮根因修复的落点。
+//   【缩进约定】同 windowClearAndSampleDirect：保留 4 空格以维持变异锚点逐字节命中。
+async function windowFinalizeCommit(result) {
     // 第三步：按【最新 settings】提交，而不是写回测试前的旧 backup（R3-01 根因之三）。
     //   旧 backup 会把窗口期间用户改的端口、乃至"关闭代理"反向覆盖，且此后不再有
     //   变化事件来纠正。按最新 settings 提交则天然同时满足：
@@ -1010,9 +1103,11 @@ async function runCompareWindow(result) {
     //   把 overridden 报成"恢复失败"，会让前台显示"请重新保存一次设置"，
     //   把用户引去排查自己的配置，而真正要处理的是企业策略或其它扩展（与 R3-07 同型）。
     if (!result.restoreFailed && core && core.status === "overridden") {
-      // 两个都可能是原因：窗口内先被接管（L473–490 已 return，走不到这里），
-      // 或复核通过之后、真正下发之前控制权又变了（L235–239 / L282–292）。
+      // 两个都可能是原因：本函数开头的收尾复核已判定被接管（那条路径直接 return，
+      // 走不到这里），或复核通过之后、真正下发之前控制权又变了。
       // 两种情况下都不夺权、如实保留待下发。
+      // 【注】此处原为硬编码行号引用（"L473–490" / "L235–239 / L282–292"），
+      //   行号随每次重构必然失效（本项目已有明确教训），故改为描述性引用。
       result.overriddenDuringRestore = core.levelOfControl || "unknown_control";
       result.pendingResubmit = suspendDirty;
       writeState({
@@ -1052,17 +1147,6 @@ async function runCompareWindow(result) {
         console.warn("重放暂停期间的设置变更失败:", e3);
       }
     }
-
-    return result;
-  } finally {
-    // 【S2】窗口结束（含任何早退路径）即清除恢复意图：SW 存活期间，恢复与上报
-    //   由窗口逻辑自己负责；标记只在「SW 于窗口中途死亡」时残留到冷启动对账。
-    //   放在 suspendDepth 递减之前，保证任何异常路径下标记都不晚于窗口关闭被清理。
-    clearPendingRestore();
-    // 暂停贯穿收尾：直到恢复与重放全部结束才递减（R3-01 根因之二）。
-    suspendDepth--;
-    if (suspendDepth < 0) suspendDepth = 0;   // 防御性归零，避免异常路径下变负
-  }
 }
 
 // 【G4】把「实际生效配置 + 控制权」压成一个可比较的签名，用于取样前后的一致性复核。

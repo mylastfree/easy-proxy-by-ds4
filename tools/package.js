@@ -8,17 +8,24 @@
 //   dist/easy-proxy-by-ds4-<version>/，并打印产物清单供人工核对。
 // 可复现性：产物内容完全由文件清单决定，清单与 manifest.version 进 git，任何人在
 //   任意机器上对同一提交执行本脚本都得到逐字节相同的产物（纯复制，无构建步骤）。
+//   【M-1·审计修复】这句此前是假的：仓库当时没有 .gitattributes，工作树行尾只能依赖
+//   各人的 core.autocrlf（一个本机配置、不随仓库分发）—— 实测 Windows 检出为 CRLF、
+//   Linux CI 为 LF，同一提交打包出的 .js/.html/.json 字节因此不同；而下面的产物自校验
+//   只比对【同一工作树内】的源文件与产物，结构上不可能发现跨平台差异。
+//   现在行尾由仓库内的 .gitattributes（`* text=auto eol=lf`）钉死 —— 属性优先于
+//   core.autocrlf，本声明才成立。tests/manifest.test.js 对该文件有断言，
+//   删掉它或放宽该规则即门禁变红。
 //
 // 【M-2·审计修复】本脚本是发布产物的唯一来源，此前零测试、CI 不跑打包。
 //   现在把「清单校验」与「复制动作」抽成可注入 destRoot 的纯函数并导出，
 //   tests/manifest.test.js 直接对它们断言（产物清单、排除契约、逐字节保真）；
-//   脚本本体仅在直接执行时进入 main()，被 require 时零副作用。
+//   脚本本体仅在直接执行时调用 runCli()，被 require 时零副作用。
 "use strict";
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const root = path.join(__dirname, "..");
+const REPO_ROOT = path.join(__dirname, "..");
 
 // 运行时文件清单 = manifest 直接或间接引用的文件 + manifest 自身。
 // 新增源文件时必须同步此清单（清单缺失会在 missingFromManifest / pack 中报错）。
@@ -57,7 +64,7 @@ function missingFromManifest(manifest, files) {
 //   （activeEditableId 被改成恒返回 null，即「焦点保护失效」）—— 打包动作
 //   发生在变异运行期间，把故意破坏的代码复制进了发布产物。若当时上传商店，
 //   用户拿到的就是被破坏的版本。本脚本是发布产物的唯一来源，必须自己拦住它。
-const MUTATION_SENTINEL = path.join(root, ".mutation-in-progress");
+const MUTATION_SENTINEL = path.join(REPO_ROOT, ".mutation-in-progress");
 
 // 【B-5】destRoot 是否落在系统临时目录内（两侧都取 realpath，防软链绕过）。
 function isInsideOsTmp(p) {
@@ -99,10 +106,15 @@ function assertNoMutationInProgress(destRoot, opts) {
 // 纯复制，无构建步骤；发现清单缺失或源文件不存在时抛错（由调用方决定如何呈现）。
 // opts.selfCheck=true 仅供测试自检使用，且仅在 destRoot 位于系统临时目录时生效
 // （见 assertNoMutationInProgress 的说明）；发布路径永远不传它。
+// opts.root 可覆盖「源文件根目录」（默认仓库根）—— 仅供测试注入一个夹具目录，
+//   使「清单遗漏 / 源文件缺失 / 产物不一致」三条错误分支都能被确定性地触发与断言
+//   （【L-2·审计修复】：此前这些分支连一次都不会被执行）。发布路径永远不传它。
 function pack(destRoot, opts) {
   assertNoMutationInProgress(destRoot, opts);
 
-  const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
+  const o = opts || {};
+  const srcRoot = o.root || REPO_ROOT;
+  const manifest = JSON.parse(fs.readFileSync(path.join(srcRoot, "manifest.json"), "utf8"));
   const version = manifest.version;
   const missing = missingFromManifest(manifest);
   if (missing.length) {
@@ -113,7 +125,7 @@ function pack(destRoot, opts) {
   fs.mkdirSync(dest, { recursive: true });
   const copied = [];
   for (const f of RUNTIME_FILES) {
-    const src = path.join(root, f);
+    const src = path.join(srcRoot, f);
     if (!fs.existsSync(src)) {
       throw new Error("清单中的文件不存在：" + f);
     }
@@ -126,7 +138,7 @@ function pack(destRoot, opts) {
   //   （含变异恰好在打包中途开始）。两层互补，缺一层就会漏。
   //   检出即删除产物目录，绝不留下「看起来已就绪」的污染产物。
   for (const f of RUNTIME_FILES) {
-    const srcBuf = fs.readFileSync(path.join(root, f));
+    const srcBuf = fs.readFileSync(path.join(srcRoot, f));
     const outBuf = fs.readFileSync(path.join(dest, f));
     if (!srcBuf.equals(outBuf)) {
       fs.rmSync(dest, { recursive: true, force: true });
@@ -138,22 +150,36 @@ function pack(destRoot, opts) {
   return { dest, version, copied };
 }
 
-function main() {
+// CLI 入口的可注入实现（【L-2·审计修复】）。
+//   此前这些逻辑直接写在 main() 里并调用 process.exit，而 .c8rc.json 又把 tools/**
+//   整个排除在覆盖率统计之外 —— 结果是「发布产物的唯一来源」这个脚本自身零覆盖，
+//   连失败分支都从没被执行过（审计据此判定 L-2）。
+//   现在把入口收成 runCli()：副作用（打印/失败的退出码）都可注入，
+//   函数体返回退出码而不结束进程，因此成功与失败两条路径都能被测试覆盖。
+//   直接执行时的行为逐字保持不变（仍然是同步打包 + 同样的退出码）。
+function runCli(opts) {
+  const o = opts || {};
+  const packOpts = o.packOpts;
+  const srcRoot = (packOpts && packOpts.root) || REPO_ROOT;
+  const destRoot = o.destRoot || path.join(REPO_ROOT, "dist");
+  const log = o.log || console.log;
+  const logErr = o.logErr || console.error;
   try {
-    const { dest, version, copied } = pack(path.join(root, "dist"));
-    console.log("打包 easy-proxy-by-ds4 v" + version + " -> " + path.relative(root, dest));
+    const { dest, version, copied } = pack(destRoot, packOpts);
+    log("打包 easy-proxy-by-ds4 v" + version + " -> " + path.relative(srcRoot, dest));
     for (const f of copied) {
-      console.log("  + " + f + "  (" + fs.statSync(path.join(root, f)).size + " B)");
+      log("  + " + f + "  (" + fs.statSync(path.join(srcRoot, f)).size + " B)");
     }
-    console.log("");
-    console.log("已排除非运行文件：tests/、.github/、docs、元文件与依赖目录。");
-    console.log("产物就绪：" + path.relative(root, dest));
+    log("");
+    log("已排除非运行文件：tests/、.github/、docs、元文件与依赖目录。");
+    log("产物就绪：" + path.relative(srcRoot, dest));
+    return 0;
   } catch (e) {
-    console.error("错误：" + (e && e.message || e));
-    process.exit(1);
+    logErr("错误：" + (e && e.message || e));
+    return 1;
   }
 }
 
-if (require.main === module) main();
+if (require.main === module) process.exit(runCli());
 
-module.exports = { RUNTIME_FILES, missingFromManifest, pack };
+module.exports = { RUNTIME_FILES, missingFromManifest, pack, runCli };

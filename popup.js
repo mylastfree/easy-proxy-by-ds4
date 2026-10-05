@@ -1,4 +1,4 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.13.0]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.14.0]
 // 【L-06·审计修复】补上全局严格模式（理由同 background.js：classic script 默认非严格）。
 'use strict';
 var S = window.EasyProxy;
@@ -182,7 +182,14 @@ function renderStatus(state, readFailed) {
   // 对比测试期间保存的配置，若因外部接管而尚未下发，必须让用户看得见（R3-01）。
   // 此前这种情况被静默丢弃：存储里是新值、界面无任何提示、浏览器仍在用旧配置。
   if (state.pendingResubmit) text += "（有配置变更待下发）";
-  el.statusBar.textContent = text;
+  // 【L-7·审计修复】状态条此前【只用颜色】区分严重度（class="ok|warn|error|muted"）：
+  //   色觉障碍、灰度打印、把截图转黑白，都无法分辨「已生效 / 提示 / 故障」。
+  //   而图标本身早已用字形区分（绿=代 / 红=直，见 README 图例）—— 同一屏的两个
+  //   信息面一个双编码、一个单编码。这里补前置符号，与图标同一策略。
+  //   符号表刻意声明在函数【内部】：ownership.test.js 会按源码标记切片、
+  //   把 renderStatus 单独注入一个空上下文执行，引用切片外的常量会直接 ReferenceError。
+  var mark = { ok: "✓", warn: "⚠", error: "✗", muted: "·" }[row[1]] || "";
+  el.statusBar.textContent = (mark ? mark + " " : "") + text;
   el.statusBar.className = "status " + row[1];
 }
 
@@ -206,7 +213,16 @@ function renderTest(result) {
       '<span class="t-muted">尚未测试。点击「测试当前出口」查看流量实际从哪里出去。</span>';
     return;
   }
+  // 【M-2 抽取】原 renderTest 140 行，把「判定」与「拼 DOM」混在一起。
+  //   现在只做编排：判定交给纯函数，内容交给拼装函数，本函数只负责写 innerHTML。
+  var c = classifyTestResult(result);
+  el.testResult.innerHTML = buildTestHeader(result) +
+    '<div class="verdict ' + c.kind + '">' + escapeHtml(c.verdict) + "</div>";
+}
 
+// 【M-2 抽取】结果区头部（当前出口 / 直连出口 / 代理配置 / 生效模式）。
+//   只拼 HTML 片段，不做任何判定 —— 与 classifyTestResult 的职责互不重叠。
+function buildTestHeader(result) {
   var html = "";
   html += "<div><b>当前出口</b>" + escapeHtml(fmtExit(result.exit)) + "</div>";
 
@@ -244,6 +260,18 @@ function renderTest(result) {
     html += "<div><b>生效模式</b>" + escapeHtml(result.activeMode) + "</div>";
   }
 
+  return html;
+}
+
+// 【M-2/L-5 抽取】「结果 → 判定」链，纯函数：输入 result，输出 { verdict, kind }。
+//   抽出的两个理由都不是为了好看：
+//     · M-2：它原本是 renderTest 里的 90 行分支链；
+//     · L-5：它是【用户唯一看到的结论面】，历次修复（R6-01 / 第 4 条 / 第 6 条 /
+//       R7-02 / G4）全部落在这里，却因为藏在 innerHTML 组装中间而只被间接覆盖 ——
+//       覆盖率报告里 popup.js L255-307 与 L319-323 整段为空。
+//   现在每个分支都能被直接断言（见 tests/popup.test.js 的 L-5 段）。
+//   本次只做搬迁：不合并分支、不改一句文案、不动判定顺序。
+function classifyTestResult(result) {
   var verdict = "";
   var kind = "warn";
 
@@ -337,8 +365,7 @@ function renderTest(result) {
     kind = "warn";
   }
 
-  html += '<div class="verdict ' + kind + '">' + escapeHtml(verdict) + "</div>";
-  el.testResult.innerHTML = html;
+  return { verdict: verdict, kind: kind };
 }
 
 function escapeHtml(s) {
@@ -647,86 +674,18 @@ function clearLocalBypassIfAny(savedBypassList, formWasShadowed) {
 }
 
 function save() {
-  // 【R8-01】核心安全要求：读取失败后表单内容不可信，必须【拒绝写入】。
-  //   仅提示而不阻止，用户点一次「保存」仍会把默认值写回 sync 并清掉代理。
-  if (loadFailed) {
-    showHint(READ_FAIL_HINT, "error");
-    return;
-  }
-
-  var settings = readForm();
-  var errors = S.validateSettings(settings);
-  if (errors.length) {
-    showHint(errors.join("；"), "error");
-    return;
-  }
-
-  // 【V-01】遮蔽现场下用户「改字后保存」会让后台自愈的判据（逐字符等于默认列表）
-  //   永久失效：写进 sync 的值成为当前生效值（resolveBypassList 的 sync 非空优先），
-  //   而用户自己那份规则不再被自动恢复。R9-01 的守卫保证了 local 不被删除
-  //   （数据不丢），但"规则长期不生效"仍是用户必须知情后才能接受的结果。
-  //
-  //   这里刻意不用 window.confirm()：popup 一旦失焦就会被销毁，原生对话框的返回值
-  //   永远回不来，会让保存变成"点了没反应"——那是用一个静默失败换另一个。
-  //   改用行内二次确认：第一次点击只改按钮文案与提示，不写任何存储。
-  //   判据用 looksLikeShadowEdit（「默认列表 + 编辑」形态）：逐字符等于默认列表
-  //   是 R9-01 主场景（用户什么都没改），既有守卫已能安全处理，不在这里打断。
-  //   位置刻意放在 readForm/validateSettings 之后：先把参数校验的错误说出来，
-  //   再让用户确认，避免"先确认、后被告知输入非法"。
-  if (loadedShadowed && !pendingShadowConfirm && S.looksLikeShadowEdit(settings.bypassList)) {
-    pendingShadowConfirm = true;
-    el.saveButton.textContent = "确认保存（会用此内容替换当前生效的绕过列表）";
-    showHint("当前显示的绕过列表来自内置默认值，并不是你自己保存的那一份（你自己的规则保存在本机）。" +
-      "再点一次上面的「确认保存」才会写入；取消请直接关闭弹窗。", "warn");
-    return;
-  }
-
-  var oversize =
-    S.estimateBytes({ bypassList: settings.bypassList }) > S.MAX_SYNC_BYTES_PER_ITEM;
-
-  // 【R9-01】必须在【发起写入之前】快照这个标记。
-  //   写入 sync 会触发 storage.onChanged，popup 自己的 onChanged 监听会重新执行
-  //   load()，而 load() 会用「新值是否等于默认列表」重算 loadedShadowed —— 对刚
-  //   写进去的新值而言恒为 false。若在回调里读 loadedShadowed，守卫会被自己的
-  //   写入冲掉，等同不存在（真实浏览器的 storage 事件同样会触发）。
-  //   因此这里取快照，回调里只读快照。
-  var formWasShadowed = loadedShadowed;
-
-  // 【V-02】安全守卫必须挂在【分支判定之前】，而不是挂在短列表分支的清理动作上。
-  //   遮蔽现场的表单内容不属于用户：此时 oversize 分支的语义前提（「列表太大，
-  //   sync 放不下，所以存一份到 local」）根本不成立 —— local 里躺着的很可能正是
-  //   用户规则的最后一份副本，而表单里那份是内置默认列表加用户的改动。
-  //   因此遮蔽现场【一律不写 local】：写空串会丢副本，写表单值会覆盖副本。
-  //
-  //   第二层约束：遮蔽现场下也不能「顺手把表单值写进 sync」。chrome.storage.sync
-  //   的【单键】上限是 8192 字节（S.MAX_SYNC_BYTES_PER_ITEM 就是它），而走到
-  //   oversize 分支的正是「用户粘贴了超长列表」的情形：写 sync 在真实 Chrome 上
-  //   必然以 lastError 失败，用户却会以为自己保存成功了。
-  //   local 不能写、sync 装不下 → 唯一安全的动作是【在写入之前就拒绝】。
-  //   【注意】本仓库测试的 storage 桩不做配额校验，「错误地写 sync」不会在测试里
-  //   报错，所以这一层由 R9-01-F7 显式断言守住，不能省。
-  if (formWasShadowed && oversize) {
-    console.warn("遮蔽现场下拒绝保存超长绕过列表：local 是用户规则唯一副本不可覆盖，" +
-      "而 sync 的单键上限（" + S.MAX_SYNC_BYTES_PER_ITEM + " 字节）装不下这份列表。" +
-      "本次未写入任何存储。");
-    showHint("未保存：当前显示的绕过列表来自内置默认值，而你粘贴的列表超过了可直接保存的长度上限（" +
-      S.MAX_SYNC_BYTES_PER_ITEM + " 字节），本机还保存着你自己的规则（不会被覆盖）。" +
-      "请先等后台恢复你自己的规则，或把列表缩短后重试。", "error");
-    return;
-  }
+  // 【M-2·审计修复】「能不能保存」的 4 道前置守卫 + 写入链所需输入，整体抽到 prepareSave()
+  //   （逐字搬移）。返回值 null = 已被守卫拦截（提示已给出、未写入任何存储）。
+  //   抽出的理由：save() 曾达 198 行，把「拒绝写入的判定」与「怎么写入」混在一起 ——
+  //   前者是安全断言（读取失败/校验失败/遮蔽确认/遮蔽+超长），需要被独立测试与评审。
+  var prep = prepareSave();
+  if (!prep) return;
+  var settings = prep.settings;
+  var formWasShadowed = prep.formWasShadowed;
+  var oversize = prep.oversize;
 
   var chain = formWasShadowed
-    ? setStorage("sync", settings).then(function () {
-        // 把「用户规则可能仍未生效」的事实留在日志里，而不是只留在界面：
-        //   后续若出现「我的规则不生效」的报障，维护者能直接定位到这一次主动保存。
-        console.warn("遮蔽现场下保存：已按用户表单写入 sync，但未改动 storage.local" +
-          "（其中的绕过列表可能是用户规则唯一副本，且后台自愈判据已因本次写入不再成立）。");
-        showHint("已保存；但本机还保存着你自己的规则，当前生效的仍可能是这一份表单内容。" +
-          "关闭并重新打开弹窗，或等待后台自动恢复后再确认。", "warn");
-        // 【第 1 条】本分支的提示是【数据安全告知】，信息量高于「是否已生效」，
-        //   因此后续不覆盖它（confirmApplied 的 silent 模式）。
-        return "shadow";
-      })
+    ? saveShadowBranch(settings)
     : (oversize
         // 【第 3 条·审计修复】超长列表必须「先落地、再切换引用」，且切换前要确证落地成功。
         //
@@ -783,15 +742,7 @@ function save() {
               showHint("绕过列表较长，已存于本地（不跨设备同步）", "warn");
               return "oversize";
             })
-        : setStorage("sync", settings).then(function () {
-            // 【R8-02】把本次写进 sync 的 bypassList 一并交给清理函数：
-            //   它据此判断「保存的是系统默认列表」还是「用户自己撰写的列表」。
-            //   【S1】同时传入 formWasShadowed 快照：遮蔽现场下绝不写 local（纵深防御）。
-            return clearLocalBypassIfAny(settings.bypassList, formWasShadowed);
-          }).then(function () {
-            showHint("设置已保存", "ok");
-            return "generic";
-          }));
+        : saveGenericBranch(settings, formWasShadowed));
 
   // 【第 1 条·审计修复】本次保存是否会真正改变存储。
   //   快照由 load() 写入，因此这里比较的是「表单内容」与「上次从存储读到的内容」。
@@ -805,23 +756,137 @@ function save() {
     //   遮蔽现场（shadow）的提示是数据安全告知，只补发请求、不覆盖文案。
     return confirmApplied(sigChanged, kind === "shadow");
   }, function (err) {
-    // 【第 2 条·审计修复】按阶段分辨失败，不把「已写入但没清理干净」笼统报成「保存失败」。
-    if (err && err.phase === "local_cleanup") {
-      // 取值规则是「sync 非空优先，为空则回退 local」：只有在 sync 为空
-      // （用户把列表清空了）时，没清掉的旧 local 才会成为真正生效的那一份。
-      if (!settings.bypassList) {
-        showHint("设置已保存，但本机保存的旧绕过列表未能清除，因此当前实际生效的仍是" +
-          "那份旧列表——你刚清空的规则可能仍会绕过代理。请重试保存。（" +
-          ((err && err.message) || err) + "）", "error");
-      } else {
-        showHint("设置已保存；只是本机多留了一份旧的绕过列表副本没能清除" +
-          "（当前生效的是你刚保存的这份，不受影响）。可稍后重试保存。（" +
-          ((err && err.message) || err) + "）", "warn");
-      }
+    handleSaveFailure(err, settings);
+  });
+}
+
+// 【M-2·审计修复】保存的前置守卫 + 写入链输入（原 save() 开头 677–743 行，逐字搬移）。
+//   返回值：null = 已被守卫拦截（提示已给出、未写入任何存储）；
+//          否则 { settings, formWasShadowed, oversize } 交给写入链。
+//   四道守卫依次为：读取失败即拒写（R8-01）、参数校验、遮蔽现场行内二次确认（V-01）、
+//   遮蔽现场 + 超长列表在写入前拒绝（V-02）。它们的共同点是「拒绝」而非「写入」，
+//   因此与写入链分开后可以各自独立评审与断言。
+function prepareSave() {
+  // 【R8-01】核心安全要求：读取失败后表单内容不可信，必须【拒绝写入】。
+  //   仅提示而不阻止，用户点一次「保存」仍会把默认值写回 sync 并清掉代理。
+  if (loadFailed) {
+    showHint(READ_FAIL_HINT, "error");
+    return null;
+  }
+
+  var settings = readForm();
+  var errors = S.validateSettings(settings);
+  if (errors.length) {
+    showHint(errors.join("；"), "error");
+    return null;
+  }
+
+  // 【V-01】遮蔽现场下用户「改字后保存」会让后台自愈的判据（逐字符等于默认列表）
+  //   永久失效：写进 sync 的值成为当前生效值（resolveBypassList 的 sync 非空优先），
+  //   而用户自己那份规则不再被自动恢复。R9-01 的守卫保证了 local 不被删除
+  //   （数据不丢），但"规则长期不生效"仍是用户必须知情后才能接受的结果。
+  //
+  //   这里刻意不用 window.confirm()：popup 一旦失焦就会被销毁，原生对话框的返回值
+  //   永远回不来，会让保存变成"点了没反应"——那是用一个静默失败换另一个。
+  //   改用行内二次确认：第一次点击只改按钮文案与提示，不写任何存储。
+  //   判据用 looksLikeShadowEdit（「默认列表 + 编辑」形态）：逐字符等于默认列表
+  //   是 R9-01 主场景（用户什么都没改），既有守卫已能安全处理，不在这里打断。
+  //   位置刻意放在 readForm/validateSettings 之后：先把参数校验的错误说出来，
+  //   再让用户确认，避免"先确认、后被告知输入非法"。
+  if (loadedShadowed && !pendingShadowConfirm && S.looksLikeShadowEdit(settings.bypassList)) {
+    pendingShadowConfirm = true;
+    el.saveButton.textContent = "确认保存（会用此内容替换当前生效的绕过列表）";
+    showHint("当前显示的绕过列表来自内置默认值，并不是你自己保存的那一份（你自己的规则保存在本机）。" +
+      "再点一次上面的「确认保存」才会写入；取消请直接关闭弹窗。", "warn");
+    return null;
+  }
+
+  var oversize =
+    S.estimateBytes({ bypassList: settings.bypassList }) > S.MAX_SYNC_BYTES_PER_ITEM;
+
+  // 【R9-01】必须在【发起写入之前】快照这个标记。
+  //   写入 sync 会触发 storage.onChanged，popup 自己的 onChanged 监听会重新执行
+  //   load()，而 load() 会用「新值是否等于默认列表」重算 loadedShadowed —— 对刚
+  //   写进去的新值而言恒为 false。若在回调里读 loadedShadowed，守卫会被自己的
+  //   写入冲掉，等同不存在（真实浏览器的 storage 事件同样会触发）。
+  //   因此这里取快照，回调里只读快照。
+  var formWasShadowed = loadedShadowed;
+
+  // 【V-02】安全守卫必须挂在【分支判定之前】，而不是挂在短列表分支的清理动作上。
+  //   遮蔽现场的表单内容不属于用户：此时 oversize 分支的语义前提（「列表太大，
+  //   sync 放不下，所以存一份到 local」）根本不成立 —— local 里躺着的很可能正是
+  //   用户规则的最后一份副本，而表单里那份是内置默认列表加用户的改动。
+  //   因此遮蔽现场【一律不写 local】：写空串会丢副本，写表单值会覆盖副本。
+  //
+  //   第二层约束：遮蔽现场下也不能「顺手把表单值写进 sync」。chrome.storage.sync
+  //   的【单键】上限是 8192 字节（S.MAX_SYNC_BYTES_PER_ITEM 就是它），而走到
+  //   oversize 分支的正是「用户粘贴了超长列表」的情形：写 sync 在真实 Chrome 上
+  //   必然以 lastError 失败，用户却会以为自己保存成功了。
+  //   local 不能写、sync 装不下 → 唯一安全的动作是【在写入之前就拒绝】。
+  //   【注意】本仓库测试的 storage 桩不做配额校验，「错误地写 sync」不会在测试里
+  //   报错，所以这一层由 R9-01-F7 显式断言守住，不能省。
+  if (formWasShadowed && oversize) {
+    console.warn("遮蔽现场下拒绝保存超长绕过列表：local 是用户规则唯一副本不可覆盖，" +
+      "而 sync 的单键上限（" + S.MAX_SYNC_BYTES_PER_ITEM + " 字节）装不下这份列表。" +
+      "本次未写入任何存储。");
+    showHint("未保存：当前显示的绕过列表来自内置默认值，而你粘贴的列表超过了可直接保存的长度上限（" +
+      S.MAX_SYNC_BYTES_PER_ITEM + " 字节），本机还保存着你自己的规则（不会被覆盖）。" +
+      "请先等后台恢复你自己的规则，或把列表缩短后重试。", "error");
+    return null;
+  }
+
+  return { settings: settings, formWasShadowed: formWasShadowed, oversize: oversize };
+}
+
+// 【M-2·审计修复】保存失败的阶段化呈现（原 save() 的失败回调体，逐字搬移）。
+//   【第 2 条·审计修复】按阶段分辨失败，不把「已写入但没清理干净」笼统报成「保存失败」。
+function handleSaveFailure(err, settings) {
+  if (err && err.phase === "local_cleanup") {
+    // 取值规则是「sync 非空优先，为空则回退 local」：只有在 sync 为空
+    // （用户把列表清空了）时，没清掉的旧 local 才会成为真正生效的那一份。
+    if (!settings.bypassList) {
+      showHint("设置已保存，但本机保存的旧绕过列表未能清除，因此当前实际生效的仍是" +
+        "那份旧列表——你刚清空的规则可能仍会绕过代理。请重试保存。（" +
+        ((err && err.message) || err) + "）", "error");
     } else {
-      showHint("保存失败：" + ((err && err.message) || err), "error");
+      showHint("设置已保存；只是本机多留了一份旧的绕过列表副本没能清除" +
+        "（当前生效的是你刚保存的这份，不受影响）。可稍后重试保存。（" +
+        ((err && err.message) || err) + "）", "warn");
     }
-    resetShadowConfirm();
+  } else {
+    showHint("保存失败：" + ((err && err.message) || err), "error");
+  }
+  resetShadowConfirm();
+}
+
+// 【M-2·审计修复】遮蔽现场下的写入链（原 save() 三元分支的一支，逐字搬移）。
+//   只写 sync、绝不触碰 local（其中的绕过列表可能是用户规则唯一副本）。
+//   返回值 "shadow" 让调用方保留这条【数据安全告知】文案（confirmApplied 的 silent 模式）。
+function saveShadowBranch(settings) {
+  return setStorage("sync", settings).then(function () {
+    // 把「用户规则可能仍未生效」的事实留在日志里，而不是只留在界面：
+    //   后续若出现「我的规则不生效」的报障，维护者能直接定位到这一次主动保存。
+    console.warn("遮蔽现场下保存：已按用户表单写入 sync，但未改动 storage.local" +
+      "（其中的绕过列表可能是用户规则唯一副本，且后台自愈判据已因本次写入不再成立）。");
+    showHint("已保存；但本机还保存着你自己的规则，当前生效的仍可能是这一份表单内容。" +
+      "关闭并重新打开弹窗，或等待后台自动恢复后再确认。", "warn");
+    // 【第 1 条】本分支的提示是【数据安全告知】，信息量高于「是否已生效」，
+    //   因此后续不覆盖它（confirmApplied 的 silent 模式）。
+    return "shadow";
+  });
+}
+
+// 【M-2·审计修复】普通短列表的写入链（原 save() 三元分支的一支，逐字搬移）。
+//   先写 sync，再按「写入的列表是不是系统默认列表」决定是否清理本机旧副本。
+function saveGenericBranch(settings, formWasShadowed) {
+  return setStorage("sync", settings).then(function () {
+    // 【R8-02】把本次写进 sync 的 bypassList 一并交给清理函数：
+    //   它据此判断「保存的是系统默认列表」还是「用户自己撰写的列表」。
+    //   【S1】同时传入 formWasShadowed 快照：遮蔽现场下绝不写 local（纵深防御）。
+    return clearLocalBypassIfAny(settings.bypassList, formWasShadowed);
+  }).then(function () {
+    showHint("设置已保存", "ok");
+    return "generic";
   });
 }
 

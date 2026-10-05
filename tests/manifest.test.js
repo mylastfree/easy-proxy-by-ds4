@@ -386,6 +386,156 @@ console.log("== 打包脚本（M-2：发布产物的唯一来源必须有测试�
 }
 
 console.log("");
+console.log("== 跨平台产物字节一致性（M-1：行尾属性必须随仓库分发）==");
+{
+  // 【M-1·审计修复】tools/package.js 声明「任何人在任意机器上对同一提交执行本脚本
+  //   都得到逐字节相同的产物」。该声明此前是假的：仓库没有 .gitattributes，工作树
+  //   行尾只能依赖各人的 core.autocrlf（本机配置、不随仓库分发）—— 实测 Windows 为
+  //   CRLF、Linux CI 为 LF，同一提交打包出的 .js/.html/.json 字节不同；而 pack() 的
+  //   逐字节自校验只比对【同一工作树内】的源文件与产物，结构上不可能发现跨平台差异。
+  //   这里把「属性文件存在且把行尾钉死为 LF」变成断言，防止它日后被删掉或改宽，
+  //   让那条声明重新变成一句无支撑的承诺。
+  const ga = read(".gitattributes");
+  t(".gitattributes 存在（行尾属性的单一事实来源必须随仓库分发）", ga.length > 0);
+  t(".gitattributes 把文本文件行尾钉死为 LF（优先于 core.autocrlf）",
+    /^\*[ \t]+text=auto[ \t]+eol=lf[ \t]*$/m.test(ga),
+    "未找到 '* text=auto eol=lf' 规则");
+  t(".gitattributes 显式声明 .png 为二进制（避免行尾转换损坏图标字节）",
+    /^\*\.png[ \t]+binary[ \t]*$/m.test(ga));
+  // 声明与机制必须互相引用：否则「可复现」这句注释会再次与实现脱节（S-2 同型）。
+  t("tools/package.js 的产物可复现声明引用 .gitattributes（声明与机制挂钩）",
+    /\.gitattributes/.test(read("tools/package.js")));
+}
+
+console.log("");
+console.log("== 打包脚本 CLI 入口（L-2：发布产物唯一来源的退出码路径必须有测试）==");
+{
+  // 【L-2·审计修复】tools/package.js 此前把 CLI 逻辑直接写在 main() 里并调用
+  //   process.exit，而 .c8rc.json 又把 tools/** 整个排除在覆盖率之外 —— 结果是
+  //   「发布产物的唯一来源」这个脚本自身零测试：失败分支（process.exit(1)）从未
+  //   被执行过。一旦复制失败被静默吞掉（例如错误地 `return` 而非 `exit(1)`），
+  //   发布流水线会「成功」地交出残缺产物而无人察觉。
+  //   现在入口收成可注入的 runCli(opts)（见 tools/package.js）：返回退出码而不结束
+  //   进程，成功/失败两条路径都可以被直接断言。本组断言同时校验：
+  //     ① 成功 → 退出码 0、有产物目录、无错误日志；
+  //     ② 失败 → 退出码 1、错误被写入 logErr（绝不静默）。
+  //   【双环境稳定】失败路径刻意不依赖某个具体错误来源：常规运行下 pack 因
+  //   destRoot 的父路径是普通文件而抛 ENOTDIR；变异门禁下哨兵在位，pack 会先抛
+  //   「变异测试正在运行」。两者都走 runCli 的同一 catch 分支，断言（退出码 1 +
+  //   错误被记录）在两种环境下都成立，与「测试必须环境无关」的硬约束一致。
+  const os2 = require("node:os");
+  const { runCli } = require("../tools/package.js");
+  const cliVersion = JSON.parse(read("manifest.json")).version;
+
+  // ---- 成功路径：注入临时 destRoot，收集日志 ----
+  const cliTmp = fs.mkdtempSync(path.join(os2.tmpdir(), "easy-proxy-cli-"));
+  try {
+    const logs = [], errs = [];
+    const code = runCli({
+      destRoot: cliTmp,
+      packOpts: { selfCheck: true }, // 与 B-5 同源：仅对系统临时目录生效
+      log: (m) => logs.push(String(m)),
+      logErr: (m) => errs.push(String(m))
+    });
+    t("runCli 成功路径返回退出码 0", code === 0, "code=" + code);
+    t("runCli 成功路径不写任何错误日志", errs.length === 0, errs.join(" | "));
+    t("runCli 成功路径确实产出 <名>-<版本> 目录",
+      fs.existsSync(path.join(cliTmp, "easy-proxy-by-ds4-" + cliVersion)),
+      fs.readdirSync(cliTmp).join(", "));
+    t("runCli 成功路径把产物目录打印到 log（CLI 行为未因可测化而改变）",
+      logs.some((l) => l.indexOf("easy-proxy-by-ds4-" + cliVersion) >= 0),
+      logs.join(" | "));
+  } finally {
+    fs.rmSync(cliTmp, { recursive: true, force: true });
+  }
+
+  // ---- 失败路径：destRoot 的父路径是普通文件 → pack 无法建目录 ----
+  //   用一个「占位文件」当父目录，保证失败是确定性的（不依赖权限/磁盘状态）。
+  const cliBlocker = path.join(os2.tmpdir(), "easy-proxy-cli-blocker-" + process.pid);
+  fs.writeFileSync(cliBlocker, "");
+  try {
+    const logs = [], errs = [];
+    const code = runCli({
+      destRoot: path.join(cliBlocker, "sub"),
+      packOpts: { selfCheck: true },
+      log: (m) => logs.push(String(m)),
+      logErr: (m) => errs.push(String(m))
+    });
+    t("runCli 失败路径返回退出码 1（发布失败必须非零退出，否则流水线假成功）",
+      code === 1, "code=" + code);
+    t("runCli 失败路径把错误写入 logErr（不静默吞掉）",
+      errs.length === 1 && /^错误：/.test(errs[0]), JSON.stringify(errs));
+  } finally {
+    fs.rmSync(cliBlocker, { force: true });
+  }
+
+  // ---- pack 自身的两条错误分支：用夹具目录注入 root，确定性触发 ----
+  //   （【L-2·审计修复】此前这两条分支连一次都不会被执行 —— missingFromManifest
+  //     的遗漏检出、以及清单文件缺失时的中止，都只在「有人把仓库改坏」时才走到。）
+  const { pack } = require("../tools/package.js");
+  const fixture = fs.mkdtempSync(path.join(os2.tmpdir(), "easy-proxy-fixture-"));
+  try {
+    // (a) manifest 引用了一个不在 RUNTIME_FILES 里的文件 → 必须在复制前中止。
+    fs.writeFileSync(path.join(fixture, "manifest.json"), JSON.stringify({
+      manifest_version: 3, name: "fixture", version: "9.9.9",
+      background: { service_worker: "background.js" },
+      action: { default_popup: "popup.html" },
+      icons: { "16": "icon-unlisted.png" } // 刻意不在 RUNTIME_FILES 内
+    }));
+    let eMissingRef = null;
+    try { pack(fixture, { root: fixture, selfCheck: true }); } catch (e) { eMissingRef = e; }
+    t("pack 检出「manifest 引用的文件不在打包清单中」（加文件忘同步清单即中止）",
+      !!eMissingRef && /未包含在打包清单中/.test(eMissingRef.message),
+      eMissingRef ? eMissingRef.message : "未抛错（清单校验失效）");
+
+    // (b) 清单文件缺失 → 必须在复制到一半时中止，绝不产出残缺包。
+    fs.writeFileSync(path.join(fixture, "manifest.json"), JSON.stringify({
+      manifest_version: 3, name: "fixture", version: "9.9.9",
+      background: { service_worker: "background.js" },
+      action: { default_popup: "popup.html" },
+      icons: { "16": "icon-red-16.png" } // 全部在清单内；但夹具里没有这些文件
+    }));
+    let eMissingSrc = null;
+    try { pack(fixture, { root: fixture, selfCheck: true }); } catch (e) { eMissingSrc = e; }
+    t("pack 在源文件缺失时中止并点名文件（不产出残缺产物）",
+      !!eMissingSrc && /清单中的文件不存在/.test(eMissingSrc.message),
+      eMissingSrc ? eMissingSrc.message : "未抛错（残缺产物被放行）");
+  } finally {
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+
+  // ---- pack 的最后一道网：产物自校验（B-3）----
+  //   这一层覆盖「复制动作本身出错 / 源文件在打包中途被并发改写」。它此前
+  //   从未被执行过。这里刻意用「故障注入」而非真实并发：临时把 fs.copyFileSync
+  //   换成「复制后把目标写坏」，从而确定性地触发不一致检出（真实并发无法稳定复现）。
+  const corruptTmp = fs.mkdtempSync(path.join(os2.tmpdir(), "easy-proxy-corrupt-"));
+  const corruptDest = path.join(corruptTmp, "easy-proxy-by-ds4-" + cliVersion);
+  const realCopyFileSync = fs.copyFileSync;
+  let eCorrupt = null;
+  try {
+    fs.copyFileSync = function (s, d) {
+      realCopyFileSync(s, d);
+      // 只破坏一个文件，足以让自校验逐字节比对发现差异。
+      //   刻意不引入 Buffer（测试环境的 globals 白名单里没有它，用它会直接被
+      //   no-undef 拦下）——写一段普通字符串即可产生不同的字节序列。
+      if (path.basename(d) === "popup.js") fs.writeFileSync(d, "// corrupted by test\n");
+    };
+    try { pack(corruptTmp, { selfCheck: true }); } catch (e) { eCorrupt = e; }
+  } finally {
+    fs.copyFileSync = realCopyFileSync; // 必须还原：跨测试共享同一 fs 对象
+  }
+  try {
+    t("pack 检出产物与源文件不一致并中止（B-3 最后一道网：防止产物含污染字节）",
+      !!eCorrupt && /产物与源文件不一致/.test(eCorrupt.message),
+      eCorrupt ? eCorrupt.message : "未抛错（自校验失效）");
+    t("pack 检出不一致后删除已产出的目录（绝不留下「看似就绪」的污染产物）",
+      !fs.existsSync(corruptDest));
+  } finally {
+    fs.rmSync(corruptTmp, { recursive: true, force: true });
+  }
+}
+
+console.log("");
 console.log("== 判据单一实现（G3：遮蔽现场判据收敛到 settings.js）==");
 {
   // 【G3 成因记录】同一业务判据曾有三处独立实现（settings / background / popup），
@@ -398,6 +548,44 @@ console.log("== 判据单一实现（G3：遮蔽现场判据收敛到 settings.j
     "popup.js 中未找到 S.isLegacyShadowPair 调用");
   t("settings.js 同时导出 looksLikeShadowEdit 与 isLegacyShadowPair",
     /looksLikeShadowEdit/.test(settingsJs) && /isLegacyShadowPair/.test(settingsJs));
+}
+
+console.log("");
+console.log("== 缺陷/修复编号索引（L-6：编号族必须集中登记，新增族未登记即变红）==");
+{
+  // 【L-6·审计修复】全仓 100+ 处 【X-NN】 标注此前无集中登记：哪一族、到哪一号、
+  //   有无冲突全靠人工避重，跨文件引用无法机械定位。这里只做「族级」登记校验 ——
+  //   逐条列 139 个编号既不可维护、也会立刻漂移；族级校验已足以拦住「引入新族却
+  //   不登记」。索引正文见 ARCHITECTURE.md 第 7 节。
+  const archSrc = read("ARCHITECTURE.md");
+  const declaredFams = ((archSrc.match(/编号族（机械校验用，勿删）：([^\n]+)/) || [])[1] || "")
+    .match(/[A-Z]+/g) || [];
+  t("ARCHITECTURE.md 含编号族登记行且能解析出 ≥ 8 个族（防止索引被删或改残）",
+    declaredFams.length >= 8, JSON.stringify(declaredFams));
+
+  // 扫描范围与索引「主要出处」一致：根目录 + tools/ + tests/ + docs/ + CI 工作流。
+  // 刻意不扫 .json（manifest 无标注、package-lock 体积大且无标注）。
+  const scanDirs = [".", "tools", "tests", "docs", ".github/workflows"];
+  const scanned = [];
+  for (const d of scanDirs) {
+    let ents = [];
+    try { ents = fs.readdirSync(path.join(rootDir, d)); } catch (e) { continue; }
+    for (const e of ents) {
+      if (!/\.(js|html|md|yml)$/.test(e)) continue;
+      const rel = d === "." ? e : d + "/" + e;
+      try { if (fs.statSync(path.join(rootDir, rel)).isFile()) scanned.push(rel); } catch (e) { /* 跳过 */ }
+    }
+  }
+  const actualSet = new Set();
+  for (const f of scanned) {
+    for (const m of read(f).matchAll(/【([A-Za-z]+)-?\d/g)) actualSet.add(m[1]);
+  }
+  const actualFams = [...actualSet].sort();
+  t("扫描确实命中编号标注（≥ 8 族，防止正则失效使本组断言恒真）",
+    actualFams.length >= 8, "扫描 " + scanned.length + " 个文件，命中 " + JSON.stringify(actualFams));
+  t("全仓实际出现的编号族集合 = 索引登记的族集合（新增族未登记即变红）",
+    declaredFams.slice().sort().join(",") === actualFams.join(","),
+    "索引=" + JSON.stringify(declaredFams.slice().sort()) + "；实际=" + JSON.stringify(actualFams));
 }
 
 console.log("");

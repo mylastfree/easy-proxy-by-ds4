@@ -83,6 +83,10 @@
 
 > 两种状态用了**不同的字形**而不只是不同的颜色：**绿·代** 表示走本扩展下发的代理；**红·直** 表示**未走本扩展的代理** —— 通常是真正的直连，但若浏览器正沿用系统/其它扩展的代理设置，或清除后回读失败而无法确证，图标标题与状态条会**如实说明并非直连**（只有回读确证 `mode === "direct"` 时才宣称直连）。
 > 这样即使在色觉异常或灰度显示下，也能从字形本身判断当前状态。
+> **状态条也做了同样的双编码**（L-7·审计修复）：文案前会带一个严重度符号 ——
+> `✓` 已生效、`⚠` 提示或待处理、`✗` 故障、`·` 中性（未启用）。此前状态条**只靠颜色**，
+> 灰度截图或色觉障碍下无法分辨；现在两种呈现面（图标字形 + 状态条符号）口径一致。
+> `tests/popup.test.js` 断言了「每种严重度都必须带对应符号」，退回只靠颜色会直接变红。
 > 鼠标悬停在图标上还会显示对应文字提示。
 
 ## 已知边界
@@ -120,27 +124,53 @@
 
 | 测试 | 覆盖内容 |
 | --- | --- |
-| `tests/manifest.test.js` | 清单完整性：版本格式、权限最小化、引用文件存在、HTML/JS 元素 ID 一致、源文件头与 manifest 版本对齐、打包哨兵互斥与自检例外边界、文档声明数（含出口端点清单、devDependencies 白名单、覆盖率门禁开关与行/分支覆盖双披露、status/reason 取值双向一致）一致性（81 项） |
-| `tests/settings.test.js` | 纯函数：默认值、类型收敛、绕过列表解析、输入校验（含 host:port 必拒写法提前拦截、方括号用法与主机形态收口）、容量估算、主机名 ASCII 判定、出口检测端点容错配置、出口 IP 形态校验（`isIpLiteral`）（110 项） |
-| `tests/background.test.js` | 异步逻辑：并发下发的最终一致性、测试期暂停机制、取值一致性、CIDR 判定（38 项） |
+| `tests/manifest.test.js` | 清单完整性：版本格式、权限最小化、引用文件存在、HTML/JS 元素 ID 一致、源文件头与 manifest 版本对齐、打包哨兵互斥与自检例外边界、打包 CLI 退出码与 pack 各失败分支、跨平台产物字节一致性（`.gitattributes`）、缺陷编号族登记、文档声明数（含出口端点清单、devDependencies 白名单、覆盖率门禁开关与行/分支覆盖双披露、status/reason 取值双向一致）一致性（98 项） |
+| `tests/settings.test.js` | 纯函数：默认值、类型收敛、绕过列表解析、输入校验（含 host:port 必拒写法提前拦截、方括号用法与主机形态收口）、容量估算（含循环引用退化为上限值）、主机名 ASCII 判定、出口检测端点容错配置、出口 IP 形态校验（`isIpLiteral`）（111 项） |
+| `tests/background.test.js` | 异步逻辑：并发下发的最终一致性、测试期暂停机制、取值一致性、CIDR 判定、`applyProxyCore` 三条失败分支（回读为空 / 缺 `levelOfControl` / 被外部接管）与两处「读取失败即跳过」保守分支的正向用例（46 项） |
 | `tests/fix-safety.test.js` | 修复安全性：暂停标志必然复位、串行队列不累积、收紧判定未误伤合法输入（19 项） |
 | `tests/concurrency.test.js` | 并发护栏（N1/N2）：暂停计数不泄漏、测试互斥生效（40 项） |
 | `tests/ownership.test.js` | 所有权护栏：断言实际生效配置而非存储值，外部接管不夺权也不丢配置；对比窗口恢复意图持久化与取样一致性复核；禁用路径遗留作用域清理、onProxyError 透传、onStartup 对齐、出口检测多端点容错与超时语义、状态写入失败降级标记；第 4 条审计修复的 background 侧护栏（clear() ≠ 强制直连：回读实际模式与回读失败均不得谎称直连）与第 5 条（状态写入代次：旧状态重试不得覆盖新状态、失败标记按【键】管理）（309 项） |
-| `tests/popup.test.js` | popup 交互：异常时按钮必须复位、通道失败如实呈现、遮蔽现场数据保全，且如实显示失败原因；表单重绘焦点保护、escapeHtml 转义契约与 XSS 回归；审计修复第 1/2/3/4/6 条的前台侧护栏（内容不变的保存必须显式下发、local 清理失败如实上报、超长列表"先落地→确证→再切换引用"、带 systemProxy 的禁用态不得宣称直连、收尾被接管不得落到"代理确实生效"、禁用态「回读失败」档不得宣称直连、恢复默认的阶段分辨与下发结果消费、恢复被中断档不得渲染为代理异常）；诊断导出（L-08）的渲染、脱敏（不含出口 IP）、读取失败如实、后台无响应/通道异常如实、按文本渲染与按钮复位（191 项） |
+| `tests/popup.test.js` | popup 交互：异常时按钮必须复位、通道失败如实呈现、遮蔽现场数据保全，且如实显示失败原因；表单重绘焦点保护、escapeHtml 转义契约与 XSS 回归；审计修复第 1/2/3/4/6 条的前台侧护栏（内容不变的保存必须显式下发、local 清理失败如实上报、超长列表"先落地→确证→再切换引用"、带 systemProxy 的禁用态不得宣称直连、收尾被接管不得落到"代理确实生效"、禁用态「回读失败」档不得宣称直连、恢复默认的阶段分辨与下发结果消费、恢复被中断档不得渲染为代理异常）；测试结论判定（`classifyTestResult` 的 20 组 verdict/kind 组合）、状态条严重度符号（L-7）；诊断导出（L-08）的渲染、脱敏（不含出口 IP）、读取失败如实、后台无响应/通道异常如实、按文本渲染与按钮复位（216 项） |
 | `tests/mutation-check.js` | 变异测试：故意破坏每个修复点，确认护栏测试真的会失败（34 项变异） |
 
-七套功能测试合计 **788 项断言**。
+七套功能测试合计 **839 项断言**。
 
 ```powershell
 npm test                       # 全部七套（tests/run-all.js 统一入口，任一失败即停）
 npm run coverage               # c8 覆盖率 + 门禁（低于 .c8rc.json 的门槛直接失败，覆盖率只可升不可降）
-                               #   行覆盖  background 95.3% / settings 99.6% / popup 91.1%
-                               #   分支覆盖 background 85.0% / settings 95.2% / popup 77.6%
+                               #   行覆盖  background 97.2% / settings 100% / popup 96.3% / tools/package.js 100%
+                               #   分支覆盖 background 86.0% / settings 95.7% / popup 84.4% / tools/package.js 68.3%
+                               #   函数覆盖 100%；合计行覆盖 97.5% / 分支覆盖 86.9%
+                               #   （门禁阈值：行/语句 85、函数 95、分支 74；仅 Node 22 节点运行）
+npm run e2e                    # 真实浏览器冒烟（opt-in，见下）
 node tests\mutation-check.js   # 变异门禁：运行后会自动还原被变异文件（S-1 加固：
                                #   任何退出路径均幂等还原，运行前后快照比对工作区污染）
 ```
 
-发布前还须完成 [docs/E2E-SMOKE.md](docs/E2E-SMOKE.md) 的真实浏览器冒烟清单——单元/护栏测试全部依赖手写 chrome mock，真实 Chrome 的代理语义、存储配额与 SW 生命周期只有人工冒烟能兜底。
+### 发布前必须执行：真实浏览器 E2E 冒烟（`npm run e2e`）
+
+`npm test` 的 839 项断言**全部跑在 Node 里的 `chrome.*` 替身之上**——它们能证明「我们的逻辑按预期处理了给定的回读结果」，但证明不了「Chrome 会给出我们所假设的回读结果」。两者之间的差距恰好是本项目缺陷密度最高的地方：`chrome.proxy.settings.clear()` 只清**调用方槽位**（下层系统/策略代理会重新显现，桩测试永远返回 `direct`，真机返回 `system`），外部扩展接管后的 `levelOfControl` 在桩测试里只有手写才会出现。
+
+`tests/e2e-smoke.js` 用 Playwright 驱动真实 Chromium，加载**打包产物**跑通三条主干，共 22 项断言：
+
+| 主干 | 验收要点 |
+| --- | --- |
+| ① 启用 | 回读 `levelOfControl === controlled_by_this_extension` 且 `mode === fixed_servers`，`singleProxy` 与设置逐字段一致，`lastState.status === applied` |
+| ② 禁用 | 回读确认**未**残留本扩展的 `fixed_servers`，且签名完全回到测试前基线；`lastState.status === direct`；实际模式非 `direct` 时如实上报 `systemProxy`（不谎称直连） |
+| ③ 外部接管 | 第二个扩展（`tests/e2e/fixtures/interloper/`）写入自己的 `fixed_servers` 后，状态落 **`overridden` 而非 `applied`**，且本扩展**不夺权**（生效配置仍是接管者的 `127.0.0.1:19999`，不是本扩展的 `10808`） |
+
+它是**刻意 opt-in** 的，不并入 `npm test`、也不进 CI 门禁：它需要可选依赖 `playwright-core` 与一个 Chromium 二进制，二者都不属于本扩展的运行时契约（扩展本身仍是**零运行时依赖、零构建**），且需要真实进程环境——并入门禁会让「测试必须环境无关」这条硬约束失效。
+
+```powershell
+npm i                       # 可选依赖 playwright-core 已列入 devDependencies，npm ci 即可
+npm run e2e                 # 有头模式（兼容性最好）；自动复用本机已缓存的 Chromium
+$env:E2E_HEADLESS=1; npm run e2e          # 无头模式
+$env:E2E_CHROME_PATH="C:\path\to\chrome.exe"; npm run e2e   # 指定浏览器
+```
+
+退出码：`0` 全部通过；`1` 有断言失败（真实缺陷）；`2` 环境未就绪（缺可选依赖 / 缺 Chromium / 变异哨兵在位）——`2` **不计为失败**，按提示补齐环境后重跑即可。
+
+发布前还须完成 [docs/E2E-SMOKE.md](docs/E2E-SMOKE.md) 的**人工**冒烟残余项：自动化已覆盖三条主干（含三条主干的状态回读与控制权归属），但真实代理链路（连通性、出口 IP 是否变化、绕过列表是否真的直连）、安装升级路径、隐身窗口与存储配额仍只有人工清单能兜底。
 
 这些测试在 CI 上自动运行（Node 20 / 22 / 24 三个版本），见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
@@ -154,7 +184,7 @@ node tests\mutation-check.js   # 变异门禁：运行后会自动还原被变�
 
 ## 版本历史
 
-详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.12.0`。
+详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.14.0`。
 
 ## 安全
 
