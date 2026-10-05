@@ -21,7 +21,12 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function buildEnv(opts) {
   opts = opts || {};
-  const syncStore = {}, localStore = {}, sessionStore = {};
+  // 【S2】seedSession / seedSync：预置存储后加载 background.js，用于模拟
+  //   「SW 在窗口中途死亡后冷启动」的对账场景 —— 标记由前一个 env 的真实代码
+  //   路径写入，本 env 只负责把它带进冷启动。
+  const syncStore = Object.assign({}, opts.seedSync || {});
+  const localStore = {};
+  const sessionStore = Object.assign({}, opts.seedSession || {});
   const listeners = { changed: [], message: [], onChange: [], installed: [] };
   const setCalls = [];       // setProxy 的发起序列
   const setConfigs = [];     // R7-01：每次下发给 chrome.proxy 的完整配置对象
@@ -80,6 +85,13 @@ function buildEnv(opts) {
           if (cb) cb();
           if (Object.keys(changes).length) for (const fn of listeners.changed.slice()) fn(changes, areaName);
         }, 0);
+      },
+      // 【S2】clearPendingRestore 需要 session.remove（缺桩会使窗口 finally 抛错、
+      //   暂停计数泄漏，护栏连锁变红）。
+      remove(keys, cb) {
+        const ks = Array.isArray(keys) ? keys : [keys];
+        for (const k of ks) delete store[k];
+        setTimeout(() => { if (cb) cb(); }, 0);
       }
     };
   }
@@ -231,6 +243,12 @@ async function drain(env) {
 
 const BASE = { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", bypassList: "x" };
 function setSync(env, obj) { return new Promise(r => env.sandbox.chrome.storage.sync.set(obj, r)); }
+// 【A1/lint】put 原先声明在 R7-03 段的块级作用域内，却在 V-04 段的兄弟块中被使用
+//   （运行时靠 Annex B 的块级函数提升侥幸可用，ESLint no-undef 如实报警）。
+//   提升到模块层，让声明与全部使用点处于同一作用域。
+function put(env, area, obj) {
+  return new Promise(r => env.sandbox.chrome.storage[area].set(obj, r));
+}
 function ask(env, msg) {
   const h = env.listeners.message[0];
   return new Promise(r => h(msg, { id: SENDER_ID }, r));
@@ -367,9 +385,10 @@ function t(name, cond, extra) {
     const env = buildEnv({ fetchDelay: 120 });
     await ready(env, "10808");
     env.setGetHook((n, o, cb, dflt) => {
-      // n=1 before；n=2 清除前复核（仍由我方控制，允许清除）；
-      // n>=3 收尾复核（此时已被外部接管）
-      if (n <= 2) return dflt(o, cb);
+      // n=1 before；n=2 取样后复核（G4 新增，仍由我方控制）；
+      // n=3 清除前复核（仍由我方控制，允许清除）；
+      // n>=4 收尾复核（此时已被外部接管）
+      if (n <= 3) return dflt(o, cb);
       setTimeout(() => cb({
         value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
         levelOfControl: "controlled_by_other_extensions"
@@ -421,7 +440,9 @@ function t(name, cond, extra) {
     const env = buildEnv({ fetchDelay: 60 });
     await ready(env, "10808");
     env.setGetHook((n, o, cb, dflt) => {
-      if (n === 1) return dflt(o, cb);
+      // n<=3：before、取样后复核（G4 新增）与清除前复核都正常回读；
+      // n>=4：收尾复核开始回读失败（控制权未知即拒绝）
+      if (n <= 3) return dflt(o, cb);
       setTimeout(() => { env.sandbox.chrome.runtime.lastError = { message: "get failed (injected)" }; cb(undefined); env.sandbox.chrome.runtime.lastError = undefined; }, 0);
     });
     env.onClearDuringDirect(sb => {
@@ -443,10 +464,15 @@ function t(name, cond, extra) {
     const env = buildEnv({ fetchDelay: 80 });
     await ready(env, "10808");
     env.setGetHook((n, o, cb, dflt) => {
-      if (n === 1) {
+      if (n <= 2) {
         dflt(o, cb);
-        // 在 before 回读完成之后、我方 clear 之前，外部接管
-        setTimeout(() => { env.sandbox.chrome.proxy.settings.set({ value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } } }, () => {}); }, 1);
+        // 在取样后复核（G4 新增的第二次回读）完成之后、我方 clear 之前，外部接管。
+        //   注入点必须放在 n===2 而不是 n===1：否则接管会落在取样窗口内，
+        //   被 G4 的取样一致性复核先拦下（sampling_unstable），本用例要验证的
+        //   【窗口清除前复核的 TOCTOU 防护】就永远走不到了。
+        if (n === 2) {
+          setTimeout(() => { env.sandbox.chrome.proxy.settings.set({ value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } } }, () => {}); }, 1);
+        }
         return;
       }
       setTimeout(() => cb({
@@ -1128,11 +1154,11 @@ function t(name, cond, extra) {
     const env = buildEnv({ fetchDelay: 120 });
     await ready(env, "10808");
 
-    // 第一次窗口：入口、窗口开头复核与收尾复核（前 3 次回读）都属我方，
-    //   清除与收尾提交都真实执行；真正的接管发生在【收尾提交内部】
+    // 第一次窗口：before、取样后复核（G4 新增）、窗口开头复核与收尾复核（前 4 次
+    //   回读）都属我方，清除与收尾提交都真实执行；真正的接管发生在【收尾提交内部】
     //   （applyProxyCore 下发前的控制权复核）→ 按设计放弃写入、且【不清脏】。
     env.setGetHook((n, o, cb, defaultGet) => {
-      if (n <= 3) return defaultGet(o, cb);
+      if (n <= 4) return defaultGet(o, cb);
       return cb({
         value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
         levelOfControl: "controlled_by_other_extensions"
@@ -1170,8 +1196,9 @@ function t(name, cond, extra) {
 
     // 第二次窗口：入口复核仍属我方（才允许进入对比），窗口开头复核即为外部接管
     //   → 命中【清除前接管】早退分支，全程不执行清除、也不下发任何配置。
+    //   （n=1 before、n=2 取样后复核【G4】都属我方；n>=3 = 窗口开头复核 → 外部）
     env.setGetHook((n, o, cb, defaultGet) => {
-      if (n === 1) return defaultGet(o, cb);
+      if (n <= 2) return defaultGet(o, cb);
       return cb({
         value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
         levelOfControl: "controlled_by_other_extensions"
@@ -1785,9 +1812,7 @@ function t(name, cond, extra) {
       const cfg = env.setConfigs[env.setConfigs.length - 1];
       return (cfg && cfg.rules && cfg.rules.bypassList) || [];
     }
-    function put(env, area, obj) {
-      return new Promise(r => env.sandbox.chrome.storage[area].set(obj, r));
-    }
+    // put(env, area, obj) 已提升至模块层（见文件头部 BASE 附近）
     // 降级现场的统一构造：sync 有完整配置，bypassList 取 syncBypass 给定值。
     async function degradedEnv(syncBypass, withKey) {
       const env = buildEnv({ fetchDelay: 20 });
@@ -2166,6 +2191,128 @@ function t(name, cond, extra) {
     }
 
   console.log("");
-  console.log("通过 " + pass + " 项，失败 " + fail + " 项");
+  console.log("== S2：对比窗口期间 SW 被回收 —— 恢复意图持久化 + 冷启动对账 ==");
+  {
+    // 【S1 步骤：真实驱动一次「窗口内死亡」】用 getHook 让窗口在清除之后永久挂起
+    //   （收尾复核永不回调）—— 与「SW 在恢复之前被回收」等价：writePendingRestore
+    //   已沿真实代码路径写入、窗口的 finally（含 clearPendingRestore）永不执行。
+    const envA = buildEnv({ fetchDelay: 40 });
+    await ready(envA, "10808");
+    envA.setGetHook((n, o, cb, dflt) => {
+      // n=1 before；n=2 取样后复核（G4）；n=3 清除前复核（允许清除）；
+      // n>=4 = 收尾复核：永不回调 = SW 在此处死亡
+      if (n <= 3) return dflt(o, cb);
+      // 永不回调：窗口挂起在「代理已清除」与「恢复」之间
+    });
+    // 故意不 await：窗口被桩永久挂起，await 会卡死本用例（这正是「SW 死亡」的模拟）
+    ask(envA, { action: "testConnection", compare: true });
+    const t0S2 = Date.now();
+    // 等待条件必须是「代理确实已被清除」（proxyActive=false），不能用 clearCalls
+    //   是否包含 "regular" —— 冷启动（未启用配置）本身就会清一次 regular。
+    while (!(envA.sessionStore.pendingRestore && envA.isProxyActive() === false) &&
+           Date.now() - t0S2 < 3000) await sleep(4);
+    t("S2-A 前置事实：清除之前已沿真实代码路径把「待恢复意图」写入 session",
+      !!envA.sessionStore.pendingRestore &&
+      typeof envA.sessionStore.pendingRestore.at === "number",
+      JSON.stringify(envA.sessionStore.pendingRestore));
+    t("S2-B 前置事实：此刻代理已被清除（正处于「代理已清除」的危险区间）",
+      envA.isProxyActive() === false && envA.clearCalls.indexOf("regular") >= 0,
+      "proxyActive=" + envA.isProxyActive() + "；clears=" + JSON.stringify(envA.clearCalls));
+    t("S2-C 前置事实：窗口确实被挂起在恢复之前（无任何我方恢复写回）",
+      envA.setCalls.length === 0,
+      "set 序列 = " + JSON.stringify(envA.setCalls));
+
+    // 【S2 步骤：冷启动对账】新 SW 实例带着残留标记与用户配置启动。
+    const envB = buildEnv({
+      seedSession: { pendingRestore: envA.sessionStore.pendingRestore },
+      seedSync: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "x" }
+    });
+    await drain(envB);
+    await sleep(120);
+
+    t("S2-D 核心：冷启动对账后代理按最新设置重新下发（fixed_servers 10808）",
+      envB.setCalls.indexOf("127.0.0.1:10808") >= 0 && envB.getEffective() === "127.0.0.1:10808",
+      "set 序列 = " + JSON.stringify(envB.setCalls) + "；实际 = " + envB.getEffective());
+    t("S2-E 核心：状态被如实标记为「恢复被中断」（restore_interrupted），不再静默",
+      envB.stateWrites.some(s => s && s.reason === "restore_interrupted" && s.status === "error"),
+      JSON.stringify(envB.stateWrites));
+    t("S2-F 核心：残留标记已被消费（session 中不再有 pendingRestore）",
+      !envB.sessionStore.pendingRestore,
+      JSON.stringify(envB.sessionStore.pendingRestore));
+    t("S2-G 最终状态回到真实终态 applied（对账之后一切照常）",
+      (envB.sessionStore.lastState || {}).status === "applied",
+      JSON.stringify(envB.sessionStore.lastState));
+    envA.closeWindow(); envB.closeWindow();
+  }
+
+  console.log("");
+  console.log("== S2 反向对照：正常窗口收尾后不得留下恢复意图标记 ==");
+  {
+    const env = buildEnv({ fetchDelay: 60 });
+    await ready(env, "10808");
+    await ask(env, { action: "testConnection", compare: true });
+    await sleep(700); env.closeWindow();
+    t("S2-H 窗口正常收尾（含早退）后 session 中无 pendingRestore 残留",
+      !env.sessionStore.pendingRestore,
+      JSON.stringify(env.sessionStore.pendingRestore));
+    t("S2-I 正常窗口收尾后代理恢复生效（既有语义不变）",
+      env.getEffective() === "127.0.0.1:10808",
+      "实际 = " + env.getEffective());
+  }
+
+  console.log("");
+  console.log("== G4：前置取样期间配置变化 —— 标记 sampling_unstable 并放弃对比 ==");
+  {
+    // 构造：before 回读（n=1）之后、直连出口取样期间，外部接管改变了实际配置。
+    //   取样后的复核回读（n=2，G4 新增）发现签名不一致 → 不得带着不可信的
+    //   直连评价基准进入对比窗口，必须如实标记并早退。
+    const env = buildEnv({ fetchDelay: 60 });
+    await ready(env, "10808");
+    const clearsBeforeG4 = env.clearCalls.length;
+    let injected = false;
+    env.setGetHook((n, o, cb, dflt) => {
+      // n=1 = before 回读：正常放行，并在其后触发一次外部接管（取样期间生效）
+      if (n === 1 && !injected) {
+        injected = true;
+        dflt(o, cb);
+        setTimeout(() => {
+          env.externalSet("controlled_by_other_extensions", "external", "9090");
+        }, 0);
+        return;
+      }
+      // n>=2（取样后复核及之后）：外部接管后的真实状态
+      setTimeout(() => cb({
+        value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
+        levelOfControl: "controlled_by_other_extensions"
+      }), 0);
+    });
+    const resp = await ask(env, { action: "testConnection", compare: true });
+    await sleep(300); env.closeWindow();
+
+    t("G4-A 核心：结果标记 samplingUnstable（取样不可信被如实上报）",
+      !!(resp && resp.result && resp.result.samplingUnstable === true),
+      "samplingUnstable=" + (resp && resp.result && resp.result.samplingUnstable));
+    t("G4-B 核心：compareSkipped = sampling_unstable（放弃对比，不给出无依据结论）",
+      !!(resp && resp.result && resp.result.compareSkipped === "sampling_unstable"),
+      "compareSkipped=" + (resp && resp.result && resp.result.compareSkipped));
+    t("G4-C 核心：未进入对比窗口（无新增 regular 清除，未动仍在生效的配置）",
+      env.clearCalls.slice(clearsBeforeG4).indexOf("regular") < 0,
+      "新增清除 = " + JSON.stringify(env.clearCalls.slice(clearsBeforeG4)));
+    t("G4-D 核心结论：不存在「出口 IP 与直连相同」的误导性判定",
+      !(resp && resp.result && resp.result.ipChanged === false &&
+        resp && resp.result && resp.result.direct && resp.result.direct.ok),
+      "ipChanged=" + (resp && resp.result && resp.result.ipChanged));
+  }
+
+  console.log("");
+  // 【G1】文档一致性自检：README 声明的本套件断言数必须与实际通过数一致
+{
+  const g1 = require("./g1-consistency.js").g1ConsistencyCheck("tests/ownership.test.js", pass);
+  if (!g1.skipped && g1.declared !== pass) {
+    fail++;
+    console.log("  FAIL  G1 文档一致性：README 声明 " + g1.declared + " 项，实际通过 " + pass + " 项（改测试后请同步 README 对应行与合计）");
+  }
+}
+console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);
 })().catch(e => { console.error("EXC: " + (e && e.stack || e)); process.exit(2); });

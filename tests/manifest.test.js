@@ -148,13 +148,68 @@ console.log("== 发布 tag 与 manifest.version 一致性（R3-02）==");
     console.log("  SKIP  当前提交没有 tag（候选提交），跳过发布 tag 一致性校验");
   } else {
     for (const tag of tagAtHead) {
-      t("指向 HEAD 的 tag " + tag + " 与 manifest.version 一致（应为 v" + version + "）",
-        tag === "v" + version, "tag=" + tag + " version=" + version);
+      // 【G1 计数稳定性】本断言只在「tag 触发」的运行里出现，若计入 pass，
+      //   同一份代码在候选提交（无 tag）与发布提交（有 tag）上的通过数会差 1，
+      //   README 的声明数就无法同时匹配两者。因此不计入 pass 计数：
+      //   失败照常 fail++（CI 变红），成功只打印日志。
+      if (tag === "v" + version) {
+        console.log("  PASS  指向 HEAD 的 tag " + tag + " 与 manifest.version 一致（v" + version + "）");
+      } else {
+        fail++;
+        console.log("  FAIL  指向 HEAD 的 tag " + tag + " 与 manifest.version 不一致（应为 v" + version + "）  -> tag=" + tag + " version=" + version);
+      }
     }
   }
   t("manifest.json 能读出 version", typeof version === "string" && version.length > 0, String(version));
 }
 
 console.log("");
+console.log("== 文档声明数一致性（G1：合计 = 各行之和；变异数与脚本一致）==");
+{
+  // 【G1】README 的「合计 N 项断言」必须等于其表格各行声明数之和 ——
+  //   每行的数值是否与实际一致由各测试文件结尾的 G1 运行期自检把守，
+  //   这里守的是「行与合计之间」的算术一致性，两层合起来文档漂移必然红。
+  const readme = read("README.md");
+  const rows = [...readme.matchAll(/tests\/[\w-]+\.test\.js[^\n]*?（(\d+) 项）/g)].map(m => Number(m[1]));
+  t("README 测试表能解析出 7 行断言数声明", rows.length === 7, "解析到 " + rows.length + " 行");
+  const total = (readme.match(/合计 \*\*(\d+) 项断言\*\*/) || [])[1];
+  t("README 的合计断言数 = 各行声明数之和",
+    !!total && Number(total) === rows.reduce((a, b) => a + b, 0),
+    "合计=" + total + "；各行=" + JSON.stringify(rows) + "；和=" + rows.reduce((a, b) => a + b, 0));
+
+  // 【G1】变异数同理：README 声明的变异数必须与 tests/mutation-check.js 实际定义数一致
+  const mutationSrc = read("tests/mutation-check.js");
+  const mutationCount = (mutationSrc.match(/expectFail:/g) || []).length;
+  const declaredMut = (readme.match(/（(\d+) 项变异）/) || [])[1] ||
+                      (readme.match(/(\d+) 项变异全部被拦截/) || [])[1];
+  t("README 声明的变异数与 mutation-check.js 实际定义数一致",
+    !!declaredMut && Number(declaredMut) === mutationCount,
+    "README=" + (declaredMut || "未声明") + "；实际=" + mutationCount);
+}
+
+console.log("");
+console.log("== 判据单一实现（G3：遮蔽现场判据收敛到 settings.js）==");
+{
+  // 【G3 成因记录】同一业务判据曾有三处独立实现（settings / background / popup），
+  //   且发生实质漂移 —— 那正是 S1（存量编辑形态保存清空 local）的直接成因。
+  //   修复后 popup 一律调用 S.isLegacyShadowPair（前台确认门，可放宽）；
+  //   background 保留语义独立的 isLegacyShadowed（后台自愈，刻意保守），
+  //   两者的分工由 settings.js 注释声明。这里断言 popup 不再携带内联判据副本。
+  t("popup.js 调用共享判据 isLegacyShadowPair（G3：单一实现）",
+    /S\.isLegacyShadowPair\s*\(/.test(popupJs),
+    "popup.js 中未找到 S.isLegacyShadowPair 调用");
+  t("settings.js 同时导出 looksLikeShadowEdit 与 isLegacyShadowPair",
+    /looksLikeShadowEdit/.test(settingsJs) && /isLegacyShadowPair/.test(settingsJs));
+}
+
+console.log("");
+// 【G1】文档一致性自检：README 声明的本套件断言数必须与实际通过数一致
+{
+  const g1 = require("./g1-consistency.js").g1ConsistencyCheck("tests/manifest.test.js", pass);
+  if (!g1.skipped && g1.declared !== pass) {
+    fail++;
+    console.log("  FAIL  G1 文档一致性：README 声明 " + g1.declared + " 项，实际通过 " + pass + " 项（改测试后请同步 README 对应行与合计）");
+  }
+}
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail > 0 ? 1 : 0);

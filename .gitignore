@@ -15,3 +15,12 @@ desktop.ini
 
 # 本地隔离工作区，不入库
 .worktrees/
+
+# 依赖与构建产物（A1 / A3）：运行时零依赖，node_modules 仅含 lint 用的 devDependencies
+node_modules/
+dist/
+
+# 本地助手记忆目录：不入库。
+#   CI 有「变异后 git status --porcelain 必须为空」的硬门禁，
+#   未跟踪的本地目录会被误判为变异未还原造成的污染。
+.workbuddy/

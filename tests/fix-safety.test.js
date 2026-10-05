@@ -38,6 +38,13 @@ function buildEnv(opts) {
             for (const fn of listeners.changed.slice()) fn(changes, areaName);
           }
         }, 0);
+      },
+      // 【S2】clearPendingRestore 需要 session.remove（缺桩会使窗口 finally 抛错、
+      //   暂停计数泄漏，护栏连锁变红）。
+      remove(keys, cb) {
+        const ks = Array.isArray(keys) ? keys : [keys];
+        for (const k of ks) delete store[k];
+        setTimeout(() => { if (cb) cb(); }, 0);
       }
     };
   }
@@ -222,7 +229,15 @@ function t(name, cond, extra) {
   }
 
   console.log("");
-  console.log("通过 " + pass + " 项，失败 " + fail + " 项");
+  // 【G1】文档一致性自检：README 声明的本套件断言数必须与实际通过数一致
+{
+  const g1 = require("./g1-consistency.js").g1ConsistencyCheck("tests/fix-safety.test.js", pass);
+  if (!g1.skipped && g1.declared !== pass) {
+    fail++;
+    console.log("  FAIL  G1 文档一致性：README 声明 " + g1.declared + " 项，实际通过 " + pass + " 项（改测试后请同步 README 对应行与合计）");
+  }
+}
+console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);
 })().catch(function (e) {
   console.error("测试脚本异常:", e);

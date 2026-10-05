@@ -1,4 +1,4 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.7.1]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.8.0]
 var S = window.EasyProxy;
 
 var el = {
@@ -35,7 +35,13 @@ var STATUS_TEXT = {
   //   这一档下我们【根本不知道】代理现在是什么状态，必须如实说不知道；
   //   用 muted 档的直连文案会把「读不到」谎报成「用户没开代理」。
   //   也不并入 error 档：本次什么都没做，代理没有被改动，凭什么说它异常。
-  status_read_failed: ["状态未知：无法读取当前状态，代理可能仍在生效", "warn"]
+  //   status_read_failed: ["状态未知：无法读取当前状态，代理可能仍在生效", "warn"]
+  status_read_failed: ["状态未知：无法读取当前状态，代理可能仍在生效", "warn"],
+  // 【G2】消息通道层面失败（send reject / 后台无响应）：与 status_read_failed 同为
+  //   「未知」档，但成因不同 —— 不是「读不到 session」，而是「根本没能与后台通信」
+  //   （SW 崩溃 / 扩展重载 / 消息通道异常）。同样必须如实说不知道，
+  //   绝不能静默停留在初始文案「读取状态中…」，把未知伪装成一切正常。
+  channel_failed: ["状态未知：无法与后台通信，代理可能仍在生效（可尝试关闭后重新打开弹窗）", "warn"]
 };
 
 function setStorage(area, obj) {
@@ -47,10 +53,15 @@ function setStorage(area, obj) {
   });
 }
 
+// 【G2】通道错误必须暴露：此前 `void chrome.runtime.lastError` 把「根本没能与后台
+//   通信」吞成 resolve(null)，调用方无法区分「后台回答了：没有状态」与「后台根本
+//   没回答」。现在 lastError 存在时 reject，由调用方各自渲染失败档：
+//   runTest 走 R7-08 的「测试失败」文案，refreshStatus 走 G2 的「无法与后台通信」状态条。
 function send(message) {
-  return new Promise(function (resolve) {
+  return new Promise(function (resolve, reject) {
     chrome.runtime.sendMessage(message, function (resp) {
-      void chrome.runtime.lastError;
+      var err = chrome.runtime.lastError;
+      if (err) { reject(new Error(err.message || "消息通道异常")); return; }
       resolve(resp || null);
     });
   });
@@ -125,8 +136,9 @@ function fmtExit(exit) {
 
 function renderTest(result) {
   if (!result) {
+    // 【A5】内联色值改为 popup.html 中定义的样式类，消除样式双轨。
     el.testResult.innerHTML =
-      '<span style="color:#5a6772">尚未测试。点击「测试当前出口」查看流量实际从哪里出去。</span>';
+      '<span class="t-muted">尚未测试。点击「测试当前出口」查看流量实际从哪里出去。</span>';
     return;
   }
 
@@ -193,6 +205,12 @@ function renderTest(result) {
   } else if (result.compareSkipped === "unknown_active_mode") {
     verdict = "ℹ 无法确认当前实际生效的代理配置，已跳过直连对比，未改动现有代理。";
     kind = "warn";
+  } else if (result.compareSkipped === "sampling_unstable") {
+    // 【G4】取样期间配置发生了变化：直连评价基准不可信，必须如实说明并请用户重测，
+    //   绝不能带着不可信的基准给出「代理未生效」之类的结论。
+    verdict = "ℹ 取样期间代理配置发生了变化，本次「直连出口」不可信，已放弃对比，未改动现有代理；请重测。";
+    if (result.compareSkippedReason) verdict += "（" + result.compareSkippedReason + "）";
+    kind = "warn";
   } else if (!result.exit || !result.exit.ok) {
     verdict = "✗ 出口检测失败。若已启用代理，说明流量可能无法出去——请检查代理地址与端口，或代理软件是否在运行。";
     kind = "error";
@@ -241,22 +259,23 @@ function escapeHtml(s) {
 function renderTestError(err) {
   var reason = (err && err.message) ? err.message : err;
   if (!reason) reason = "消息通道异常";
+  // 【A5】内联色值改为样式类（与 renderTest 的 muted 同一处理）。
   el.testResult.innerHTML =
-    '<span style="color:#a3251b">测试失败：' + escapeHtml(reason) + "</span>";
+    '<span class="t-error">测试失败：' + escapeHtml(reason) + "</span>";
 }
 
 async function runTest(compare) {
   el.testButton.disabled = true;
   el.testDirectButton.disabled = true;
   el.testResult.innerHTML =
-    '<span style="color:#5a6772">测试中…' + (compare ? "（对比期间会短暂切换为直连，随后自动恢复）" : "") + "</span>";
+    '<span class="t-muted">测试中…' + (compare ? "（对比期间会短暂切换为直连，随后自动恢复）" : "") + "</span>";
 
   try {
     var resp = await send({ action: "testConnection", compare: compare });
 
     if (!resp || !resp.ok) {
       el.testResult.innerHTML =
-        '<span style="color:#a3251b">测试失败：' + escapeHtml((resp && resp.error) || "无响应") + "</span>";
+        '<span class="t-error">测试失败：' + escapeHtml((resp && resp.error) || "无响应") + "</span>";
       return;
     }
     renderTest(resp.result);
@@ -290,6 +309,9 @@ var loadedShadowed = false;
 //   不用 window.confirm()：popup 一旦失焦就会被销毁，原生对话框的返回值
 //   永远回不来，会把保存变成「点了没反应」——用一个静默失败换另一个不可接受。
 var pendingShadowConfirm = false;
+// 【G6】「恢复默认」的行内二次确认状态。与 pendingShadowConfirm 同一条反模式防线：
+//   window.confirm 在 popup 失焦时永不返回，会把高危操作变成「点了没反应」。
+var pendingResetConfirm = false;
 var READ_FAIL_HINT = "读取设置失败，当前显示可能不是你的真实设置；为避免覆盖你的设置，已禁止保存。请关闭并重新打开弹窗（或等存储恢复后自动刷新）。";
 
 function setFormDisabled(disabled) {
@@ -308,10 +330,17 @@ function resetShadowConfirm() {
   el.saveButton.textContent = "保存设置";
 }
 
-// 表单字段清单：读取失败时统一清空 + 禁用。
+// 【G6】「恢复默认」确认态复位：表单重载或操作结束时与 saveButton 同步复位，
+//   避免确认态跨操作残留（隔了很久之后一次普通点击直接执行清空）。
+function resetResetConfirm() {
+  pendingResetConfirm = false;
+  el.resetButton.textContent = "恢复默认";
+}
+
+// 读取失败时统一清空 + 禁用全部表单字段（enableProxy / proxyType / proxyHost /
+//   proxyPort / bypassList）。
 //   清空是必须的 —— 存储里可能是用户上一次的真实配置（sync 与 local 两次读取之间失败时），
 //   留着它就等于让用户在一份【不完整】的显示上继续编辑，那正是本缺陷的误导来源。
-var FORM_FIELDS = ["enableProxy", "proxyType", "proxyHost", "proxyPort", "bypassList"];
 
 function clearForm() {
   el.enableProxy.checked = false;
@@ -373,36 +402,59 @@ function load() {
       //   遮蔽他真正的规则。后台的连续自愈会很快把 sync 恢复为空串占位、让 local
       //   重新生效；在自愈完成之前，用户至少能看到发生了什么，不会把"看到默认值"
       //   误当成"我的规则丢了"而重新手打一遍。
-      var shadowed =
-        typeof (items && items.bypassList) === "string" &&
-        items.bypassList === S.DEFAULTS.bypassList &&
-        typeof (local && local.bypassList) === "string" &&
-        local.bypassList.length > 0 &&
-        local.bypassList !== S.DEFAULTS.bypassList;
+      // 【S1/G3】判据收敛到 settings.js 的唯一实现 isLegacyShadowPair：
+      //   此前这里是内联的「逐字符相等」判据，与 background.js 的 isLegacyShadowed
+      //   一样识别不了「默认列表 + 编辑」形态（升级前 V-01 缺陷留下的存量污染：
+      //   sync = 内置默认列表整段 + 用户追加/编辑的内容）。该形态下用户点一次保存
+      //   就会经 clearLocalBypassIfAny 把 local 唯一副本静默清空（不可逆，且全程
+      //   无 lastError）。isLegacyShadowPair 同时覆盖「逐字符相等」与「默认列表 +
+      //   编辑」两种形态，并有 settings.test.js V-01-a…k 共 11 条断言护住语义。
+      //   后台自愈判据刻意保持保守（逐字符相等）：它要执行写操作，放宽会误伤
+      //   用户自写列表 —— 保守侧不放宽，前台确认门放宽，这是 settings.js 注释里
+      //   「后台保守、前台可放宽」的既有设计意图。
+      var shadowed = S.isLegacyShadowPair(
+        items && items.bypassList,
+        local && local.bypassList
+      );
       loadedShadowed = shadowed;
       // 【V-01】表单重载即复位确认态与按钮文案：任何一次存储变化（含保存成功后
       //   自己触发的那次）都会走到这里，确认态不会跨操作残留。
+      //   【G6】「恢复默认」的行内确认态同理一并复位。
       resetShadowConfirm();
+      resetResetConfirm();
       if (shadowed) {
-        console.warn("检测到历史遗留的绕过列表污染现场：本机 local 保存着用户规则，但 sync 是内置默认列表。已标记本次表单，保存时不会据此删除 local。");
-        // 【W-01】此前的文案是「此提示存在期间请勿保存」——守卫补全覆盖全部写入路径之后，
-        //   这句话已经变成谎言（保存不会删掉本机那份规则），而且会诱导用户在被遮蔽的
-        //   界面上空等。新文案把两件事分开说清：「保存不会丢数据」与「保存会覆盖生效值」。
-        showHint("检测到历史遗留的绕过列表：本机保存着你自己的规则，但当前生效的是内置默认列表。" +
-          "后台正在自动恢复为你的规则。此时可以直接保存（不会删掉本机那份规则），" +
-          "但保存的内容会成为当前生效值；若想恢复自己的规则，请等本提示消失后再保存。", "warn");
+        console.warn("检测到历史遗留的绕过列表污染现场：本机 local 保存着用户规则，但 sync 是内置默认列表（或以其为前缀的编辑形态）。已标记本次表单，保存时不会据此删除 local。");
+        // 【W-01】把两件事分开说清：「保存不会丢数据」与「保存会覆盖生效值」。
+        //   【S1】不再承诺「后台正在自动恢复」：对「默认列表 + 编辑」形态，后台
+        //   自愈判据（保守、逐字符相等）不会触发，提示必须对两种形态都成立。
+        showHint("检测到历史遗留的绕过列表：本机保存着你自己的规则，但当前生效的是内置默认列表（或以其为前缀的内容）。" +
+          "此时可以直接保存（不会删掉本机那份规则），但保存的内容会成为当前生效值；" +
+          "若想恢复自己的规则，请先核对本机那份内容，再把它重新保存一次。", "warn");
       }
     });
   });
 }
 
+// 【G2】通道失败的统一渲染：状态条必须离开初始文案，如实进入「未知」档。
+//   此前 refreshStatus 在 !resp 时直接 return、通道错误被 send 吞掉，
+//   SW 崩溃 / 扩展重载后状态条会永久停留在「读取状态中…」，用户看不到任何异常。
+function renderChannelFailed() {
+  el.statusBar.textContent = STATUS_TEXT.channel_failed[0];
+  el.statusBar.className = "status " + STATUS_TEXT.channel_failed[1];
+}
+
 function refreshStatus() {
   send({ action: "getStatus" }).then(function (resp) {
-    if (!resp) return;
+    // 【G2】resp 为 null（后台无响应）与通道错误同档：都是「无法与后台通信」，
+    //   必须如实渲染，不得静默 return 让状态条停留在初始文案上。
+    if (!resp) { renderChannelFailed(); return; }
     // 【R8-04】resp.readFailed 为真时 state 必为 null，两者一起交给 renderStatus：
     //   只传 state 会让它走了「真的没有状态」那条正确兜底，重新变成假象。
     renderStatus(resp.state, resp.readFailed === true);
     renderTest(resp.test);
+  }, function () {
+    // 【G2】send reject（chrome.runtime.lastError / 同步抛错）：同上，如实呈现。
+    renderChannelFailed();
   });
 }
 
@@ -426,7 +478,12 @@ function refreshStatus() {
 //   误判的代价也经过权衡：用户手写出与默认列表逐字相同的列表（含首行注释与空行）
 //   概率可忽略；即使真的发生，代价只是 local 多留一份与 sync 相同的残留，
 //   不丢数据 —— 保守方向正确。
-function clearLocalBypassIfAny(savedBypassList) {
+function clearLocalBypassIfAny(savedBypassList, formWasShadowed) {
+  // 【S1】纵深防御第二层：调用点已保证遮蔽现场不会进入本函数，这里再挡一次 ——
+  //   即使上游判据将来发生漂移（G3 正是这么发生的），只要本次保存发生在遮蔽现场
+  //   （表单内容不来自用户自己的规则），就绝不写 local。写空串会丢用户唯一副本，
+  //   写表单值会覆盖唯一副本，两种动作都不允许。
+  if (formWasShadowed === true) return Promise.resolve();
   // 【R8-02】保存的正是系统默认列表 → 保留 local，不发任何写入。
   // 【R9-01】本判据（逐字符等于内置默认列表 = 存量污染特征）保持不变：
   //   R8-02-C 已论证把它放宽成"一律不清"会让过期副本复活，那不可接受。
@@ -537,7 +594,8 @@ function save() {
         : setStorage("sync", settings).then(function () {
             // 【R8-02】把本次写进 sync 的 bypassList 一并交给清理函数：
             //   它据此判断「保存的是系统默认列表」还是「用户自己撰写的列表」。
-            return clearLocalBypassIfAny(settings.bypassList);
+            //   【S1】同时传入 formWasShadowed 快照：遮蔽现场下绝不写 local（纵深防御）。
+            return clearLocalBypassIfAny(settings.bypassList, formWasShadowed);
           }).then(function () {
             showHint("设置已保存", "ok");
           }));
@@ -551,8 +609,28 @@ function save() {
   });
 }
 
+// 【G6】恢复默认：移除 window.confirm，改用与 save()（V-01）一致的行内二次确认。
+//   同一反模式的第二个实例：popup 一旦失焦即被销毁，原生对话框的返回值永远回不来，
+//   会把「恢复默认」变成「点了没反应」。而该操作会清空本机 local 里的绕过列表
+//   （遮蔽现场下那很可能是用户规则的唯一副本），属用户必须明确知情的高危操作，
+//   绝不允许静默失败。第一次点击只进入确认态（零写入），第二次点击才执行。
 function resetDefaults() {
-  if (!window.confirm("将把所有设置恢复为默认值（含默认绕过列表），确定吗？")) return;
+  if (!pendingResetConfirm) {
+    pendingResetConfirm = true;
+    el.resetButton.textContent = "确认恢复默认";
+    var msg = "将把所有设置恢复为默认值（含默认绕过列表），并清空本机保存的绕过列表。" +
+      "再点一次上面的「确认恢复默认」才会执行；取消请直接关闭弹窗。";
+    // 【G6】遮蔽现场下的知情补充：本机 local 里躺着的很可能是用户规则的唯一副本，
+    //   恢复默认会把它一并清空 —— 必须让用户在确认之前知道这一点（与 save() 在
+    //   遮蔽现场下的处理保持同一知情标准）。
+    if (loadedShadowed) {
+      msg = "注意：本机还保存着你自己的绕过规则（可能是唯一副本），恢复默认将把它一并清空。" + msg;
+    }
+    showHint(msg, "warn");
+    return;
+  }
+  pendingResetConfirm = false;
+  el.resetButton.textContent = "恢复默认";
   setStorage("sync", S.DEFAULTS).then(function () {
     return setStorage("local", { bypassList: "" });
   }).then(function () {

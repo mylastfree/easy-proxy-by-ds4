@@ -238,6 +238,19 @@ const mutations = [
     from: "  var chain = formWasShadowed\n    ? setStorage(\"sync\", settings).then(function () {",
     to: "  var chain = false\n    ? setStorage(\"sync\", settings).then(function () {",
     expectFail: true
+  },
+  {
+    // 【S1】load() 里的遮蔽现场标记（loadedShadowed）是「存量编辑形态不清空 local」
+    //   的守门者：判据已收敛到 S.isLegacyShadowPair（同时覆盖「逐字符相等」与
+    //   「默认列表+编辑」两种形态）。把它变异成恒假 = 退回 2.7.1 的失明状态：
+    //   存量污染现场（sync = 默认列表+编辑、local = 用户唯一副本）下用户点一次
+    //   保存就会经 clearLocalBypassIfAny 把 local 写空（不可逆数据丢失）。
+    //   popup 的 S1 用例（含 R9-01-F3/F4 零写入断言）必须变红。
+    name: "M19 遮蔽现场标记退化为恒假（S1 回归：存量编辑形态保存清空 local 唯一副本）",
+    target: "popup",
+    from: "      loadedShadowed = shadowed;",
+    to: "      loadedShadowed = false;",
+    expectFail: true
   }
 ];
 

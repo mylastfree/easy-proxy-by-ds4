@@ -2,6 +2,39 @@
 
 本文件记录本扩展的所有重要变更。
 
+## [2.8.0] - 2026-10-05
+
+关闭生产上线前审计（基准 `7e5731c`）的全部问题：2 项严重（S1 / S2）、6 项一般（G1–G6）、6 项建议（A1–A6）。本版新增可观察契约（`chrome.storage.session` 新键 `pendingRestore`、状态子类型 `reason:"restore_interrupted"`、对比测试早退原因 `compareSkipped:"sampling_unstable"`、popup 状态条新档「无法与后台通信」、清单新增 `author` / `homepage_url`），按仓库惯例升 minor。公开发布准入的前置条件（S1 + S2 + 文档纠偏）在本版全部关闭。
+
+### 修复（严重）
+
+- **S1（P1）存量「默认列表 + 编辑」污染现场保存会静默清空 `local` 唯一副本**：2.7.1 的三处生效判据（`popup.js` 的 `loadedShadowed` 内联判据、`clearLocalBypassIfAny` 的守卫、`background.js` 的自愈判据）全部只认「逐字符相等」，对升级前 V-01 缺陷留下的「sync = 内置默认列表整段 + 用户编辑」形态完全失明 —— 用户在该现场点一次保存，`local` 里的用户规则唯一副本即被静默清空（不可逆、无任何 `lastError`，探针实测复现）。修复：①`popup.js` 的 `load()` 判据收敛到 `settings.js` 的唯一实现 `isLegacyShadowPair`（同时覆盖「逐字符相等」与「默认列表 + 编辑」两种形态，V-01-a…k 共 11 条断言护住语义）；②`clearLocalBypassIfAny` 增加纵深防御第二层（传入 `formWasShadowed`，遮蔽现场绝不写 `local`）；③后台自愈判据刻意保持保守（逐字符相等）不动 —— 它要执行写操作，放宽会误伤用户自写列表，前台确认门放宽即可。新增 S1 门禁用例（存量编辑形态 → 两次点击保存后 `local` 逐字符未变、`local.set` 序列为空）并纳入变异门禁（M19）。
+- **S2（P1）对比窗口期间 Service Worker 被回收，代理停留在「已清除（直连）」且不恢复**：`runCompareWindow` 在清除与恢复之间存在真实的异步区间，而 `suspendDepth` / `suspendDirty` 都是模块级内存变量，SW 在「清除之后、恢复之前」被回收（关弹窗、崩溃、重载、休眠唤醒）后代理停留直连、无人恢复 —— 用户以为在走代理实际全部直连，属静默隐私暴露。修复（持久化「待恢复意图」+ 冷启动对账）：①清除之前把意图写入 `chrome.storage.session`（新键 `pendingRestore`，同一浏览器会话内跨 SW 重启存活）；②窗口收尾（含早退）清除标记；③SW 冷启动发现残留标记 = 上一次恢复未完成：消费标记、如实上报 `reason:"restore_interrupted"`、并立即按最新 settings 重新下发。新增 S2 门禁用例（用永不回调的 get 桩把窗口真实挂起在恢复之前 → 新 SW 实例带残留标记冷启动 → 断言 1 秒内重新下发、状态如实标记、标记被消费）与反向对照（正常收尾无标记残留）。
+
+### 修复（一般）
+
+- **G1（P2）文档事实漂移根治**：README 的版本号（2.7.0 → 实际）、断言总数（534 → 实测）、变异数（16 → 实测）与 CHANGELOG 的 576（实为 577）均已按实测纠偏；并把「文档漂移」变成可拦截的缺陷 —— 每个测试文件结尾新增 **G1 运行期自检**（`tests/g1-consistency.js`：README 中本套件声明的断言数 ≠ 实际通过数即红），`manifest.test.js` 新增「合计 = 各行之和」「变异数与 mutation-check.js 实际定义数一致」两条断言。
+- **G2（P2）消息通道失败不再静默**：`send()` 此前用 `void chrome.runtime.lastError` 吞掉通道错误并 `resolve(null)`，`refreshStatus()` 在无响应时直接 return —— SW 崩溃 / 扩展重载后状态条永久停留在「读取状态中…」。现在 `send()` 在 `lastError` 存在时 reject，`refreshStatus()` 为「通道 reject」与「后台无响应」两条路径统一渲染新档文案「状态未知：无法与后台通信，代理可能仍在生效（可尝试关闭后重新打开弹窗）」（warn 档，不谎报直连）。
+- **G3（P2）遮蔽现场判据三处重复实现收敛**：popup 的内联「逐字符相等」判据删除，一律调用 `S.isLegacyShadowPair`（G3 正是 S1 的成因）；`manifest.test.js` 新增结构断言（popup 必须调用共享判据）。background 保留语义独立的 `isLegacyShadowed`（后台自愈，刻意保守），分工由 `settings.js` 注释声明。
+- **G4（P2）对比测试前置取样与配置变化互斥**：直连出口的取样发生在 `before` 回读与窗口之间，期间配置若被修改（用户、多设备同步、外部接管），取样基准不可信且会误报「代理很可能未生效」。现在取样完成后复核一次「控制权 + 实际配置签名」（`proxySignature`，比对 levelOfControl / mode / scheme / host / port），不一致即标记 `samplingUnstable`、以 `compareSkipped:"sampling_unstable"` 早退并如实提示「请重测」，绝不给出无依据的结论。既有注入型用例的 get 序号已适配新回读序列。
+- **G5（P3）对比窗口直连取样改用独立短超时**：新增 `S.COMPARE_EXIT_TIMEOUT_MS = 4000`（全局 12 秒仅用于「代理仍在生效」的普通检测）——「代理已被清除」的区间最坏持有时长从 12 秒降到 4 秒，同时缩小 S2 的暴露窗口；README 承诺改为区间表述。
+- **G6（P3）`resetDefaults()` 移除 `window.confirm`**：与 V-01 同一反模式的最后残留（popup 失焦即销毁，原生对话框返回值永远回不来）。改为与 `save()` 一致的行内二次确认：第一次点击零写入、按钮文案变「确认恢复默认」、提示如实说明「将清空本机保存的绕过列表」；遮蔽现场下追加「本机还保存着你自己的绕过规则（可能是唯一副本），恢复默认将把它一并清空」的知情说明。确认态随表单重载复位，不跨操作残留。
+
+### 新增（建议项 A1–A6）
+
+- **A1**：新增 `package.json`（零运行时依赖不变，`npm test` / `npm run mutation` / `npm run package` 一键命令）与 ESLint 配置（`eslint.config.mjs`，8 条核心规则），lint 纳入 CI 首个失败点。
+- **A2**：`.github/workflows/ci.yml` 的两个 Actions 由可变标签固定到 commit SHA（供应链最小信任）；新增 `.github/dependabot.yml`（github-actions 生态每周核查）。
+- **A3**：新增 `tools/package.js` 可复现打包脚本：从清单读取版本，仅复制运行时文件（manifest / 三源码 / popup.html / 图标）到 `dist/easy-proxy-by-ds4-<version>/`，显式排除 `tests/`、`.github/`、`.editorconfig`、`CHANGELOG.md` 等非运行文件并打印产物清单。
+- **A4**：`background.js` 的 `reapply` 消息分支补充「保留用途声明」：产品代码无调用方，仅用于来源校验测试与 Service Worker 控制台诊断，非死代码。
+- **A5**：清单补齐 `author` 与 `homepage_url`（公开发布后用户可追溯来源与提 Issue）；popup.js 中 4 处内联色值改为 `popup.html` 定义的 `.t-muted` / `.t-error` 样式类，消除样式双轨。
+- **A6**：新增 `ARCHITECTURE.md`（状态机、串行队列 / 代次号 / 暂停计数器、三存储区契约、遮蔽现场防线）与 `CONTRIBUTING.md`（含「改判据必须同步门禁用例 + 变异项」约定）。
+
+### 测试
+
+- 断言总数 **577 → 616**（新增 39 条，既有断言除 4 处 get 序号适配外零删除零改写）：`popup` 124 → **146**（S1 三条前置 + 五条核心、G2 五条、G6 九条）、`ownership` 234 → **247**（S2 六条 + 反向对照两条、G4 四条）、`manifest` 45 → **49**（G1 三条 + G3 两条；tag 一致性断言移出 pass 计数，另各文件结尾的 G1 自检按失败计，不计入通过数）。
+- 变异门禁 **18 → 19 项**：新增 **M19**（`loadedShadowed` 标记退化为恒假 —— S1 的守门者；注入后 S1 / R9-01 系列零写入断言必须变红）。
+- 四个后台测试桩（`background` / `fix-safety` / `concurrency` / `ownership`）与 popup 联动桩补齐 `storage.area.remove`（S2 的 `clearPendingRestore` 需要；缺桩会使窗口 finally 抛错、暂停计数泄漏）；`ownership` 桩新增 `seedSession` / `seedSync` 选项（模拟「SW 死亡后冷启动」的存储预置）。
+
 ## [2.7.1] - 2026-10-05
 
 修复第九轮 03 独立验收（基准 `3b6ebce`，判定**不通过**）留下的缺陷：**V-02**（P2，验收判定的唯一阻塞项）与 V-01 / V-03 / V-04 / V-05 / V-06 / V-07（P3），并补齐 6 条残余风险的逐条处置。本版不改动存储键集合与取值规则（`S.DEFAULTS` / `CONFIG_KEYS` / `resolveBypassList` 一字未动），按仓库惯例升 patch。
@@ -15,7 +48,7 @@
 
 ### 测试
 
-- 断言总数 **534 → 576**（新增 42 条，**删除或改写既有断言 0 条**，见 `git diff 3b6ebce..HEAD -- tests/` 的 `-  t(` 行数为 0）：`popup` 104 → **124**（遮蔽现场超长列表的 11 条 + 行内二次确认的 9 条）、`settings` 66 → **77**（新增纯函数的 11 条边界断言）、`ownership` 230 → **234**（首次安装的 3 条 + 1 条下发断言）、`concurrency` 33 → **40**（窗口期间配置落地的 2 条 + M9 语义的 2 条 + 在途下发顺序不变量的 3 条）。
+- 断言总数 **534 → 577**（新增 42 条，**删除或改写既有断言 0 条**，见 `git diff 3b6ebce..HEAD -- tests/` 的 `-  t(` 行数为 0）：`popup` 104 → **124**（遮蔽现场超长列表的 11 条 + 行内二次确认的 9 条）、`settings` 66 → **77**（新增纯函数的 11 条边界断言）、`ownership` 230 → **234**（首次安装的 3 条 + 1 条下发断言）、`concurrency` 33 → **40**（窗口期间配置落地的 2 条 + M9 语义的 2 条 + 在途下发顺序不变量的 3 条）。（数值经 2.8.0 审计实测纠偏：原记 576，实测为 577。）
 - **`popup.js` 首次纳入变异门禁**：此前 `tests/mutation-check.js` 的 `targets` 只有 `background.js` 与 `settings.js`，`popup.js` 的守卫无法被自动验证（只能靠人工确认「改回恒假会红」）。现新增 `targets.popup`、变异 **M17**（遮蔽现场超长拒绝层恒假）与 **M18**（遮蔽现场入口守卫恒假），并同步扩展 `originals`/`norm`/`eol`/`finally` 还原与 `restored` 核验。门禁 **16 → 18** 项，实测 **18/0/0/0**、`原文件已恢复：是`、退出码 0。
 - **`concurrency.test.js` 的桩补三项纯新增能力**（默认值下不进任何分支，既有 33 条断言行为一字未变）：`holdPort`（命中端口的 set 在显式放行前不完成，使「在途下发」成为受控状态）、`fetchLog`、`releaseHeldSets()`；另让控制权回读的 `levelOfControl` 可被用例切换，用于构造「窗口期间被外部接管」。
 - **护栏归属澄清（V-03/V-05）**：M10 的唯一守门者仍是 `ownership` 的 `R3-01-R3 核心（确定性）`，现已在 `concurrency` 增加同语义**冗余**护栏（实测在 M10 下变红）。**如实记录的归属事实**：M9（删掉 `suspendDirty = true`）的守门者是 `ownership` 侧的 `pendingResubmit` 断言与 `concurrency` 新增的 `V-03b`（实测在 M9 下变红）；M11（窗口收尾不再提交）的守门者是 `concurrency` 的 `V-03-A2`（实测在 M11 下变红）。`concurrency` 侧新增的 `V-03-A2` **在 M9 下不变红**——本版不把它写成 M9 的守门者（那会是误导），其注释已写明这一事实。

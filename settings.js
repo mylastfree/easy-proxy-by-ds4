@@ -1,4 +1,4 @@
-// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.7.1]
+// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.8.0]
 // 刻意不依赖任何 chrome.* API，使 popup 与 Service Worker 可共用同一套逻辑。
 (function (root) {
   'use strict';
@@ -40,6 +40,13 @@
   // ipinfo.io 返回 Access-Control-Allow-Origin: *，故无需申请任何 host 权限。
   var TEST_ENDPOINT = 'https://ipinfo.io/json';
   var TEST_TIMEOUT_MS = 12000;
+  // 【G5】对比窗口内「取直连出口」的独立短超时。
+  //   该请求发生在「代理已被清除（直连）」的区间内，超时越长 = 用户处于真实直连的
+  //   时间越长，也直接放大 S2（SW 回收）的暴露窗口。全局 TEST_TIMEOUT_MS（12 秒）
+  //   适用于「代理仍在生效」的普通出口检测；对比窗口内必须用更短的独立上限（4 秒），
+  //   使「代理已清除」的最坏持有时长从 12 秒降到 4 秒量级。端点不可达时按既有
+  //   失败契约返回 {ok:false}，对比测试如实报「直连出口获取失败」，不再苦等。
+  var COMPARE_EXIT_TIMEOUT_MS = 4000;
 
   function str(v) {
     return v === null || v === undefined ? '' : String(v);
@@ -278,6 +285,7 @@
     MAX_SYNC_BYTES_PER_ITEM: MAX_SYNC_BYTES_PER_ITEM,
     TEST_ENDPOINT: TEST_ENDPOINT,
     TEST_TIMEOUT_MS: TEST_TIMEOUT_MS,
+    COMPARE_EXIT_TIMEOUT_MS: COMPARE_EXIT_TIMEOUT_MS,
     normalizeSettings: normalizeSettings,
     parseBypassList: parseBypassList,
     resolveBypassList: resolveBypassList,

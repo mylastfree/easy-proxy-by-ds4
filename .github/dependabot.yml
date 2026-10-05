@@ -1,0 +1,13 @@
+# dependabot 配置（A2）
+# 供应链最小信任的配套措施：本仓库运行时零依赖，唯一的依赖面是 CI 的 GitHub Actions。
+# dependabot 每周核查 actions 升级并开 PR，升级经人工评审后合入 ——
+# 与 ci.yml 中「Actions 固定到 commit SHA」配合：SHA 保证不可变，dependabot 保证可升级。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    labels: ["ci"]

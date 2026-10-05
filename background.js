@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.7.1]
+// background.js —— MV3 Service Worker  [v2.8.0]
 importScripts("settings.js");
 
 var S = self.EasyProxy;
@@ -82,6 +82,64 @@ function writeTest(result) {
   chrome.storage.session.set({ lastTest: result }, function () {
     var err = chrome.runtime.lastError;
     if (err) console.warn("写入 lastTest 失败，前台可能显示过期测试结果:", err.message);
+  });
+}
+
+/* ==================== 对比窗口恢复意图的持久化（S2） ==================== */
+
+// MV3 的 Service Worker 可在任意 await 点被浏览器回收，而对比窗口的「清除 → 恢复」
+// 之间有真实的异步区间（直连取样，最长约 COMPARE_EXIT_TIMEOUT_MS=4 秒），
+// suspendDepth / suspendDirty 都是模块级内存变量，随 SW 一起消失。
+// 若 SW 在【清除之后、恢复之前】被回收（关弹窗、崩溃、扩展重载、休眠唤醒），
+// 代理将停留在「已清除（直连）」且无人恢复 —— 用户以为在走代理，实际全部直连，
+// 对以「代理是否生效」为唯一价值的工具而言，这是静默的隐私暴露。
+//
+// 【S2】方案 = 持久化「待恢复意图」+ 冷启动对账（与「显式失败、绝不把读不到
+// 当没有」的既有设计哲学一致）：
+//   · 清除之前把意图写入 chrome.storage.session（同一浏览器会话内跨 SW 重启存活）；
+//   · 窗口收尾（含早退）清除标记 —— SW 存活期间窗口逻辑自己负责恢复与上报；
+//   · SW 冷启动若发现残留标记 = 上一次窗口的恢复没有完成：消费标记、如实上报
+//     「恢复被中断」，并立即按最新 settings 重新下发代理。
+var PENDING_RESTORE_KEY = "pendingRestore";
+
+function writePendingRestore() {
+  var patch = {};
+  patch[PENDING_RESTORE_KEY] = { at: Date.now() };
+  chrome.storage.session.set(patch, function () {
+    var err = chrome.runtime.lastError;
+    if (err) console.warn("写入恢复意图失败（SW 回收后代理可能停留在直连且无对账依据）:", err.message);
+  });
+}
+
+function clearPendingRestore() {
+  chrome.storage.session.remove([PENDING_RESTORE_KEY], function () {
+    var err = chrome.runtime.lastError;
+    if (err) console.warn("清除恢复意图失败:", err.message);
+  });
+}
+
+// 冷启动对账：发现残留的「待恢复意图」= 上一次对比窗口的恢复没有完成。
+// 无论有无标记，最终都必须驱动一次按最新 settings 的常规下发（冷启动的既有职责）。
+function reconcilePendingRestore() {
+  chrome.storage.session.get([PENDING_RESTORE_KEY], function (items) {
+    var err = chrome.runtime.lastError;
+    if (err) {
+      // 读不到标记 ≠ 没有标记：如实留痕后按常规冷启动继续（绝不因对账失败而不下发）。
+      console.warn("读取恢复意图失败，按无标记处理并照常下发:", err.message);
+      applyProxySerial();
+      return;
+    }
+    var marker = items && items[PENDING_RESTORE_KEY];
+    if (!marker) { applyProxySerial(); return; }
+    clearPendingRestore();
+    var imsg = "检测到上一次对比测试的恢复被中断（Service Worker 在代理被清除后、恢复之前被回收，期间流量可能已直连），已按当前设置重新下发代理";
+    console.warn(imsg, marker);
+    // 如实上报「恢复未完成」：status 用 error 档（此刻代理确实可能仍处于直连），
+    // reason 单列 restore_interrupted 供前台与诊断区分于真实代理故障；
+    // 随后的 applyProxySerial 会按最新 settings 重新下发并写出真实终态。
+    writeState({ status: "error", reason: "restore_interrupted", message: imsg, at: Date.now() });
+    updateIcon("error");
+    applyProxySerial();
   });
 }
 
@@ -173,9 +231,14 @@ function updateIcon(status, reason) {
 /* ==================== 出口检测 ==================== */
 
 // 检测当前网络出口。端点支持 CORS，因此无需申请任何 host 权限。
-function fetchExit() {
+// 【G5】timeoutMs：可选的独立超时上限。全局默认 S.TEST_TIMEOUT_MS（12 秒）适用于
+//   「代理仍在生效」的普通出口检测；对比窗口内的直连取样必须传入
+//   S.COMPARE_EXIT_TIMEOUT_MS（4 秒）—— 那段时间代理已被清除、流量真实直连，
+//   超时越长 = 用户暴露在直连下的时间越长，也直接放大 S2 的暴露窗口。
+function fetchExit(timeoutMs) {
+  var limit = timeoutMs || S.TEST_TIMEOUT_MS;
   var controller = new AbortController();
-  var timer = setTimeout(function () { controller.abort(); }, S.TEST_TIMEOUT_MS);
+  var timer = setTimeout(function () { controller.abort(); }, limit);
   var url = S.TEST_ENDPOINT + (S.TEST_ENDPOINT.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now();
 
   return fetch(url, { cache: "no-store", signal: controller.signal })
@@ -195,7 +258,7 @@ function fetchExit() {
     })
     .catch(function (err) {
       var msg = (err && err.name === 'AbortError')
-        ? '请求超时（' + Math.round(S.TEST_TIMEOUT_MS / 1000) + ' 秒）'
+        ? '请求超时（' + Math.round(limit / 1000) + ' 秒）'
         : ((err && err.message) || String(err));
       return { ok: false, error: msg };
     })
@@ -398,10 +461,12 @@ async function applyProxyCore() {
   // 这种情况下显示绿色 applied 是在宣称一个未经证实的结论（R3-04）：
   // 必须判为 error，让用户看到"状态未知"而不是"已生效"。
   if (!details) {
-    var rmsg = "无法回读代理设置，不能确认代理是否已生效";
+    // 【A1/lint】此处与函数前部的读取失败分支各有一个消息变量：
+    //   同名 var 会被 no-redeclare 拦下，且两处语义不同，刻意不同名。
+    var rdmsg = "无法回读代理设置，不能确认代理是否已生效";
     updateIcon("error");
-    writeState({ status: "error", message: rmsg, at: Date.now() });
-    return { ok: false, status: "error", errors: [rmsg] };
+    writeState({ status: "error", message: rdmsg, at: Date.now() });
+    return { ok: false, status: "error", errors: [rdmsg] };
   }
 
   // 控制权判定改为【白名单】（R3-04）：
@@ -553,6 +618,21 @@ async function runConnectionTest(compare) {
   }
 
   if (compare && settings.enableProxy && controlledByUs && !result.compareSkipped) {
+    // 【G4】取样可信度复核：currentExit 的取样发生在 before 回读与本次回读之间。
+    //   若这两次回读之间控制权或实际生效配置发生了变化（用户改设置、多设备同步、
+    //   外部接管），取样可能来自「下发前」或「下发后」，得到一个不可信的评价基准，
+    //   进而误报「出口 IP 与直连相同 → 代理很可能未生效」，把用户引向错误的排障方向。
+    //   因此必须复核：签名不一致就放弃对比并如实标记，绝不给出无依据的结论。
+    //   两次回读都失败（都为 null）视为相等 —— 两边同样不可读，不构成「发生了变化」。
+    var afterSample = await readProxyDetails();
+    if (proxySignature(before) !== proxySignature(afterSample)) {
+      result.samplingUnstable = true;
+      result.compareSkipped = "sampling_unstable";
+      result.compareSkippedReason = "取样期间代理配置或控制权发生了变化，直连评价基准不可信";
+      writeTest(result);
+      return result;
+    }
+
     // 整个对比窗口作为一个【排他任务】排入与普通下发相同的串行队列（R3-01）。
     //   · 此前窗口内的 clear / 恢复都直接调用，与普通下发构成两条并行写路径；
     //     窗口期间保存的新端口会被恢复写回的旧 backup 反向覆盖，且此后没有任何
@@ -618,13 +698,20 @@ async function runCompareWindow(result) {
       return result;
     }
 
+    // 【S2】清除之前先持久化「待恢复意图」：从这里到收尾提交之间 SW 随时可能被
+    //   回收，标记在位 = 冷启动能识别「恢复未完成」并重新下发。窗口正常收尾时
+    //   由 finally 清除；只有「SW 在窗口中途死亡」时标记才会残留到冷启动。
+    writePendingRestore();
+
     try {
       await clearProxyScope("regular");
     } catch (directClearErr) {
       // 清除失败就无法取得可信的直连出口，必须如实标记，不能假装测过直连。
       result.directClearFailed = (directClearErr && directClearErr.message) || String(directClearErr);
     }
-    result.direct = await fetchExit();
+    // 【G5】直连取样用独立短超时（4 秒）：这段区间代理已被清除、流量真实直连，
+    //   不允许沿用 12 秒的全局上限把暴露窗口拉长一个数量级。
+    result.direct = await fetchExit(S.COMPARE_EXIT_TIMEOUT_MS);
 
     // 第二步：收尾复核控制权。
     //   白名单判定（R3-04）：只有确证"本扩展控制"或"当前无人控制（可被我方控制）"
@@ -727,10 +814,29 @@ async function runCompareWindow(result) {
 
     return result;
   } finally {
+    // 【S2】窗口结束（含任何早退路径）即清除恢复意图：SW 存活期间，恢复与上报
+    //   由窗口逻辑自己负责；标记只在「SW 于窗口中途死亡」时残留到冷启动对账。
+    //   放在 suspendDepth 递减之前，保证任何异常路径下标记都不晚于窗口关闭被清理。
+    clearPendingRestore();
     // 暂停贯穿收尾：直到恢复与重放全部结束才递减（R3-01 根因之二）。
     suspendDepth--;
     if (suspendDepth < 0) suspendDepth = 0;   // 防御性归零，避免异常路径下变负
   }
+}
+
+// 【G4】把「实际生效配置 + 控制权」压成一个可比较的签名，用于取样前后的一致性复核。
+//   比对 levelOfControl / mode / singleProxy 的 scheme+host+port 四项 —— 与
+//   isOwnLastIntent（R6-04/R8-03）的值维度保持同一严格度：协议不同 = 链路不同。
+//   回读失败（null）与任何可读配置都不相等；两次都失败视为相等（都不可读）。
+function proxySignature(d) {
+  if (!d) return null;
+  var v = d.value || {};
+  var sp = (v.rules && v.rules.singleProxy) || null;
+  return JSON.stringify([
+    d.levelOfControl || null,
+    v.mode || null,
+    sp ? [sp.scheme || null, sp.host || null, String(sp.port)] : null
+  ]);
 }
 
 // 控制权白名单（R3-04）：只有这两种取值表示"我方可以合法写入代理设置"。
@@ -1148,6 +1254,13 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
   }
 
   if (request.action === "reapply") {
+    // 【A4 · 保留用途声明】本分支在产品代码中【没有】任何调用方（popup 从不发送）。
+    //   有意保留，不是死代码，两个用途：
+    //   1) tests/ownership.test.js 用它验证消息来源校验（sender.id 白名单）与
+    //      「强制重下发」的消息契约，删除会破坏测试；
+    //   2) 诊断入口：在扩展的 Service Worker 控制台执行
+    //      chrome.runtime.sendMessage({ action: "reapply" })
+    //      可强制按最新设置重新下发一次代理。
     applyProxySerial().then(sendResponse);
     return true;
   }
@@ -1171,4 +1284,7 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
 //   注意顺序：自愈是异步的，本次 applyProxySerial 可能仍用旧（被遮蔽）的
 //   sync 值下发一次，但自愈完成后的 applyProxySerial 会立刻纠正为 local 真值。
 reconcileLegacyBypass();
-applyProxySerial();
+// 【S2】冷启动先对账「待恢复意图」：若上一次对比窗口的恢复被 SW 回收打断，
+//   这里会如实上报并立即按最新 settings 重新下发；无标记时行为与原先完全一致
+//   （该函数内部所有路径最终都会调用 applyProxySerial，本处不再重复调用）。
+reconcilePendingRestore();

@@ -27,15 +27,27 @@ jobs:
         node-version: [20, 22, 24]
 
     steps:
+      # 【A2】Actions 固定到 commit SHA（供应链最小信任）：
+      #   checkout@v4.2.2 = 11bd71901bbe5b1630ceea73d27597364c9af683
+      #   setup-node@v4.4.0 = 49933ea5288caeca8642d1e84afbd3f7d6820020
+      #   可变标签可能被上游劫持后指向任意代码；SHA 不可变，升级交给 dependabot。
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: 设置 Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node-version }}
 
-      # 本项目零依赖，无需 npm install —— 直接跑测试
+      # 【A1】静态 lint 作为 CI 的首个失败点（核心规则：no-undef / no-unused-vars 等；
+      #   本仓库曾靠它抓到一处真实的块级作用域逃逸）。devDependencies 仅含 eslint，
+      #   运行时依旧零依赖。
+      - name: Lint（ESLint）
+        run: |
+          npm install --no-fund --no-audit
+          npm run lint
+
+      # 本项目运行时零依赖，无需额外安装 —— 直接跑测试
       - name: 语法校验
         run: |
           set -e

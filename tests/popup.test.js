@@ -181,10 +181,9 @@ function buildChainEnv(opts) {
   //   于是 popup.js 的 getStatus 请求过去只会拿到 null（连不上后台）；
   //   而本任务要覆盖的恰恰是「后台确实回答了，但回答的内容是读取失败」。
   //   因此把 popup 的 sendMessage 直接接到【真实 background.js 的监听器】上，
-  //   由 bgSendResponse 把响应送回来 —— 走的是产品里真实的那段回调代码。
+  //   由其 onMessage 处理器经 sendResponse 回调把响应送回来 —— 走的是产品里
+  //   真实的那段回调代码。
   const msgHandlers = [];
-  const bgSendResponse = v => { for (const fn of bgResponses.slice()) fn(v); bgResponses.length = 0; };
-  const bgResponses = [];
   const proxy = { value: null, applied: [], cleared: [] };
   const syncSetCalls = [];          // sync.set 的调用序列（含失败调用，用于「有没有写」）
   const localSetCalls = [];         // local.set 的调用序列
@@ -308,6 +307,13 @@ function buildChainEnv(opts) {
               for (const fn of storageListeners.slice()) fn(changes, name);
             }
           }, 0);
+        },
+        // 【S2】background.js 的 clearPendingRestore 使用 session.remove：
+        //   联动环境下后台代码同样会走到窗口 finally，缺桩会抛 TypeError。
+        remove(keys, cb) {
+          const ks = Array.isArray(keys) ? keys : [keys];
+          for (const k of ks) delete store[k];
+          setTimeout(() => { if (cb) cb(); }, 0);
         }
       };
     }
@@ -1356,6 +1362,186 @@ function t(name, cond, extra) {
       "状态条=" + JSON.stringify(stEnv.textContent));
   }
   console.log("");
-  console.log("通过 " + pass + " 项，失败 " + fail + " 项");
+  console.log("== S1：存量「默认列表+编辑」污染现场 —— 普通保存不得清空 local 唯一副本 ==");
+  {
+    // S1 的真实到达路径：升级前 V-01 缺陷把「内置默认列表 + 用户编辑」写进了 sync，
+    //   用户唯一的长列表只剩 local 一份。旧实现的 loadedShadowed 判据只认「逐字符
+    //   相等」，对编辑形态恒为 false → 保存走普通分支 → clearLocalBypassIfAny 的
+    //   守卫（保存值 === 默认列表）同样不命中 → local 被静默清空，不可逆。
+    //   修复后：load() 用 S.isLegacyShadowPair 识别编辑形态 → loadedShadowed=true
+    //   → 保存走遮蔽现场分支（+ V-01 二次确认门），local 逐字符不变。
+    const sboxS1 = { TextEncoder: TextEncoder };
+    sboxS1.self = sboxS1; sboxS1.globalThis = sboxS1;
+    vm.createContext(sboxS1);
+    vm.runInContext(settingsSrc, sboxS1);
+    const DEF_S1 = sboxS1.EasyProxy.DEFAULTS.bypassList;
+    const NL_S1 = String.fromCharCode(10);
+    const LONG_S1 = Array.from({ length: 500 }, (_, i) => "s1-" + (i + 1) + ".internal.example").join(NL_S1);
+    // 升级前缺陷留下的形态：默认列表整段 + 用户编辑（保存值 !== 默认列表，
+    //   旧实现的一切判据都对它失明）
+    const EDIT_S1 = DEF_S1 + NL_S1 + "my-custom.internal";
+
+    const envS1 = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: EDIT_S1 },
+      localStore: { bypassList: LONG_S1 }
+      // 不需要 setFilter：该形态下后台自愈判据（保守、逐字符相等）不会触发，
+      //   现场天然稳定，这正是 S1 与 R9-01 场景的关键区别。
+    });
+    await waitUntil(() => proxyTarget(envS1.proxy.value) === "socks5 127.0.0.1:10808");
+    await envS1.settle(160);
+
+    t("S1-A 前置事实：sync 是「默认列表+编辑」形态（不等于默认列表，旧判据对它失明）",
+      envS1.syncStore.bypassList === EDIT_S1 && EDIT_S1 !== DEF_S1,
+      JSON.stringify([String(envS1.syncStore.bypassList).length, EDIT_S1 === DEF_S1]));
+    t("S1-B 前置事实：local 里是用户 500 条规则的唯一副本",
+      envS1.localStore.bypassList === LONG_S1,
+      "local 条数=" + String(envS1.localStore.bypassList || "").split(NL_S1).length);
+    t("S1-C 前置事实：表单显示的是被遮蔽的编辑形态（sync 非空优先）",
+      envS1.els.bypassList.value === EDIT_S1,
+      "界面长度=" + String(envS1.els.bypassList.value).length + " 期望 " + EDIT_S1.length);
+
+    // 用户什么都没改，只点一次「保存」——正是探针实测复现数据丢失的那一次点击
+    envS1.syncSetCalls.length = 0; envS1.localSetCalls.length = 0;
+    envS1.click("saveButton");
+    await envS1.settle(120);
+    // 修复后：遮蔽现场 + 编辑形态 → V-01 的行内二次确认门第一次点击不写入
+    t("S1-D 首次点击进入确认态：零写入（sync 与 local 均未被改动）",
+      envS1.syncSetCalls.length === 0 && envS1.localSetCalls.length === 0,
+      JSON.stringify([envS1.syncSetCalls.length, envS1.localSetCalls.length]));
+    t("S1-E 确认态可见：按钮文案变为「确认保存」",
+      envS1.els.saveButton.textContent.indexOf("确认保存") >= 0,
+      JSON.stringify(envS1.els.saveButton.textContent));
+
+    envS1.click("saveButton");
+    await envS1.settle(200);
+    t("S1-F 核心数据完整：保存后 local 逐字符仍是用户的 500 条规则（旧实现在这里被清空）",
+      envS1.localStore.bypassList === LONG_S1,
+      "local 条数=" + String(envS1.localStore.bypassList || "").split(NL_S1).length + " 期望 500");
+    t("S1-G 核心写入序列：local.set 中不存在任何一次 bypassList 写入（空串/表单值都不允许）",
+      envS1.localSetCalls.length === 0,
+      JSON.stringify(envS1.localSetCalls.map(o => String(o && o.bypassList).length)));
+    t("S1-H 保存意图被尊重：sync 写入的正是表单内容（编辑形态）",
+      envS1.syncSetCalls.length === 1 && envS1.syncSetCalls[0].bypassList === EDIT_S1,
+      JSON.stringify(envS1.syncSetCalls.map(o => String(o.bypassList).length)));
+  }
+
+  console.log("");
+  console.log("== G2：消息通道失败 —— 状态条必须离开「读取状态中…」，如实进入未知档 ==");
+  {
+    // 缺陷：send() 用 void chrome.runtime.lastError 吞掉通道错误并 resolve(null)，
+    //   refreshStatus 在 !resp 时直接 return —— SW 崩溃 / 扩展重载 / 消息通道异常时，
+    //   状态条永久停留在初始文案「读取状态中…」，用户既看不到错误也看不到状态。
+    const env = buildEnv();
+    await env.ready();
+    // 初始（后台尚未回答 / 无响应）：不得停留在「读取状态中…」
+    t("G2-A 初始加载后台无响应：状态条已进入「无法与后台通信」档（不再静默停留）",
+      env.els.statusBar.textContent.indexOf("无法与后台通信") >= 0 &&
+      env.els.statusBar.textContent.indexOf("读取状态中") < 0,
+      JSON.stringify(env.els.statusBar.textContent));
+
+    // 形态一：chrome.runtime.lastError（send reject）
+    env.setSend({ mode: "throw", error: "Extension context invalidated." });
+    env.sandbox.refreshStatus();
+    await env.settle();
+    t("G2-B send reject（lastError）：状态条如实显示「无法与后台通信」",
+      env.els.statusBar.textContent.indexOf("无法与后台通信") >= 0,
+      JSON.stringify(env.els.statusBar.textContent));
+    t("G2-C 样式为 warn 档（未知档，不是 error 也不是 muted 直连）",
+      env.els.statusBar.className === "status warn",
+      "className=" + JSON.stringify(env.els.statusBar.className));
+    t("G2-D 文案不谎报「未启用代理（直连）」",
+      env.els.statusBar.textContent.indexOf("未启用代理") < 0,
+      JSON.stringify(env.els.statusBar.textContent));
+
+    // 形态二：回调 null（后台无响应）
+    env.setSend({ mode: "ok", resp: null });
+    env.sandbox.refreshStatus();
+    await env.settle();
+    t("G2-E 后台无响应（回调 null）同样进入未知档，不得静默停留",
+      env.els.statusBar.textContent.indexOf("无法与后台通信") >= 0,
+      JSON.stringify(env.els.statusBar.textContent));
+  }
+
+  console.log("");
+  console.log("== G6：恢复默认改为行内二次确认 —— 第一次点击零写入，不依赖 window.confirm ==");
+  {
+    // 缺陷：resetDefaults 使用 window.confirm —— popup 失焦即销毁，返回值永远回不来，
+    //   会把「恢复默认」变成「点了没反应」（V-01 已论证并修复过同一反模式，此处是
+    //   同型残留）。且该操作会清空 local，属必须明确知情的高危操作。
+    const sboxG6 = { TextEncoder: TextEncoder };
+    sboxG6.self = sboxG6; sboxG6.globalThis = sboxG6;
+    vm.createContext(sboxG6);
+    vm.runInContext(settingsSrc, sboxG6);
+    const DEF_G6 = sboxG6.EasyProxy.DEFAULTS;
+
+    const envG6 = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: "example.com" },
+      localStore: { bypassList: "user-own-list.internal" }
+    });
+    await waitUntil(() => proxyTarget(envG6.proxy.value) === "socks5 127.0.0.1:10808");
+    await envG6.settle(60);
+
+    envG6.syncSetCalls.length = 0; envG6.localSetCalls.length = 0;
+    envG6.click("resetButton");
+    await envG6.settle(120);
+    t("G6-A 第一次点击零写入（confirm 反模式已移除，确认不靠弹窗）",
+      envG6.syncSetCalls.length === 0 && envG6.localSetCalls.length === 0,
+      JSON.stringify([envG6.syncSetCalls.length, envG6.localSetCalls.length]));
+    t("G6-B 确认态可见：按钮文案变为「确认恢复默认」",
+      envG6.els.resetButton.textContent.indexOf("确认恢复默认") >= 0,
+      JSON.stringify(envG6.els.resetButton.textContent));
+    t("G6-C 提示如实说明后果：清空本机保存的绕过列表（用户必须知情）",
+      envG6.hint().indexOf("清空本机保存的绕过列表") >= 0,
+      JSON.stringify(envG6.hint()));
+
+    envG6.click("resetButton");
+    await envG6.settle(240);
+    t("G6-D 第二次点击执行：sync 写入默认值",
+      envG6.syncSetCalls.some(o => o.bypassList === DEF_G6.bypassList),
+      JSON.stringify(envG6.syncSetCalls.map(o => String(o.bypassList).length)));
+    t("G6-E 第二次点击执行：local 的绕过列表被清空（用户明确知情后的结果）",
+      envG6.localSetCalls.some(o => o && o.bypassList === "") && envG6.localStore.bypassList === "",
+      JSON.stringify([envG6.localSetCalls.map(o => String(o && o.bypassList).length), envG6.localStore.bypassList]));
+    t("G6-F 提示「已恢复默认设置」",
+      envG6.hint().indexOf("已恢复默认设置") >= 0, JSON.stringify(envG6.hint()));
+    t("G6-G 确认态复位：按钮文案回到「恢复默认」",
+      envG6.els.resetButton.textContent.indexOf("确认恢复默认") < 0,
+      JSON.stringify(envG6.els.resetButton.textContent));
+
+    // 遮蔽现场下的知情补充：本机规则（可能是唯一副本）将被一并清空，必须先说清
+    const envG6b = buildChainEnv({
+      syncStore: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808", bypassList: DEF_G6.bypassList },
+      localStore: { bypassList: "user-only-copy.internal" },
+      setFilter: (realm, areaName, obj) => {
+        if (areaName === "sync" && Object.keys(obj).length === 1 && obj.bypassList === "") {
+          return "自愈写入被测试阻断，以固定污染现场";
+        }
+        return null;
+      }
+    });
+    await waitUntil(() => proxyTarget(envG6b.proxy.value) === "socks5 127.0.0.1:10808");
+    await envG6b.settle(160);
+    // 清掉「被阻断的自愈写入」残留的计数（setFilter 挡下的写入同样会计入调用序列）
+    envG6b.syncSetCalls.length = 0; envG6b.localSetCalls.length = 0;
+    envG6b.click("resetButton");
+    await envG6b.settle(120);
+    t("G6-H 遮蔽现场：确认提示包含「本机规则将被一并清空」的知情说明",
+      envG6b.hint().indexOf("一并清空") >= 0 && envG6b.hint().indexOf("唯一副本") >= 0,
+      JSON.stringify(envG6b.hint()));
+    t("G6-I 遮蔽现场：第一次点击仍零写入",
+      envG6b.syncSetCalls.length === 0 && envG6b.localSetCalls.length === 0,
+      JSON.stringify([envG6b.syncSetCalls.length, envG6b.localSetCalls.length]));
+  }
+
+  console.log("");
+  // 【G1】文档一致性自检：README 声明的本套件断言数必须与实际通过数一致
+{
+  const g1 = require("./g1-consistency.js").g1ConsistencyCheck("tests/popup.test.js", pass);
+  if (!g1.skipped && g1.declared !== pass) {
+    fail++;
+    console.log("  FAIL  G1 文档一致性：README 声明 " + g1.declared + " 项，实际通过 " + pass + " 项（改测试后请同步 README 对应行与合计）");
+  }
+}
+console.log("通过 " + pass + " 项，失败 " + fail + " 项");
   process.exit(fail > 0 ? 1 : 0);
 })().catch(e => { console.error(e); process.exit(2); });
