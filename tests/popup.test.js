@@ -294,6 +294,16 @@ function buildChainEnv(opts) {
               return;
             }
           }
+          // 【第 3 条·审计修复】静默丢弃注入：写入【回调成功】、不置 lastError、也不派发
+          //   onChanged，但值没有落地 —— 真实存储层在配额边界 / 并发写回 / 内部异常时
+          //   可能出现这种形态（"回调成功 ≠ 值真的可读回"）。
+          //   它专门用来证明本次修复新增的「切换引用之前回读确证」这一层是承重的：
+          //   删掉确证层，代码就会带着未落地的值去写 sync 占位串，把生效值清成空
+          //   （正是本条要消灭的丢数据路径）。
+          if (typeof opts.setDrop === "function" && opts.setDrop(realm, name, obj)) {
+            setTimeout(() => { if (cb) cb(); }, 0);
+            return;
+          }
           const changes = {};
           for (const k of Object.keys(obj)) {
             if (JSON.stringify(store[k]) !== JSON.stringify(obj[k])) {
@@ -1680,6 +1690,162 @@ function t(name, cond, extra) {
       html.indexOf("&lt;script&gt;") >= 0 && html.indexOf("<script>") < 0, html);
     t("M-4-g 恶意代理配置字段被转义",
       html.indexOf("&lt;b&gt;x&lt;/b&gt;") >= 0, html);
+  }
+
+  console.log("");
+  console.log("== 外部审查修复（v2.12.0）：第 1 / 2 / 3 / 4 / 6 条的前台侧护栏 ==");
+  {
+    const BASE_SYNC = { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808" };
+
+    // ---- 第 3 条：超长列表保存失败必须保留旧的有效规则（不得把 sync 清空） ----
+    //   修复前：先写 sync 空串占位、再写 local。用户的列表短到能直接存 sync 时
+    //   local 是空的，此时 local 写入失败 ⇒ sync="" 且 local 为空
+    //   ⇒ resolveBypassList 得空串 ⇒ 原有直连规则凭空消失（一次失败保存改变路由）。
+    {
+      const env = buildChainEnv({
+        syncStore: Object.assign({}, BASE_SYNC, { bypassList: "private.example" }),
+        localStore: {},
+        setFilter: (realm, area, obj) =>
+          (realm === "popup" && area === "local" && obj.bypassList ? "模拟 local 写入失败" : null)
+      });
+      await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+      env.els.bypassList.value =
+        Array.from({ length: 600 }, (_, i) => "h" + i + ".private.example").join("\n");
+      env.click("saveButton");
+      await env.settle(120);
+
+      t("第3条-a 失败保存不得清空 sync 里的旧列表（否则旧规则凭空消失）",
+        env.syncStore.bypassList === "private.example",
+        "sync.bypassList=" + JSON.stringify(env.syncStore.bypassList));
+      t("第3条-b 实际生效的绕过规则仍保留旧值（没有被清成空）",
+        !!env.proxy.value && Array.isArray(env.proxy.value.rules.bypassList) &&
+        env.proxy.value.rules.bypassList.indexOf("private.example") >= 0,
+        JSON.stringify(env.proxy.value && env.proxy.value.rules.bypassList));
+      t("第3条-c 如实报失败，不得谎报成功",
+        env.hint().indexOf("保存失败") >= 0,
+        JSON.stringify(env.hint()));
+      t("第3条-d 全程未把 sync 写成空串占位（切换引用前必须确证落地成功）",
+        !env.syncSetCalls.some(o => o.bypassList === ""),
+        JSON.stringify(env.syncSetCalls));
+    }
+
+    // ---- 第 3 条（续）：写入回调成功但值【没有落地】→ 仍必须放弃切换引用 ----
+    //   写入回调不报错 ≠ 值真的可读回。修复的核心动作是「切换 sync 占位引用之前
+    //   先回读确证」，本用例把落地动作打成静默丢弃（回调成功、无 lastError、无 onChanged），
+    //   证明那一层确证是承重的：删掉它，代码会带着未落地的值去写 sync 占位串，
+    //   生效值被清成空 —— 与「先写 sync 空串」的原始缺陷是同一个数据丢失路径。
+    {
+      const env = buildChainEnv({
+        syncStore: Object.assign({}, BASE_SYNC, { bypassList: "private.example" }),
+        localStore: {},
+        setDrop: (realm, area, obj) =>
+          (realm === "popup" && area === "local" &&
+            typeof obj.bypassList === "string" && obj.bypassList.length > 100)
+      });
+      await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+      env.els.bypassList.value =
+        Array.from({ length: 600 }, (_, i) => "h" + i + ".private.example").join("\n");
+      env.click("saveButton");
+      await env.settle(150);
+
+      t("第3条-e 写入回调成功但值未落地时：放弃切换引用，sync 不被清空",
+        env.syncStore.bypassList === "private.example",
+        "sync.bypassList=" + JSON.stringify(env.syncStore.bypassList));
+      t("第3条-f 未确证落地时如实报错，不谎报成功",
+        env.hint().indexOf("保存失败") >= 0, JSON.stringify(env.hint()));
+    }
+
+    // ---- 第 2 条：清理本机旧绕过列表失败，不得报成「设置已保存」 ----
+    //   修复前：setStorage("local",{bypassList:""}).then(resolve, resolve) 把写入失败
+    //   映射到与成功同一出口 ⇒ 用户清空了列表、sync 也是空串，但 local 清不掉
+    //   ⇒ 生效值仍是旧列表（想取消直连的站点仍然绕过代理），界面却说保存成功。
+    {
+      const env = buildChainEnv({
+        syncStore: Object.assign({}, BASE_SYNC, { bypassList: "example.com" }),
+        localStore: { bypassList: "sensitive.example" },
+        setFilter: (realm, area, obj) =>
+          (realm === "popup" && area === "local" && obj.bypassList === "" ? "模拟 local 清理失败" : null)
+      });
+      await waitUntil(() => env.els.bypassList.value === "example.com");
+      env.els.bypassList.value = "";
+      env.click("saveButton");
+      await env.settle(120);
+
+      t("第2条-a 清理失败必须如实说明旧列表仍在生效，不得只报「设置已保存」",
+        env.hint().indexOf("未能清除") >= 0 && env.hint().indexOf("仍会绕过代理") >= 0,
+        JSON.stringify(env.hint()));
+      t("第2条-b 失败是真实的（本机旧副本确实未被清掉）",
+        env.localStore.bypassList === "sensitive.example",
+        JSON.stringify(env.localStore.bypassList));
+    }
+
+    // ---- 第 1 条：内容不变的保存必须显式请求一次下发 ----
+    //   后台唯一的下发驱动源是 storage.onChanged，而 Chrome 在写入值与库中原值
+    //   完全相同时不产生任何 change（Chromium 的 LeveldbValueStore::AddToBatch）。
+    //   因此「按恢复指引重新保存一次相同配置」不会触发下发 —— 指引本身失效。
+    {
+      const env = buildChainEnv({
+        syncStore: Object.assign({}, BASE_SYNC, { bypassList: "private.example" }),
+        localStore: {}
+      });
+      await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+      await env.settle(60);
+      const appliedBefore = env.proxy.applied.length;
+      env.click("saveButton");            // 表单内容与存储完全相同
+      await env.settle(150);
+
+      t("第1条-a 相同内容的保存仍会显式触发一次下发（不依赖 storage 事件）",
+        env.proxy.applied.length === appliedBefore + 1,
+        "before=" + appliedBefore + " after=" + env.proxy.applied.length);
+      t("第1条-b 提示如实区分「已保存」与「已生效」",
+        env.hint().indexOf("已按当前配置生效") >= 0,
+        JSON.stringify(env.hint()));
+    }
+
+    // ---- 第 6 条：恢复阶段被接管，不得落到「代理确实生效」 ----
+    //   修复前：background 返回 overriddenDuringRestore，但前台没有任何分支消费它，
+    //   渲染链继续下落命中 result.ipChanged 的成功文案 ⇒ 同一屏上「被接管」与
+    //   「✓ 代理确实生效」并存。
+    {
+      const env = buildChainEnv({
+        syncStore: Object.assign({}, BASE_SYNC, { bypassList: "" }),
+        localStore: {}
+      });
+      await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+      env.popupCtx.renderTest({
+        ok: true,
+        exit: { ok: true, ip: EXIT_IP },
+        direct: { ok: true, ip: "192.0.2.1" },
+        ipChanged: true,
+        overriddenDuringRestore: "controlled_by_other_extensions",
+        settings: { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808" }
+      });
+      const html6 = env.els.testResult.innerHTML;
+      t("第6条-a 恢复期被接管时不得出现「代理确实生效」的成功结论",
+        html6.indexOf("代理确实生效") < 0, html6.slice(0, 200));
+      t("第6条-b 必须如实说明接管发生在收尾写回时",
+        html6.indexOf("被外部接管") >= 0 && html6.indexOf("收尾写回") >= 0,
+        html6.slice(0, 200));
+    }
+
+    // ---- 第 4 条：禁用后实际沿用系统代理时，不得宣称「直连」 ----
+    {
+      const env = buildChainEnv({
+        syncStore: Object.assign({}, BASE_SYNC, { bypassList: "" }),
+        localStore: {}
+      });
+      await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+      env.popupCtx.renderStatus({
+        status: "direct",
+        systemProxy: "system",
+        message: "已停用本扩展的代理；当前实际生效的是浏览器/系统自身的代理设置（system），并非直连"
+      }, false);
+      const stText = env.els.statusBar.textContent;
+      t("第4条-a 带 systemProxy 的禁用态不得使用「未启用代理（直连）」文案",
+        stText.indexOf("未启用代理（直连）") < 0, stText);
+      t("第4条-b 必须说明沿用浏览器/系统自身的代理设置",
+        stText.indexOf("沿用浏览器/系统自身的代理设置") >= 0, stText);
+    }
   }
 
   console.log("");

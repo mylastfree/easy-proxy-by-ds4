@@ -1177,8 +1177,18 @@ function t(name, cond, extra) {
     // 第一次窗口：before、取样后复核（G4 新增）、窗口开头复核与收尾复核（前 4 次
     //   回读）都属我方，清除与收尾提交都真实执行；真正的接管发生在【收尾提交内部】
     //   （applyProxyCore 下发前的控制权复核）→ 按设计放弃写入、且【不清脏】。
+    //
+    //   【第 4 条·审计修复】后的回读序列（每次 chrome.proxy.settings.get 记一个 n）：
+    //     n=1 before（入口复核）
+    //     n=2 取样后复核（G4 取样一致性）
+    //     n=3 清除前复核（TOCTOU 防护）
+    //     n=4 【新增】清除后回读实际模式 —— clear() 不等于强制直连，必须确证
+    //          下层到底是 direct 还是 system/pac_script，据此标注「直连出口」这一行
+    //     n=5 收尾复核（controlNow）
+    //     n=6 applyProxyCore 下发前的控制权复核  ← 接管注入点必须落在这里
+    //   因此注入条件从 n<=4 调整为 n<=5，保持「接管发生在收尾提交内部」的原意不变。
     env.setGetHook((n, o, cb, defaultGet) => {
-      if (n <= 4) return defaultGet(o, cb);
+      if (n <= 5) return defaultGet(o, cb);
       return cb({
         value: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "external", port: "9090" } } },
         levelOfControl: "controlled_by_other_extensions"
@@ -2572,6 +2582,146 @@ function t(name, cond, extra) {
       JSON.stringify(env.localStore.stateWriteFailed));
     t("M-5-e session 状态如实更新为 applied", (env.sessionStore.lastState || {}).status === "applied",
       "lastState=" + JSON.stringify(env.sessionStore.lastState));
+  }
+
+  console.log("");
+  console.log("== 外部审查修复（v2.12.0）：第 4 条 clear() ≠ 强制直连（background 侧） ==");
+  {
+    // 外部审查第 4 条：chrome.proxy.settings.clear() 只移除【本扩展自己】的偏好设置，
+    //   使下层设置重新生效（Chrome 文档 Scope / Precedence）—— 下层可能是操作系统代理、
+    //   pac_script、auto_detect。因此"清除成功"绝不等于"现在是直连"。
+    //   修复前：禁用分支 clear 后无条件写 status:"direct"、图标转红、文案宣称"未启用代理（直连）"，
+    //   若浏览器正沿用系统代理，界面结论与事实相反，还会污染后续"直连出口"对比的基准。
+    //   修复后：必须回读实际 mode，只有确证 "direct" 才按直连陈述。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    // 模拟：清除本扩展的 regular 槽位后，浏览器实际沿用的是【系统自身的代理】。
+    //   两层桩协同：clearHook 置位"已清除"，getHook 在被置位后交出非 direct 的实际模式。
+    let sysMode = null;
+    env.setClearHook((o, cb) => {
+      if (o.scope === "regular") sysMode = "system";
+      setTimeout(() => { if (cb) cb(); }, 0);
+    });
+    env.setGetHook((n, o, cb, dg) => {
+      if (sysMode) {
+        return setTimeout(() => cb({
+          value: { mode: sysMode }, levelOfControl: "controllable_by_this_extension"
+        }), 0);
+      }
+      return dg(o, cb);
+    });
+    await setSync(env, Object.assign({}, BASE, { enableProxy: false }));
+    await drain(env);
+    const st = env.sessionStore.lastState || {};
+    t("第4条-a 禁用后实际是系统代理：状态带 systemProxy（不谎称直连）",
+      st.status === "direct" && st.systemProxy === "system", "lastState=" + JSON.stringify(st));
+    t("第4条-b 消息点明「并非直连」，用户可据此排查",
+      typeof st.message === "string" && st.message.indexOf("并非直连") >= 0,
+      "message=" + JSON.stringify(st.message));
+  }
+  {
+    // 第 4 条的「读不到 ≠ 直连」分支：清除后回读失败时，必须如实说明"无法确证"，
+    //   不得把读失败静默归一化成"是直连"（与 R7-01 同一条原则）。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    let cleared = false;
+    env.setClearHook((o, cb) => {
+      if (o.scope === "regular") cleared = true;
+      setTimeout(() => { if (cb) cb(); }, 0);
+    });
+    env.setGetHook((n, o, cb, dg) => {
+      if (cleared) {
+        // 真实契约：置 runtime.lastError 后回调 → readProxyDetails 归一成 null
+        return setTimeout(() => {
+          env.sandbox.chrome.runtime.lastError = { message: "get failed (injected)" };
+          cb(undefined);
+          env.sandbox.chrome.runtime.lastError = undefined;
+        }, 0);
+      }
+      return dg(o, cb);
+    });
+    await setSync(env, Object.assign({}, BASE, { enableProxy: false }));
+    await drain(env);
+    const st = env.sessionStore.lastState || {};
+    t("第4条-c 回读失败：如实标记 readFailed（读不到 ≠ 直连）",
+      st.status === "direct" && st.readFailed === true, "lastState=" + JSON.stringify(st));
+    t("第4条-d 回读失败：消息说明无法确证，不宣称已直连",
+      typeof st.message === "string" && st.message.indexOf("无法确证") >= 0,
+      "message=" + JSON.stringify(st.message));
+  }
+  {
+    // 第 4 条的第二处陈述点：chrome.proxy.settings.onChange 回读路径。
+    //   外部写入方释放控制权后，「无人控制」不等于「生效的是我方配置」；
+    //   且 !isFixed 涵盖 direct / system / pac_script / auto_detect —— 只有 direct 才是直连。
+    //   修复前：一律写 status:"direct" 并宣称"未启用代理（直连）"。
+    const env = buildEnv({ fetchDelay: 20, seedSync: Object.assign({}, BASE, { enableProxy: false }) });
+    await sleep(60);
+    await drain(env);
+    env.setGetHook((n, o, cb) => setTimeout(() => cb({
+      value: { mode: "system" }, levelOfControl: "controllable_by_this_extension"
+    }), 0));
+    env.fireProxyChange({ levelOfControl: "controllable_by_this_extension" });
+    await sleep(80);
+    const st = env.sessionStore.lastState || {};
+    t("第4条-e onChange 到非直连模式：带 systemProxy（不谎称直连）",
+      st.status === "direct" && st.systemProxy === "system", "lastState=" + JSON.stringify(st));
+    t("第4条-f onChange 到非直连模式：消息点明「并非直连」",
+      typeof st.message === "string" && st.message.indexOf("并非直连") >= 0,
+      "message=" + JSON.stringify(st.message));
+  }
+
+  console.log("");
+  console.log("== 外部审查修复（v2.12.0）：第 5 条 旧状态重试不得覆盖新状态 ==");
+  {
+    // 外部审查第 5 条：writeState 的一次失败会排入 250ms 有界重试；若期间发生了
+    //   更新的真实状态（例如 onProxyError 写下 lastState=error），那次重试会把【过期的
+    //   applied】盖回去 —— 图标已按 error 变红、状态条却回到"代理已生效"，自相矛盾。
+    //   修复后：同一键的代次只由"该键的新一次写入"推进，旧代次的重试一律放弃。
+    const env = buildEnv({ fetchDelay: 20 });
+    await sleep(60);
+    await drain(env);
+    env.setSessionFail(1);                       // 下一次 lastState 写入失败 → 250ms 后重试
+    const pOld = env.sandbox.writeState({ status: "applied", at: 1 });
+    await sleep(40);
+    // 更新的真实状态在新代次上写入成功
+    const pNew = env.sandbox.writeState({ status: "error", message: "ERR_PROXY_CONNECTION_FAILED", at: 2 });
+    await Promise.all([pOld, pNew]);
+    await sleep(400);                            // 越过旧代次的重试点
+    const st = env.sessionStore.lastState || {};
+    t("第5条-a 旧状态的重试不得覆盖更新的 error 状态",
+      st.status === "error", "lastState=" + JSON.stringify(st));
+    t("第5条-b 保留的是新状态的错误消息",
+      st.message === "ERR_PROXY_CONNECTION_FAILED", "lastState=" + JSON.stringify(st));
+    t("第5条-c 被放弃的旧写入不产生误报的失败标记",
+      env.localStore.stateWriteFailed === undefined,
+      JSON.stringify(env.localStore.stateWriteFailed));
+  }
+  {
+    // 第 5 条的另一半：失败标记按【键】管理。
+    //   修复前 clearStateWriteFailMark 只要有任何一次 session 写入成功就无差别清标记 ——
+    //   另一键（lastTest）写入成功会把 lastState 的"状态可能过期"告警一并抹掉，用户失明。
+    const env = buildEnv({ fetchDelay: 20 });
+    await sleep(60);
+    await drain(env);
+    env.setSessionFail(2);                       // lastState 首次 + 重试都失败 → 落失败标记
+    await env.sandbox.writeState({ status: "applied", at: 1 });
+    await sleep(60);
+    const mark1 = env.localStore.stateWriteFailed;
+    t("第5条-d lastState 双失败 → local 标记指向 lastState",
+      !!mark1 && mark1.key === "lastState", JSON.stringify(mark1));
+    // 另一键写入成功 —— 不得把 lastState 的告警一并清掉
+    await env.sandbox.writeTest({ ok: true, ip: "203.0.113.7" });
+    await sleep(60);
+    const mark2 = env.localStore.stateWriteFailed;
+    t("第5条-e lastTest 成功不清除 lastState 的失败标记（按键管理）",
+      !!mark2 && mark2.key === "lastState", JSON.stringify(mark2));
+    // 本键写入成功 → 标记必须被清除
+    env.setSessionFail(0);
+    await env.sandbox.writeState({ status: "applied", at: 2 });
+    await sleep(60);
+    t("第5条-f lastState 恢复成功后标记被清除",
+      env.localStore.stateWriteFailed === undefined,
+      JSON.stringify(env.localStore.stateWriteFailed));
   }
 
   console.log("");

@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.11.0]
+// background.js —— MV3 Service Worker  [v2.12.0]
 importScripts("settings.js");
 
 var S = self.EasyProxy;
@@ -80,30 +80,54 @@ function readBypassText() {
 //   返回 { ok, retried?, error? } 供调用方观测（现有调用方均 fire-and-forget）。
 var STATE_WRITE_FAIL_KEY = "stateWriteFailed";
 
-function clearStateWriteFailMark() {
+// 【第 5 条·审计修复】每个状态键各维护一个递增代次，供延迟重试判定「自己是否已过期」。
+//   此前每次写入独立计时重试（250ms），而重试回调【不校验】期间是否已有更新的值写成功：
+//   一次 lastState=applied 的写入失败后，若 250ms 内发生了真实 onProxyError 并把
+//   lastState=error 写成功，那次重试随后仍会把【过期的 applied】盖回去 ——
+//   图标已按 error 变红、状态条却回到「代理已生效」，两者互相矛盾。
+//   下发路径早已用 applyGeneration 防同类问题，状态写入路径没有，属设计盲区。
+//   语义：某键的代次只由「该键的新一次写入」推进；旧代次的重试一律放弃，
+//   由最新那次写入负责上报成功或失败（失败标记也是它写）。
+var stateWriteGeneration = {};
+
+function clearStateWriteFailMark(ownerKey) {
   chrome.storage.local.get([STATE_WRITE_FAIL_KEY], function (items) {
     if (chrome.runtime.lastError) return;   // 读不到标记 ≠ 没有标记；仅影响清除时机
-    if (items && items[STATE_WRITE_FAIL_KEY]) {
-      chrome.storage.local.remove([STATE_WRITE_FAIL_KEY], function () {
-        void chrome.runtime.lastError;
-      });
-    }
+    var mark = items && items[STATE_WRITE_FAIL_KEY];
+    if (!mark) return;
+    // 【第 5 条·审计修复】失败标记按【键】管理：另一键（如 lastTest）写入成功
+    //   不该把 lastState 的告警一起抹掉 —— 那会让用户看不到「当前状态可能过期」。
+    //   旧标记没有 key 字段时按「同一键」处理，避免历史标记永远清不掉。
+    if (ownerKey && mark.key && mark.key !== ownerKey) return;
+    chrome.storage.local.remove([STATE_WRITE_FAIL_KEY], function () {
+      void chrome.runtime.lastError;
+    });
   });
 }
 
 function writeSessionValue(key, value, warnMsg) {
+  var myGen = (stateWriteGeneration[key] || 0) + 1;
+  stateWriteGeneration[key] = myGen;
+  // 过期判定：期间只要有【同一键】的更新写入，本次（含其重试）就不再具备写入资格。
+  function superseded() { return stateWriteGeneration[key] !== myGen; }
+
   return new Promise(function (resolve) {
     var pair = {};
     pair[key] = value;
     chrome.storage.session.set(pair, function () {
       var err = chrome.runtime.lastError;
-      if (!err) { clearStateWriteFailMark(); resolve({ ok: true }); return; }
+      if (!err) { clearStateWriteFailMark(key); resolve({ ok: true }); return; }
+      // 失败后若已有更新的同一键写入进来，本次直接退出：那个更新的值才是要落盘的，
+      //   由它负责重试与失败上报。此处【不能】继续重试，否则会用过期值覆盖新状态。
+      if (superseded()) { resolve({ ok: true, superseded: true }); return; }
       console.warn(warnMsg + ":", err.message);
       // 一次有界重试：绝不能在状态上报路径上无限等待。
       setTimeout(function () {
+        if (superseded()) { resolve({ ok: true, superseded: true }); return; }
         chrome.storage.session.set(pair, function () {
           var err2 = chrome.runtime.lastError;
-          if (!err2) { clearStateWriteFailMark(); resolve({ ok: true, retried: true }); return; }
+          if (!err2) { clearStateWriteFailMark(key); resolve({ ok: true, retried: true }); return; }
+          if (superseded()) { resolve({ ok: true, superseded: true }); return; }
           console.error(warnMsg + "（重试后仍失败）:", err2.message);
           // 降级通道：把失败事实写到 local（独立于 session 的存储区），
           // 由 popup 的 local.onChanged 呈现给用户。
@@ -505,15 +529,41 @@ async function applyProxyCore() {
       }
     }
 
+    // 【第 4 条·审计修复】clear() ≠ 强制直连：必须回读实际生效模式再陈述。
+    //   chrome.proxy.settings.clear() 只移除【本扩展自己】的偏好设置，使【下层设置重新生效】
+    //   （Chrome 文档 Scope / Precedence；实现见 preference_api.cc 的
+    //   ClearPreferenceFunction → RemoveExtensionControlledPref）。下层可能是操作系统代理、
+    //   pac_script、auto_detect 或其它扩展的配置。因此 clear 成功之后流量【未必是直连】，
+    //   此前却无条件写 status:"direct"、图标转红、界面宣称「未启用代理（直连）」——
+    //   与事实不符，且会污染后续「直连出口」对比的基准（把系统代理的出口当成直连出口）。
+    //   处置：回读实际模式，只有确证 mode === "direct" 才按直连陈述；回读失败也必须说明，
+    //   不得把「读不到」当成「是直连」（与 R7-01「读不到 ≠ 没有」同一条原则）。
+    var afterClear = await readProxyDetails();
+    var afterClearMode = (afterClear && afterClear.value && afterClear.value.mode) || null;
     updateIcon("direct");
-    if (legacyFailures.length) {
-      var lfmsg = "已回到直连，但清理旧版遗留代理作用域失败（" + legacyFailures.join("、") +
-        "），隐身窗口或受限场景可能仍走旧代理，建议重启浏览器";
-      writeState({ status: "direct", message: lfmsg, legacyClearFailed: legacyFailures, at: Date.now() });
-    } else {
-      writeState({ status: "direct", at: Date.now() });
+    var directState = { status: "direct", at: Date.now() };
+    if (!afterClearMode) {
+      directState.readFailed = true;
+      directState.message = "已停用本扩展的代理，但无法确证当前实际生效的模式（回读失败）；" +
+        "浏览器可能正沿用系统或其它扩展的代理设置";
+    } else if (afterClearMode !== "direct") {
+      directState.systemProxy = afterClearMode;
+      directState.message = "已停用本扩展的代理；当前实际生效的是浏览器/系统自身的代理设置" +
+        "（" + afterClearMode + "），并非直连";
     }
-    return { ok: true, status: "direct", legacyClearFailed: legacyFailures };
+    if (legacyFailures.length) {
+      var lfmsg = "清理旧版遗留代理作用域失败（" + legacyFailures.join("、") +
+        "），隐身窗口或受限场景可能仍走旧代理，建议重启浏览器";
+      directState.legacyClearFailed = legacyFailures;
+      directState.message = (directState.message ? directState.message + "；" : "") + lfmsg;
+    }
+    writeState(directState);
+    return {
+      ok: true,
+      status: "direct",
+      systemProxy: directState.systemProxy || null,
+      legacyClearFailed: legacyFailures
+    };
   }
 
   // 2) 校验：明确回报，不静默跳过
@@ -857,6 +907,16 @@ async function runCompareWindow(result) {
     } catch (directClearErr) {
       // 清除失败就无法取得可信的直连出口，必须如实标记，不能假装测过直连。
       result.directClearFailed = (directClearErr && directClearErr.message) || String(directClearErr);
+    }
+    // 【第 4 条·审计修复】clear 之后必须确证「现在到底是不是直连」。
+    //   下面的取样此前被直接称为「直连出口」，但 clear() 只是让【下层设置重新生效】：
+    //   若下层是系统代理 / PAC / 自动检测，这一段的出口走的是那条链路，并不是直连。
+    //   把实际模式如实带回前台（result.afterClearMode），由前台据实标注这一行的含义，
+    //   避免把一个被污染的基准当成「直连出口」而给出错误结论。
+    if (!result.directClearFailed) {
+      var afterClearForSample = await readProxyDetails();
+      result.afterClearMode = (afterClearForSample && afterClearForSample.value &&
+        afterClearForSample.value.mode) || null;
     }
     // 【G5】直连取样用独立短超时（4 秒）：这段区间代理已被清除、流量真实直连，
     //   不允许沿用 12 秒的全局上限把暴露窗口拉长一个数量级。
@@ -1311,7 +1371,17 @@ chrome.proxy.settings.onChange.addListener(function (details) {
         return;
       }
       if (!mineIsFixed && !isFixed) {
-        writeState({ status: "direct", at: Date.now() });
+        // 【第 4 条·审计修复】!isFixed 涵盖 direct / system / pac_script / auto_detect，
+        //   其中只有第一种才是真正的直连。此前一律写 direct 并宣称「未启用代理（直连）」，
+        //   与紧随其后那段自述的意图（「存在非我方下发的代理配置」必须如实上报）自相矛盾：
+        //   系统代理 / PAC / 自动检测同样「不是本扩展下发的配置」。
+        var dState = { status: "direct", at: Date.now() };
+        if (actualMode !== "direct") {
+          dState.systemProxy = actualMode || null;
+          dState.message = "已停用本扩展的代理；当前实际生效的是浏览器/系统自身的代理设置" +
+            "（" + (actualMode || "未知模式") + "），并非直连";
+        }
+        writeState(dState);
         updateIcon("direct");
         return;
       }

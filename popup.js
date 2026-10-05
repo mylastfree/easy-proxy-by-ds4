@@ -1,4 +1,4 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.11.0]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.12.0]
 var S = window.EasyProxy;
 
 // 【M-1】用户可直接编辑的表单字段。storage 变化触发的表单重绘，
@@ -30,6 +30,10 @@ var el = {
 var STATUS_TEXT = {
   applied: ["代理已生效", "ok"],
   direct: ["未启用代理（直连）", "muted"],
+  // 【第 4 条·审计修复】禁用路径在 clear() 之后回读到下层仍有代理
+  //   （system / pac_script / auto_detect）：此时【不是】直连，
+  //   不能沿用上面那句「未启用代理（直连）」。background 会在该情形下带 systemProxy 字段。
+  direct_system_proxy: ["未启用本扩展代理：沿用浏览器/系统自身的代理设置", "muted"],
   saved_not_applied: ["已保存，但尚未生效", "warn"],
   overridden: ["设置被企业策略或其它扩展接管", "warn"],
   // suspended 是「连接测试进行中，暂时跳过下发」的临时状态，
@@ -62,6 +66,28 @@ function setStorage(area, obj) {
       else resolve();
     });
   });
+}
+
+// 【第 2 条·审计修复】带「阶段」标记的错误。
+//   save() 必须区分两种含义完全不同的失败，不能一律报「保存失败」：
+//     · 设置根本没写进 sync（校验拒绝 / sync 写入失败）；
+//     · 设置【已经】写进 sync，只有本机那份旧绕过列表没清干净。
+//   后者若被笼统报成「保存失败」，用户会以为什么都没保存，而生效值其实已经变了 ——
+//   与本项目反复修复的「状态≠事实」缺陷族同型。
+function phaseError(phase, message) {
+  var e = new Error(message);
+  e.phase = phase;
+  return e;
+}
+
+// 【第 1 条·审计修复】「上次从存储读到的内容」的签名，供 save() 判断本次保存
+//   是否会真正改变存储 —— 见 save() 末尾 confirmApplied 的说明。
+var lastLoadedSig = null;
+
+function settingsSignature(s) {
+  if (!s) return null;
+  return [s.enableProxy ? 1 : 0, s.proxyType, s.proxyHost, s.proxyPort,
+    s.bypassList].join("\u0000");
 }
 
 // 【G2】通道错误必须暴露：此前 `void chrome.runtime.lastError` 把「根本没能与后台
@@ -123,6 +149,9 @@ function renderStatus(state, readFailed) {
   // 【R7-01-F】读取失败不是「代理坏了」：单独取文案，避免状态条自相矛盾
   //   （前半句说代理可能已回退直连、后半句说本次未改动代理）。
   var key = state.status;
+  // 【第 4 条·审计修复】禁用态带 systemProxy 时，实际生效的是浏览器/系统自身的代理，
+  //   不是直连 —— 取单独文案，避免把「沿用系统代理」谎报成「直连」。
+  if (key === "direct" && state.systemProxy) key = "direct_system_proxy";
   if (state.status === "error" && state.reason === "read_failed") key = "error_read_failed";
   else if (state.status === "error" && state.reason === "control_unknown") key = "error_control_unknown";
   var row = STATUS_TEXT[key] || ["状态未知", "muted"];
@@ -161,7 +190,17 @@ function renderTest(result) {
   html += "<div><b>当前出口</b>" + escapeHtml(fmtExit(result.exit)) + "</div>";
 
   if (result.direct) {
-    html += "<div><b>直连出口</b>" + escapeHtml(fmtExit(result.direct)) + "</div>";
+    // 【第 4 条·审计修复】对比窗口的「直连」取样发生在 clearProxyScope() 之后，
+    //   而 clear() 只是让下层设置重新生效：若下层是系统代理 / PAC / 自动检测，
+    //   这一行拿到的其实是那条链路的出口，不是直连。后台已把实际模式带回
+    //   （result.afterClearMode），这里据此如实改写标题，不再冒称「直连出口」——
+    //   否则一个被污染的基准会让「代理是否生效」的结论整体失真。
+    var directLabel = "直连出口";
+    if (result.afterClearMode && result.afterClearMode !== "direct") {
+      directLabel = "清除后出口（实际模式 " + result.afterClearMode + "，并非直连）";
+    }
+    html += "<div><b>" + escapeHtml(directLabel) + "</b>" +
+      escapeHtml(fmtExit(result.direct)) + "</div>";
   }
 
   if (result.settings) {
@@ -200,6 +239,19 @@ function renderTest(result) {
   } else if (result.restoreFailed) {
     verdict = "⚠ 对比后恢复原代理配置失败，请重新保存一次设置以恢复。";
     kind = "error";
+  } else if (result.overriddenDuringRestore) {
+    // 【第 6 条·审计修复】对比窗口收尾（第三阶段）被外部接管时，后台会返回
+    //   overriddenDuringRestore（background.js 的「两个都可能是原因」那段），
+    //   但此前前台【没有任何分支消费它】—— 该标识符在 popup.js 中零命中，
+    //   渲染链继续下落，最终命中下面 result.ipChanged 的成功文案：
+    //   同一屏上状态条说「设置被企业策略或其它扩展接管」，结果区却说
+    //   「✓ 代理确实生效」，用户无法据此确认当前链路（与 R6-01 同族）。
+    //   处置：与其他恢复异常一起放在【IP 比较之前】，并明确区分
+    //   「取样时的出口」与「收尾后的实际状态」—— 出口比较只对取样那一刻成立。
+    verdict = "⚠ 对比期间出口确实与直连不同（取样那一刻），但收尾写回时发现代理设置" +
+      "被外部接管（" + result.overriddenDuringRestore + "），已放弃写回以免夺权。" +
+      "不能据此认为本扩展的代理目前仍生效；请检查企业策略或其它扩展。";
+    kind = "warn";
   } else if (result.overriddenDuringTest) {
     verdict = "⚠ 对比期间代理设置被外部接管（" + result.overriddenDuringTest + "），已放弃写回以免夺权，请检查企业策略或其它扩展。";
     kind = "warn";
@@ -422,6 +474,8 @@ function load() {
         items && items.bypassList,
         local && local.bypassList
       );
+      // 【第 1 条】记下「这次从存储读到的内容」，供 save() 判断本次保存是否会改变存储。
+      lastLoadedSig = settingsSignature(settings);
       markLoadOk();
       renderForm(settings);
 
@@ -519,14 +573,25 @@ function clearLocalBypassIfAny(savedBypassList, formWasShadowed) {
   if (typeof savedBypassList === "string" && savedBypassList === S.DEFAULTS.bypassList) {
     return Promise.resolve();
   }
-  return new Promise(function (resolve) {
+  return new Promise(function (resolve, reject) {
     chrome.storage.local.get(["bypassList"], function (cur) {
       // 【R8-01】读取失败时 cur 为 undefined：绝不能把它当成「local 里没有列表」，
       //   更不能继续走到下面的清除分支 —— 那会把用户的长列表永久清空（与 R7-03 同型）。
       //   读不到就什么都不做，等下一次存储变化或用户重新打开弹窗。
+      //   【第 2 条·审计修复】这里是【有意】的保守放过（什么都没写），
+      //   与下面的「写入失败」必须区别对待 —— 前者没有产生任何副作用。
       if (chrome.runtime.lastError || !cur) { resolve(); return; }
       if (typeof cur.bypassList === "string" && cur.bypassList) {
-        setStorage("local", { bypassList: "" }).then(resolve, resolve);
+        // 【第 2 条·审计修复】此前是 .then(resolve, resolve)：把 local 写入失败映射到
+        //   与成功【同一个出口】，失败被彻底吞掉，调用方随后照样显示「设置已保存」。
+        //   而取值规则是「sync 非空优先，为空则回退 local」——
+        //   用户【清空】列表时 sync 是空串，此刻 local 清不掉 ⇒ 生效值仍是旧列表：
+        //   「用户原本想取消直连的站点仍可绕过代理」，界面却宣称保存成功。
+        //   与 R7-03/R8-01 同族（静默失败），现在如实上抛，由 save() 分辨阶段给准确文案。
+        setStorage("local", { bypassList: "" }).then(resolve, function (err) {
+          reject(phaseError("local_cleanup",
+            "本机旧绕过列表清理失败：" + ((err && err.message) || err)));
+        });
       } else {
         resolve();
       }
@@ -611,23 +676,66 @@ function save() {
           "（其中的绕过列表可能是用户规则唯一副本，且后台自愈判据已因本次写入不再成立）。");
         showHint("已保存；但本机还保存着你自己的规则，当前生效的仍可能是这一份表单内容。" +
           "关闭并重新打开弹窗，或等待后台自动恢复后再确认。", "warn");
+        // 【第 1 条】本分支的提示是【数据安全告知】，信息量高于「是否已生效」，
+        //   因此后续不覆盖它（confirmApplied 的 silent 模式）。
+        return "shadow";
       })
     : (oversize
-        // 【M-3·审计修复】有序写入：先写 sync 空串占位，后写 local 用户列表。
-        //   此前顺序（先 local 后 sync）在 sync 写入失败时会把系统留在
-        //   「local = 新长列表、sync = 旧非空列表」的不一致中间态：
-        //   resolveBypassList 的「sync 非空优先」规则让旧值继续遮蔽新列表，
-        //   此后用户点一次保存还可能经 clearLocalBypassIfAny 把 local 也清掉
-        //   （R8-02 的丢数据链）。反序后两个失败模式都收敛为「如实报错、
-        //   有效值回退到旧 local」，不再产生遮蔽中间态：
-        //     · sync 占位失败 → 链路中断报错，local 与 sync 都未被改动；
+        // 【第 3 条·审计修复】超长列表必须「先落地、再切换引用」，且切换前要确证落地成功。
+        //
+        //   此前的顺序是「先写 sync 空串占位、再写 local」，它留下的理由写的是：
         //     · local 写入失败 → 报错；sync="" + 旧 local → 生效值回退旧列表，
         //       新值丢失但无遮蔽、无覆盖，且用户看到失败提示。
-        ? setStorage("sync", Object.assign({}, settings, { bypassList: "" })).then(function () {
-            return setStorage("local", { bypassList: settings.bypassList });
-          }).then(function () {
-            showHint("绕过列表较长，已存于本地（不跨设备同步）", "warn");
-          })
+        //   ——该推理【只对「local 里本来就有一份旧列表」成立】。
+        //   而常见情形恰恰相反：用户的列表短到能直接存 sync，此时 local 是【空的】。
+        //   于是 local 写入失败后 sync 已被写成 ""、local 仍为空
+        //   ⇒ resolveBypassList("", undefined) 得空串
+        //   ⇒ 用户原有的直连规则【凭空消失】，而这只是一次「保存失败」造成的路由变更：
+        //      原本应本地直连的内网主机改走代理服务器（内网断连、内部主机名暴露给代理方）。
+        //
+        //   三种顺序各自的状态都要检查「生效值可能是空吗」：
+        //     A) 先 sync 占位、后 local（旧实现）：本地为空时失败 → 空 ⇒ 丢数据 ❌
+        //     B) 先 local、后 sync（更早的实现）：sync 失败 → 旧 sync 非空 ⇒ 旧值 ✅
+        //       但它留下的中间态是「local=新长列表 / sync=旧非空列表」，新列表被旧值遮蔽。
+        //     C) 本实现 = B + 落地确证：仍然先写 local，但【回读确认新值确实可读回】
+        //        之后才写 sync 占位。于是每个失败点都保留旧的有效配置：
+        //          · local 写入失败 → 链路中断报错；sync 未被改动 ⇒ 生效值 = 旧 sync ✅
+        //          · 回读确证失败   → 同样不写 sync ⇒ 生效值 = 旧 sync ✅
+        //          · sync 占位失败 → local 已是新值但 sync 仍是非空旧值 ⇒ 生效值 = 旧 sync ✅
+        //        三个失败点都不会出现「生效值为空」，即不再有丢数据路径。
+        //        中间态（local 新值被 sync 旧值遮蔽）是短暂且安全的：下一步立即切换引用；
+        //        即使切换失败，也只是「新列表没生效、旧列表照旧」，并已如实报错。
+        //
+        //   【不可两全的说明】两次写入无法原子化，中间态客观存在（报告也指出
+        //   「不要仅颠倒两个写入顺序，因为反向同样存在半提交状态」）。因此本修复的目标
+        //   不是消灭中间态，而是保证【任何中间态下生效值都不是空】—— 这是丢数据的充要条件。
+        ? setStorage("local", { bypassList: settings.bypassList })
+            .then(function () {
+              // 落地后回读确证：写入回调成功 ≠ 值真的可读回（配额、并发、存储层异常）。
+              return new Promise(function (resolve, reject) {
+                chrome.storage.local.get(["bypassList"], function (cur) {
+                  var e = chrome.runtime.lastError;
+                  if (e) {
+                    reject(phaseError("stage_verify",
+                      "确认本机绕过列表写入失败：" + e.message));
+                    return;
+                  }
+                  if (!cur || cur.bypassList !== settings.bypassList) {
+                    reject(phaseError("stage_verify",
+                      "本机绕过列表写入后未能确证，已放弃切换生效值（原配置保持不变）"));
+                    return;
+                  }
+                  resolve();
+                });
+              });
+            })
+            .then(function () {
+              return setStorage("sync", Object.assign({}, settings, { bypassList: "" }));
+            })
+            .then(function () {
+              showHint("绕过列表较长，已存于本地（不跨设备同步）", "warn");
+              return "oversize";
+            })
         : setStorage("sync", settings).then(function () {
             // 【R8-02】把本次写进 sync 的 bypassList 一并交给清理函数：
             //   它据此判断「保存的是系统默认列表」还是「用户自己撰写的列表」。
@@ -635,14 +743,83 @@ function save() {
             return clearLocalBypassIfAny(settings.bypassList, formWasShadowed);
           }).then(function () {
             showHint("设置已保存", "ok");
+            return "generic";
           }));
 
-  chain.then(function () {
+  // 【第 1 条·审计修复】本次保存是否会真正改变存储。
+  //   快照由 load() 写入，因此这里比较的是「表单内容」与「上次从存储读到的内容」。
+  var sigChanged = settingsSignature(settings) !== lastLoadedSig;
+
+  chain.then(function (kind) {
     // 【V-01】保存结束即复位确认态与按钮文案（含成功与失败两条路径）。
     resetShadowConfirm();
+    // 【第 1 条】存储确实变了 → onChanged 会驱动下发，分支里的提示语已经准确。
+    //   没变 → 不会产生任何 storage 事件，必须显式请求一次下发并消费后台结果。
+    //   遮蔽现场（shadow）的提示是数据安全告知，只补发请求、不覆盖文案。
+    return confirmApplied(sigChanged, kind === "shadow");
   }, function (err) {
-    showHint("保存失败：" + ((err && err.message) || err), "error");
+    // 【第 2 条·审计修复】按阶段分辨失败，不把「已写入但没清理干净」笼统报成「保存失败」。
+    if (err && err.phase === "local_cleanup") {
+      // 取值规则是「sync 非空优先，为空则回退 local」：只有在 sync 为空
+      // （用户把列表清空了）时，没清掉的旧 local 才会成为真正生效的那一份。
+      if (!settings.bypassList) {
+        showHint("设置已保存，但本机保存的旧绕过列表未能清除，因此当前实际生效的仍是" +
+          "那份旧列表——你刚清空的规则可能仍会绕过代理。请重试保存。（" +
+          ((err && err.message) || err) + "）", "error");
+      } else {
+        showHint("设置已保存；只是本机多留了一份旧的绕过列表副本没能清除" +
+          "（当前生效的是你刚保存的这份，不受影响）。可稍后重试保存。（" +
+          ((err && err.message) || err) + "）", "warn");
+      }
+    } else {
+      showHint("保存失败：" + ((err && err.message) || err), "error");
+    }
     resetShadowConfirm();
+  });
+}
+
+// 【第 1 条·审计修复】保存成功后确认「到底有没有生效」，把「已保存」与「已生效」分开陈述。
+//
+//   根因：后台的【唯一下发驱动源】是 storage.onChanged（见 background.js 的 onChanged 监听）。
+//   而 Chrome 在写入值与库中原值完全相同时【不产生任何 change】——
+//   Chromium 的 LeveldbValueStore::AddToBatch 在 old == new 时既不记 change、也不写库，
+//   空变更列表 ⇒ onChanged 不派发。于是「按界面提示重新保存一次相同配置」不会触发任何下发。
+//   这条路径正是本文件 renderTest 给出的恢复指引（restoreFailed 文案：
+//   「请重新保存一次设置以恢复」）—— 指引本身失效，用户还会看到「设置已保存」这个假成功。
+//
+//   ⇒ 当本次保存不会产生存储变化时，显式请求一次重下发，并以【后台下发结果】作为提示依据。
+//     与事件驱动的下发共用 background 的 applyChain 串行队列，两者不会交错。
+function confirmApplied(sigChanged, silent) {
+  if (sigChanged) return Promise.resolve(null);
+  return send({ action: "reapply" }).then(function (resp) {
+    if (!silent) {
+      if (!resp) {
+        showHint("设置已保存，但未能与后台确认是否已生效（后台无响应）。" +
+          "可点击「测试当前出口」确认，或关闭后重新打开弹窗。", "warn");
+      } else if (resp.ok === true && resp.status === "applied") {
+        showHint("设置已保存，且代理已按当前配置生效。", "ok");
+      } else if (resp.ok === true && resp.status === "direct") {
+        showHint("设置已保存（当前未启用代理）。", "ok");
+      } else if (resp.ok === true && resp.status === "suspended") {
+        // 连接测试进行中：后台已记脏，测试收尾会按最新设置下发。
+        showHint("设置已保存；连接测试结束后会自动下发。", "warn");
+      } else if (resp.ok === true && resp.status === "overridden") {
+        showHint("设置已保存，但代理设置被企业策略或其它扩展接管，本次未下发。" +
+          "请检查企业策略或其它扩展。", "warn");
+      } else {
+        // error / saved_not_applied / 未知档：存储已写入，但代理【没有】生效。
+        //   绝不能沿用「设置已保存」——那正是本条要修的假成功。
+        var why = (resp.errors && resp.errors[0]) || resp.message || resp.status || "原因未知";
+        showHint("设置已保存，但代理未能生效：" + why, "error");
+      }
+    }
+    return resp;
+  }, function (err) {
+    if (!silent) {
+      showHint("设置已保存，但无法确认代理是否生效（消息通道异常：" +
+        ((err && err.message) || err) + "）。可点击「测试当前出口」确认。", "warn");
+    }
+    return null;
   });
 }
 

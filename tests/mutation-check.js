@@ -423,6 +423,101 @@ const mutations = [
     from: "    } else if (hasNoHostLabel(s.proxyHost)) {",
     to: "    } else if (false) {",
     expectFail: true
+  },
+  {
+    // 【外部审查报告第 1 条】保存后必须确认代理是否真的生效。
+    //   把 confirmApplied 的入口判据改成恒真 = 任何保存都直接返回、从不发 reapply：
+    //   回到缺陷原状 —— 后台唯一的下发驱动源是 storage.onChanged，而 Chromium 在
+    //   写入值与库中原值完全相同时【不产生 change】（LeveldbValueStore::AddToBatch），
+    //   于是「按提示重新保存一次相同配置」永远不会触发下发。
+    //   popup 的第 1 条-a（applied 计数必须 +1）是它的主守门者。
+    name: "M26 保存后的生效确认被架空（第 1 条回归：相同内容保存不触发下发）",
+    target: "popup",
+    from: "  if (sigChanged) return Promise.resolve(null);",
+    to: "  if (true) return Promise.resolve(null);",
+    expectFail: true
+  },
+  {
+    // 【外部审查报告第 2 条】清理本机旧绕过列表失败必须如实上抛。
+    //   reject → resolve 即回到缺陷原状：local 写入失败被映射到与成功同一出口，
+    //   用户清空了列表、sync 也是空串，但 local 清不掉 ⇒ 生效值仍是旧列表
+    //   （想取消直连的站点仍绕过代理），界面却宣称"设置已保存"。
+    //   popup 的第 2 条-a（必须说明"未能清除…仍会绕过代理"）是它的主守门者。
+    name: "M27 本机旧列表清理失败被吞（第 2 条回归：静默失败报成功）",
+    target: "popup",
+    from: "          reject(phaseError(\"local_cleanup\",",
+    to: "          resolve(phaseError(\"local_cleanup\",",
+    expectFail: true
+  },
+  {
+    // 【外部审查报告第 3 条】超长列表必须「先落地、确证、再切换 sync 引用」。
+    //   在回读确证那一步直接 return，等于删掉确证层：写入回调成功但值未落地时，
+    //   代码仍会去写 sync 占位串，把生效值清成空 —— 与"先写 sync 空串"的原始
+    //   数据丢失路径等价。popup 的第 3 条-e（sync 不得被清空）是它的主守门者。
+    name: "M28 切换引用前不再回读确证（第 3 条回归：未落地也清空 sync）",
+    target: "popup",
+    from: "            .then(function () {\n              // 落地后回读确证：写入回调成功 ≠ 值真的可读回（配额、并发、存储层异常）。",
+    to: "            .then(function () {\n              return;\n              // 落地后回读确证：写入回调成功 ≠ 值真的可读回（配额、并发、存储层异常）。",
+    expectFail: true
+  },
+  {
+    // 【外部审查报告第 4 条】clear() 不等于强制直连 —— 必须在清除后回读实际模式再陈述。
+    //   把回读结果写死成 "direct" = 回到缺陷原状：禁用分支无条件宣称"未启用代理（直连）"，
+    //   而浏览器可能正沿用系统代理 / PAC / 自动检测，界面结论与事实相反，还会污染后续
+    //   "直连出口"对比的基准。
+    //   ownership 的第 4 条-a / -c（systemProxy 与 readFailed）是它的主守门者。
+    name: "M29 禁用路径清除后回读被写死（第 4 条回归：谎称已直连）",
+    target: "bg",
+    from: "    var afterClearMode = (afterClear && afterClear.value && afterClear.value.mode) || null;",
+    to: "    var afterClearMode = \"direct\";",
+    expectFail: true
+  },
+  {
+    // 【外部审查报告第 4 条·第二处陈述点】chrome.proxy.settings.onChange 回读路径。
+    //   !isFixed 涵盖 direct / system / pac_script / auto_detect，只有 direct 才是直连；
+    //   把该分支改成恒假 = 一律写 status:"direct" 并宣称"未启用代理（直连）"。
+    //   ownership 的第 4 条-e / -f（systemProxy 与"并非直连"文案）是它的主守门者。
+    name: "M30 onChange 到非直连模式仍谎称直连（第 4 条回归）",
+    target: "bg",
+    from: "        if (actualMode !== \"direct\") {",
+    to: "        if (false) {",
+    expectFail: true
+  },
+  {
+    // 【外部审查报告第 5 条】状态写入的代次护栏：旧状态的重试不得覆盖更新的状态。
+    //   把 superseded() 改成恒假 = 不认代次：一次 lastState=applied 的写入失败后，
+    //   若 250ms 内发生了真实 onProxyError（lastState=error 写成功），那次重试仍会把
+    //   过期的 applied 盖回去 —— 图标已按 error 变红、状态条却回到"代理已生效"。
+    //   ownership 的第 5 条-a / -b 是它的主守门者。
+    //   注意：这是【独立】于 M-5 的机制 —— M-5 只证明"失败降级标记"存在，
+    //   本变异证明"代次判定"本身承重（M-5 的三个用例在恒假下全部照常通过）。
+    name: "M31 状态写入代次判定失效（第 5 条回归：旧状态重试覆盖新状态）",
+    target: "bg",
+    from: "  function superseded() { return stateWriteGeneration[key] !== myGen; }",
+    to: "  function superseded() { return false; }",
+    expectFail: true
+  },
+  {
+    // 【外部审查报告第 6 条·后台侧】对比窗口收尾被外部接管时，必须把这一事实回传前台。
+    //   不再回传（置 null）= 前台没有任何信息可消费，渲染链继续下落命中 ipChanged 的
+    //   成功文案，同一屏上"被接管"与"✓ 代理确实生效"并存。
+    //   ownership 的 R6-03 fix-round-1（resp.result.overriddenDuringRestore）是主守门者。
+    name: "M32 收尾被接管的事实不再回传（第 6 条回归：前台无从消费）",
+    target: "bg",
+    from: "      result.overriddenDuringRestore = core.levelOfControl || \"unknown_control\";",
+    to: "      result.overriddenDuringRestore = null;",
+    expectFail: true
+  },
+  {
+    // 【外部审查报告第 6 条·前台侧】popup 必须真正【消费】overriddenDuringRestore。
+    //   该分支失效 = 回到缺陷原状：渲染链穿过它继续下落，最终命中 ipChanged 的成功文案
+    //   "✓ 代理确实生效"，与状态条上的"已被接管"自相矛盾。
+    //   popup 的第 6 条-a / -b 是它的主守门者。
+    name: "M33 前台不再消费 overriddenDuringRestore（第 6 条回归：误报已生效）",
+    target: "popup",
+    from: "  } else if (result.overriddenDuringRestore) {",
+    to: "  } else if (false) {",
+    expectFail: true
   }
 ];
 
