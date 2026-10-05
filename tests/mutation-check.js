@@ -230,13 +230,21 @@ const mutations = [
     expectFail: true
   },
   {
-    // 【V-02 第 2 层】把入口守卫改成恒假 —— 等价于 R9-01 修复前的状态：
+    // 【V-02 第 2 层】入口分支判定退化为恒假 —— 等价于 R9-01 修复前的状态：
     //   超长值走 oversize 分支，直接 setStorage("local", {bypassList: 表单值})，
     //   覆盖用户唯一副本。R9-01-F3 / R9-01-F4 必须变红。
-    name: "M18 遮蔽现场入口守卫恒假（V-02 回归：oversize 分支覆盖 local 唯一副本）",
+    //
+    //   【2.8.0（S1）锚点更新 · 如实记录】S1 给 clearLocalBypassIfAny 增加了
+    //   纵深防御第二层（传入 formWasShadowed 快照，遮蔽现场绝不写 local）。
+    //   该层与「chain 的 formWasShadowed 分支」互为冗余 —— 冗余意味着【单点】
+    //   变异（只改 chain 分支）会被另一层接住而不再产生可观测危害，原 M18 锚点
+    //   因此失效（2.8.0 门禁实测 MISS）。这里改变异【快照点】本身：
+    //   var formWasShadowed = loadedShadowed  →  false。它是两层防线的共同输入，
+    //   击穿它 = 两层同时失效 = 完整回到 R9-01 修复前的数据丢失路径。
+    name: "M18 遮蔽现场快照退化为恒假（V-02 回归：oversize 分支覆盖 local 唯一副本）",
     target: "popup",
-    from: "  var chain = formWasShadowed\n    ? setStorage(\"sync\", settings).then(function () {",
-    to: "  var chain = false\n    ? setStorage(\"sync\", settings).then(function () {",
+    from: "  var formWasShadowed = loadedShadowed;",
+    to: "  var formWasShadowed = false;",
     expectFail: true
   },
   {
