@@ -263,9 +263,12 @@ console.log("== 打包脚本（M-2：发布产物的唯一来源必须有测试�
     JSON.stringify(missingFromManifest(fake)));
 
   // 打包到临时目录做产物断言，不污染仓库工作区
+  // 【B-5】传 selfCheck:true：本组断言必须在【变异门禁运行期间】同样通过，否则
+  //   门禁下这 6 条产物断言必然失败，等价变异体 M1 会被误判成「被拦截」。
+  //   该例外受两重约束（显式声明 + 目标在系统临时目录），见 tools/package.js。
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "easy-proxy-pack-"));
   try {
-    const { dest, version, copied } = pack(tmp);
+    const { dest, version, copied } = pack(tmp, { selfCheck: true });
     t("pack 返回的复制清单与 RUNTIME_FILES 一致",
       JSON.stringify([...copied].sort()) === JSON.stringify([...RUNTIME_FILES].sort()),
       JSON.stringify(copied));
@@ -289,6 +292,11 @@ console.log("== 打包脚本（M-2：发布产物的唯一来源必须有测试�
     // 【B-3】变异哨兵互斥：哨兵在位时打包必须失败。
     //   事故背景：dist/ 里曾出现 M22 变异体（packaging 跑在变异运行期间）。
     //   这条断言证明「打包脚本自己拦得住」，而不是靠人记得不要并发。
+    // 【B-5】注意本组断言在两种环境下都必须通过：
+    //   · 常规运行（无哨兵）：本块自己写入哨兵，触发拒绝；
+    //   · 变异门禁运行（门禁已落哨兵）：哨兵本就在位，同样触发拒绝。
+    //   因此本块自己写入哨兵后必须【严格还原现场】——原本有就写回原内容，
+    //   原本没有才删除。下方最后一条断言校验的正是这个「还原」不变式。
     {
       const sentinel = path.join(rootDir, ".mutation-in-progress");
       const existed = fs.existsSync(sentinel);
@@ -300,12 +308,29 @@ console.log("== 打包脚本（M-2：发布产物的唯一来源必须有测试�
         t("变异哨兵在位时 pack 必须拒绝打包（B-3：防止产物含变异体）",
           !!threw && /变异测试正在运行/.test(threw.message),
           threw ? threw.message : "未抛错（护栏失效）");
+
+        // 【B-5】自检例外的边界：非系统临时目录即便声明 selfCheck 也必须拒绝，
+        //   否则 selfCheck 就退化成「绕过哨兵」的后门。探针目录若被误创建则删除。
+        const probe = path.join(rootDir, ".pack-abuse-probe");
+        let probeErr = null;
+        try { pack(probe, { selfCheck: true }); } catch (e) { probeErr = e; }
+        fs.rmSync(probe, { recursive: true, force: true });
+        t("自检例外只对系统临时目录生效（selfCheck 不能成为绕过哨兵的通道）",
+          !!probeErr && /变异测试正在运行/.test(probeErr.message),
+          probeErr ? probeErr.message : "未抛错（例外被滥用）");
       } finally {
         // 严格还原现场：原本没有哨兵就必须删掉，避免在仓库根留下残留文件。
         if (existed && backup !== null) fs.writeFileSync(sentinel, backup);
         else fs.rmSync(sentinel, { force: true });
       }
-      t("B-3 断言结束后哨兵已清除（不污染工作区）", !fs.existsSync(sentinel));
+      // 【B-5】此前这里写的是 `!fs.existsSync(sentinel)` —— 那与上面「严格还原现场」
+      //   自相矛盾：门禁运行时哨兵本就该在，被还原后依然存在，断言必然为假，
+      //   于是门禁里每条变异都因这一条而「被拦截」（假红，M1 误判的直接成因）。
+      //   正确的不变式是「断言前后的哨兵状态一致」，两种环境都成立。
+      t("B-3 断言结束后哨兵状态与断言前一致（严格还原现场，不污染工作区）",
+        fs.existsSync(sentinel) === existed &&
+          (!existed || fs.readFileSync(sentinel, "utf8") === backup),
+        "断言前 existed=" + existed + "；断言后 exists=" + fs.existsSync(sentinel));
     }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });

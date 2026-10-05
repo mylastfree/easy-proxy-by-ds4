@@ -15,6 +15,7 @@
 //   脚本本体仅在直接执行时进入 main()，被 require 时零副作用。
 "use strict";
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const root = path.join(__dirname, "..");
@@ -58,8 +59,32 @@ function missingFromManifest(manifest, files) {
 //   用户拿到的就是被破坏的版本。本脚本是发布产物的唯一来源，必须自己拦住它。
 const MUTATION_SENTINEL = path.join(root, ".mutation-in-progress");
 
-function assertNoMutationInProgress() {
+// 【B-5】destRoot 是否落在系统临时目录内（两侧都取 realpath，防软链绕过）。
+function isInsideOsTmp(p) {
+  try {
+    const tmp = fs.realpathSync(os.tmpdir());
+    const dest = fs.realpathSync(p);
+    const rel = path.relative(tmp, dest);
+    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  } catch (e) {
+    return false;
+  }
+}
+
+function assertNoMutationInProgress(destRoot, opts) {
   if (!fs.existsSync(MUTATION_SENTINEL)) return;
+
+  // 【B-5·自检例外】tests/manifest.test.js 需要在变异门禁运行期间照常验证
+  //   「打包可复现性」，而门禁的哨兵此时必然在位。若一律拒绝，那 6 条产物断言
+  //   在门禁里必然失败 —— 后果是把【等价变异体 M1（expectFail:false）】误判成
+  //   「被拦截」，门禁从 23/23 掉到 22/23（实测：CI run 37290295856 三 Node 全红）。
+  //   例外被两重条件同时收紧，不构成绕过通道：
+  //     ① 调用方必须显式传 { selfCheck: true } —— 发布 CLI（main）永不传；
+  //     ② 目标目录必须落在系统临时目录内 —— 临时目录里的产物不可能被发布。
+  //   tests/manifest.test.js 同时断言「非临时目录 + selfCheck:true 仍然拒绝」，
+  //   把这条边界钉死在测试里，防止日后被改成无条件放行。
+  if (opts && opts.selfCheck === true && isInsideOsTmp(destRoot)) return;
+
   let info = "";
   try { info = fs.readFileSync(MUTATION_SENTINEL, "utf8").trim(); } catch (e) { /* 尽力而为 */ }
   throw new Error(
@@ -72,8 +97,10 @@ function assertNoMutationInProgress() {
 
 // 打包到 <destRoot>/easy-proxy-by-ds4-<version>/，返回 { dest, version, copied }。
 // 纯复制，无构建步骤；发现清单缺失或源文件不存在时抛错（由调用方决定如何呈现）。
-function pack(destRoot) {
-  assertNoMutationInProgress();
+// opts.selfCheck=true 仅供测试自检使用，且仅在 destRoot 位于系统临时目录时生效
+// （见 assertNoMutationInProgress 的说明）；发布路径永远不传它。
+function pack(destRoot, opts) {
+  assertNoMutationInProgress(destRoot, opts);
 
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
   const version = manifest.version;

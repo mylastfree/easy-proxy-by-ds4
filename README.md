@@ -118,7 +118,7 @@
 
 | 测试 | 覆盖内容 |
 | --- | --- |
-| `tests/manifest.test.js` | 清单完整性：版本格式、权限最小化、引用文件存在、HTML/JS 元素 ID 一致、源文件头与 manifest 版本对齐、打包哨兵互斥、文档声明数一致性（68 项） |
+| `tests/manifest.test.js` | 清单完整性：版本格式、权限最小化、引用文件存在、HTML/JS 元素 ID 一致、源文件头与 manifest 版本对齐、打包哨兵互斥与自检例外边界、文档声明数一致性（69 项） |
 | `tests/settings.test.js` | 纯函数：默认值、类型收敛、绕过列表解析、输入校验（含 host:port 必拒写法提前拦截）、容量估算、主机名 ASCII 判定、出口检测端点容错配置（89 项） |
 | `tests/background.test.js` | 异步逻辑：并发下发的最终一致性、测试期暂停机制、取值一致性、CIDR 判定（38 项） |
 | `tests/fix-safety.test.js` | 修复安全性：暂停标志必然复位、串行队列不累积、收紧判定未误伤合法输入（19 项） |
@@ -127,7 +127,7 @@
 | `tests/popup.test.js` | popup 交互：异常时按钮必须复位、通道失败如实呈现、遮蔽现场数据保全，且如实显示失败原因；表单重绘焦点保护、escapeHtml 转义契约与 XSS 回归（161 项） |
 | `tests/mutation-check.js` | 变异测试：故意破坏每个修复点，确认护栏测试真的会失败（23 项变异） |
 
-七套功能测试合计 **708 项断言**。
+七套功能测试合计 **709 项断言**。
 
 ```powershell
 npm test                       # 全部七套（tests/run-all.js 统一入口，任一失败即停）
