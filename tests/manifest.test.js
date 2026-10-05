@@ -207,6 +207,54 @@ console.log("== 文档声明数一致性（G1：合计 = 各行之和；变异�
     !!total && Number(total) === rows.reduce((a, b) => a + b, 0),
     "合计=" + total + "；各行=" + JSON.stringify(rows) + "；和=" + rows.reduce((a, b) => a + b, 0));
 
+  // 【M-3·审计修复】覆盖率此前是唯一「只报告、不拦截」的质量数字：
+  //   断言数漂移会让 CI 变红，覆盖率退化却什么都不发生 —— 门禁全绿但护栏变稀。
+  //   两条断言把机制钉住，且**刻意不读取 coverage/lcov.info**：那份报告只在
+  //   `npm run coverage`（c8 包装）下才存在，用它做断言会让测试依赖环境，
+  //   与本仓库「测试必须环境无关」的硬约束冲突（读不到就跳过的写法同样不可接受，
+  //   那等于在 CI 里静默失效）。因此只做静态契约校验。
+  const c8rc = JSON.parse(read(".c8rc.json"));
+  t("覆盖率门禁已开启且四类门槛齐全（check-coverage + lines/statements/functions/branches）",
+    c8rc["check-coverage"] === true &&
+    ["lines", "statements", "functions", "branches"].every(k => typeof c8rc[k] === "number"),
+    JSON.stringify(c8rc));
+  t("README 的覆盖率声明同时给出行覆盖与分支覆盖（防止只报好看的那一个数）",
+    readme.indexOf("行覆盖") >= 0 && readme.indexOf("分支覆盖") >= 0,
+    "README 覆盖率段缺失行覆盖或分支覆盖");
+
+  // 【L-05·审计修复】status / reason 取值的双向一致性契约。
+  //   事实来源 = settings.js 的 STATUS / REASON 清单。两侧都必须与它一致：
+  //     ① 写入方（background.js）实际写出的字面量集合；
+  //     ② 渲染方（popup.js）提供的文案键集合（status 用本身，reason 用 error_<reason>）。
+  //   实测缺口即由此暴露：reason:"restore_interrupted" 此前在 popup 无文案，
+  //   落到泛化的 error 档「代理异常，流量可能已回退直连」——语义恰好相反。
+  //   刻意做静态检查（不读 coverage 之类环境产物），保证测试环境无关。
+  const settingsForStates = read("settings.js");
+  const declaredStatus = [...((settingsForStates.match(/var STATUS = \[([^\]]*)\]/) || [])[1] || "")
+    .matchAll(/'([a-z_]+)'/g)].map(m => m[1]).sort();
+  const declaredReason = [...((settingsForStates.match(/var REASON = \[([^\]]*)\]/) || [])[1] || "")
+    .matchAll(/'([a-z_]+)'/g)].map(m => m[1]).sort();
+  const bgForStates = read("background.js");
+  const writtenStatus = [...new Set([...bgForStates.matchAll(/status:\s*"([a-z_]+)"/g)].map(m => m[1]))].sort();
+  const writtenReason = [...new Set([...bgForStates.matchAll(/reason:\s*"([a-z_]+)"/g)].map(m => m[1]))].sort();
+  t("L-05-a background.js 写出的 status 集合 = settings.js 的 STATUS 清单",
+    declaredStatus.length > 0 && declaredStatus.join(",") === writtenStatus.join(","),
+    "声明=" + JSON.stringify(declaredStatus) + "；实际写出=" + JSON.stringify(writtenStatus));
+  t("L-05-b background.js 写出的 reason 集合 = settings.js 的 REASON 清单",
+    declaredReason.length > 0 && declaredReason.join(",") === writtenReason.join(","),
+    "声明=" + JSON.stringify(declaredReason) + "；实际写出=" + JSON.stringify(writtenReason));
+
+  const popupForStates = read("popup.js");
+  const statusTextBlock = (popupForStates.match(/var STATUS_TEXT = \{([\s\S]*?)\n\};/) || [])[1] || "";
+  const textKeys = [...statusTextBlock.matchAll(/^\s*([a-z_]+):/gm)].map(m => m[1]);
+  const missingStatusText = declaredStatus.filter(s => textKeys.indexOf(s) < 0);
+  t("L-05-c popup 为每个 status 提供 STATUS_TEXT 文案（否则静默落兜底「状态未知」）",
+    textKeys.length > 0 && missingStatusText.length === 0,
+    "缺=" + JSON.stringify(missingStatusText) + "；已有键=" + JSON.stringify(textKeys));
+  const missingReasonText = declaredReason.filter(r => textKeys.indexOf("error_" + r) < 0);
+  t("L-05-d popup 为每个 reason 提供 error_<reason> 文案",
+    missingReasonText.length === 0, "缺=" + JSON.stringify(missingReasonText));
+
   // 【G1】变异数同理：README 声明的变异数必须与 tests/mutation-check.js 实际定义数一致
   const mutationSrc = read("tests/mutation-check.js");
   const mutationCount = (mutationSrc.match(/expectFail:/g) || []).length;

@@ -1,6 +1,6 @@
 {
   "name": "easy-proxy-by-ds4",
-  "version": "2.12.0",
+  "version": "2.13.0",
   "private": true,
   "description": "一键让 Chrome 走本地代理（SOCKS5 / HTTPS），局域网默认直连，内置出口检测",
   "license": "MIT",
@@ -14,6 +14,9 @@
     "lint": "eslint .",
     "package": "node tools/package.js",
     "coverage": "c8 node tests/run-all.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "devDependencies": {
     "c8": "^12.0.0",

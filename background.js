@@ -1,4 +1,8 @@
-// background.js —— MV3 Service Worker  [v2.12.0]
+// background.js —— MV3 Service Worker  [v2.13.0]
+// 【L-06·审计修复】补上全局严格模式：本文件是 classic service worker（非 module），
+//   默认处于非严格模式，隐式全局赋值、静默失败的写入、`this` 装箱等都无法被
+//   静态规则拦住。settings.js 早已声明（在 IIFE 内），此处与 popup.js 补齐一致。
+'use strict';
 importScripts("settings.js");
 
 var S = self.EasyProxy;
@@ -289,6 +293,23 @@ function updateIcon(status, reason) {
   if (status === 'error' && reason === 'control_unknown') {
     titles.error = '无法确证代理控制权，本次未改动代理';
   }
+  // 【M-1·审计修复】direct 档同样有三个语义不同的来源，标题必须跟着分档。
+  //   背景：v2.12.0 第 4 条把「状态条文案」按 systemProxy 分了档，但图标标题没有
+  //   跟着分 —— 图标标题固定为「未启用代理（直连）」，而图标本身的图例
+  //   （README：红·直 = 直连）也是一次独立断言。于是「不得宣称直连」这个验收要点
+  //   只落在状态条上，悬停提示仍在宣称直连，与状态条正文自相矛盾。
+  //   三个来源：
+  //     · reason === 'direct'            → 回读确证就是直连，沿用原句（唯一可宣称直连的情形）
+  //     · reason === 'read_failed'       → 回读失败：本扩展代理确已停用，但底层模式读不到
+  //     · reason === 其它 mode 字符串    → 回读成功但非 direct（system / pac_script /
+  //                                        auto_detect / 外部 fixed_servers）
+  if (status === 'direct') {
+    if (reason === 'read_failed') {
+      titles.direct = '已停用本扩展代理，但无法确证当前实际生效的模式';
+    } else if (reason && reason !== 'direct') {
+      titles.direct = '未启用本扩展代理（当前沿用 ' + reason + '）';
+    }
+  }
   chrome.action.setTitle({ title: titles[status] || "代理设置" }, function () {
     void chrome.runtime.lastError;
   });
@@ -299,12 +320,18 @@ function updateIcon(status, reason) {
 // 【C-3】出口检测响应的 schema 校验与归一化。
 //   此前直接信任 resp.json() 的形状（data.ip || '' 兜底），端点被劫持/改版返回
 //   缺 ip 或非对象 JSON 时会得到 {ok:true, ip:''} 的「成功」结果，误导测试结论。
-//   现在：ip 必须是非空白、长度合理（≤45，IPv6 最长 39 + 容差）的字符串，否则判为
-//   端点失败并触发备用端点。其余字段缺失时安全地置空串（备用端点如 ipify 只返回 ip）。
+//   现在：ip 必须通过 settings.js 的 isIpLiteral 形态校验（非空、长度合理、无空白，
+//   且确实是 IPv4 / IPv6 字面量），否则判为端点失败并触发备用端点。
+//   其余字段缺失时安全地置空串（备用端点如 ipify 只返回 ip）。
+//
+//   【L-03·审计修复】「长度 ≤45 + 无空白」这一层是承重的但不充分：SECURITY.md 与
+//   PRIVACY.md 都声称响应必须包含「有效的 ip 字段」，而 "not-an-ip" 能通过旧判据 ——
+//   界面会把一段无意义文本当作出口 IP 展示，并据「拿到了 ip」判为「出口检测成功」。
+//   判据收敛到 settings.js（与 host 校验同一处「单一实现」原则），文档与实现从此一致。
 function normalizeExitPayload(data) {
   if (!data || typeof data !== 'object') return null;
   var ip = typeof data.ip === 'string' ? data.ip.trim() : '';
-  if (!ip || ip.length > 45 || /\s/.test(ip)) return null;
+  if (!S.isIpLiteral(ip)) return null;
   function s(v) { return typeof v === 'string' ? v : ''; }
   return {
     ok: true,
@@ -540,7 +567,10 @@ async function applyProxyCore() {
     //   不得把「读不到」当成「是直连」（与 R7-01「读不到 ≠ 没有」同一条原则）。
     var afterClear = await readProxyDetails();
     var afterClearMode = (afterClear && afterClear.value && afterClear.value.mode) || null;
-    updateIcon("direct");
+    // 【M-1·审计修复】把回读结果一并交给 updateIcon：图标标题必须与状态条同档，
+    //   否则悬停提示会在「回读失败」与「沿用下层代理」两种情形下继续宣称直连。
+    //   afterClearMode 为 null（回读失败）时传 'read_failed'，由 updateIcon 取对应文案。
+    updateIcon("direct", afterClearMode || "read_failed");
     var directState = { status: "direct", at: Date.now() };
     if (!afterClearMode) {
       directState.readFailed = true;
@@ -1382,7 +1412,8 @@ chrome.proxy.settings.onChange.addListener(function (details) {
             "（" + (actualMode || "未知模式") + "），并非直连";
         }
         writeState(dState);
-        updateIcon("direct");
+        // 【M-1·审计修复】同禁用分支：把实际模式交给 updateIcon，标题不得宣称直连。
+        updateIcon("direct", actualMode || "read_failed");
         return;
       }
       // 剩下的组合都是「界面结论会与实际不符」的那一档，必须如实报 error：
@@ -1454,6 +1485,30 @@ chrome.storage.onChanged.addListener(function (changes, areaName) {
   }
 });
 
+// 【L-08·审计修复】诊断快照的脱敏摘要。
+//   背景：全仓 28 处 console.*（background 25 / popup 3）分散在各条路径上，
+//   排障只能人工打开 Service Worker 控制台逐条翻，且没有任何「把现状一次性导出来」的入口。
+//   脱敏是硬要求：本快照会被用户直接复制进公开 issue，因此
+//     · 不含出口 IP（用户真实 IP）—— 只保留「是否拿到出口 / 是否变化」这类结构性信息；
+//     · 不含代理地址与端口（用户内网拓扑）—— 只保留状态结论里已有的模式名。
+function summarizeTest(t) {
+  if (!t || typeof t !== 'object') return null;
+  return {
+    ok: t.ok === true,
+    error: typeof t.error === 'string' ? t.error : null,
+    hasExit: !!(t.exit && t.exit.ok),
+    hasDirectExit: !!(t.direct && t.direct.ok),
+    ipChanged: t.ipChanged === true,
+    afterClearMode: t.afterClearMode || null,
+    activeMode: t.activeMode || null,
+    compareSkipped: t.compareSkipped || null,
+    restoreFailed: t.restoreFailed === true,
+    overriddenDuringRestore: t.overriddenDuringRestore || null,
+    overriddenDuringTest: t.overriddenDuringTest || null,
+    stateSuperseded: t.stateSuperseded === true
+  };
+}
+
 chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
   if (!request) return;
 
@@ -1488,14 +1543,41 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
   }
 
   if (request.action === "reapply") {
-    // 【A4 · 保留用途声明】本分支在产品代码中【没有】任何调用方（popup 从不发送）。
-    //   有意保留，不是死代码，两个用途：
-    //   1) tests/ownership.test.js 用它验证消息来源校验（sender.id 白名单）与
-    //      「强制重下发」的消息契约，删除会破坏测试；
+    // 【A4 → v2.13.0 更正】原注释写「本分支在产品代码中【没有】任何调用方（popup 从不发送）」，
+    //   自 v2.12.0 起已被推翻：popup 有两处真实调用方 ——
+    //     · confirmApplied()：内容不变的保存（Chromium 对「写入值与库中原值完全相同」的
+    //       storage.set 既不派发 onChanged、也不写盘，故此时必须显式索取一次下发）；
+    //     · resetDefaults()：恢复默认后显式索取一次下发。
+    //   保留原两点用途，并补充第 3 点：
+    //   1) tests/ownership.test.js 与 tests/concurrency.test.js 用它验证消息来源校验
+    //      （sender.id 白名单）与「强制重下发」的消息契约，删除会破坏测试；
     //   2) 诊断入口：在扩展的 Service Worker 控制台执行
     //      chrome.runtime.sendMessage({ action: "reapply" })
-    //      可强制按最新设置重新下发一次代理。
+    //      可强制按最新设置重新下发一次代理；
+    //   3) 产品路径：上述两处前台调用方据本分支的返回值陈述「是否真的生效」
+    //      （见 popup.js 的 reportApplyOutcome）。
     applyProxySerial().then(sendResponse);
+    return true;
+  }
+
+  if (request.action === "getDiagnostics") {
+    // 【L-08·审计修复】一次性诊断快照，供 popup 的「导出诊断」按钮呈现。
+    //   读取失败同样如实上报（ok:false + error），绝不把「读不到」伪装成「没有」——
+    //   与 getStatus 的 readFailed 契约同一条原则。
+    chrome.storage.session.get(["lastState", "lastTest", PENDING_RESTORE_KEY], function (items) {
+      var dErr = chrome.runtime.lastError;
+      sendResponse({
+        ok: !dErr,
+        error: dErr ? dErr.message : null,
+        version: chrome.runtime.getManifest().version,
+        lastState: dErr ? null : (items && items.lastState) || null,
+        lastTest: dErr ? null : summarizeTest(items && items.lastTest),
+        pendingRestore: dErr ? null : (items && items[PENDING_RESTORE_KEY]) || null,
+        suspendDepth: suspendDepth,
+        suspendDirty: suspendDirty,
+        at: Date.now()
+      });
+    });
     return true;
   }
 

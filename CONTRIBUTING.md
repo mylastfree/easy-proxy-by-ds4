@@ -29,9 +29,9 @@
 
 ```powershell
 npm run lint        # ESLint（CI 首个失败点）
-npm test            # 七套功能测试（755 项断言，tests/run-all.js 统一入口）
+npm test            # 七套功能测试（788 项断言，tests/run-all.js 统一入口）
 npm run coverage    # 可选：c8 覆盖率报告
-npm run mutation    # 变异门禁（33 项，本机约 36 分钟）
+npm run mutation    # 变异门禁（34 项，本机约 36 分钟）
 npm run package     # 可选：验证打包清单
 ```
 

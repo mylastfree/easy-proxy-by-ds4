@@ -22,6 +22,9 @@ const path = require('node:path');
 
 const settingsSrc = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8');
 const popupSrc = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
+// 【L-08】诊断快照里含 `chrome.runtime.getManifest().version`，桩必须提供真实版本，
+//   否则 background 的 getDiagnostics 分支会抛 TypeError（真实 SW 里该 API 恒存在）。
+const manifestVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest.json'), 'utf8')).version;
 
 const EXIT_IP = "203.0.113.9";
 
@@ -201,6 +204,8 @@ function buildChainEnv(opts) {
       runtime: {
         lastError: undefined,
         id: "test-extension-id",
+        // 【L-08】getDiagnostics 会读版本号；桩返回真实 manifest 版本。
+        getManifest() { return { version: manifestVersion }; },
         onInstalled: { addListener() {} },
         onStartup: { addListener() {} },
         onMessage: { addListener(fn) { msgHandlers.push(fn); } },
@@ -1504,8 +1509,14 @@ function t(name, cond, extra) {
       envG6.hint().indexOf("清空本机保存的绕过列表") >= 0,
       JSON.stringify(envG6.hint()));
 
+    // 【测试稳定性修复】第二次点击后的链路含一次真实的下发往返（reapply → applyProxy，
+    //   其中逐条清理遗留作用域 = 十余次 setTimeout(0) 跳）。固定 sleep(240) 实测完成
+    //   时间在 166–270 ms，恰好压在预算上 ⇒ 机器负载高时偶发假红（曾复现）。
+    //   改为等待「提示确实被替换」这一完成信号：不预设结果文本（G6-F 仍是真断言），
+    //   也不受负载漂移影响。同上，其余「点击后紧接固定 settle 再断言异步结果」处一并改造。
+    const confirmHintG6 = envG6.hint();
     envG6.click("resetButton");
-    await envG6.settle(240);
+    await waitUntil(() => envG6.hint() !== confirmHintG6, 3000);
     t("G6-D 第二次点击执行：sync 写入默认值",
       envG6.syncSetCalls.some(o => o.bypassList === DEF_G6.bypassList),
       JSON.stringify(envG6.syncSetCalls.map(o => String(o.bypassList).length)));
@@ -1792,7 +1803,14 @@ function t(name, cond, extra) {
       await env.settle(60);
       const appliedBefore = env.proxy.applied.length;
       env.click("saveButton");            // 表单内容与存储完全相同
-      await env.settle(150);
+      // 【测试稳定性修复】save() 的提示序列是「（载入后的空串）→ 异步置『设置已保存』
+      //   → 再由下发结果覆盖」，其间有一次真实下发往返（约 200 ms）。固定 sleep(150)
+      //   在负载下会假红。这里等到提示进入「终态」为止 —— 终态 = 既非载入期的空串、
+      //   也非中间态『设置已保存』；不预设终态的具体文本，故第 1 条-b 仍是独立断言。
+      await waitUntil(() => {
+        const h = env.hint();
+        return h !== "" && h !== "设置已保存";
+      }, 3000);
 
       t("第1条-a 相同内容的保存仍会显式触发一次下发（不依赖 storage 事件）",
         env.proxy.applied.length === appliedBefore + 1,
@@ -1845,7 +1863,170 @@ function t(name, cond, extra) {
         stText.indexOf("未启用代理（直连）") < 0, stText);
       t("第4条-b 必须说明沿用浏览器/系统自身的代理设置",
         stText.indexOf("沿用浏览器/系统自身的代理设置") >= 0, stText);
+      // 【M-1·审计修复】禁用态的第三档：clear() 成功、回读实际模式失败。
+      //   background 早就在 directState 上写 readFailed，但前台只消费了 systemProxy，
+      //   于是本档落到「未启用代理（直连）」—— 与紧随其后的 message 直接矛盾。
+      env.popupCtx.renderStatus({
+        status: "direct",
+        readFailed: true,
+        message: "已停用本扩展的代理，但无法确证当前实际生效的模式（回读失败）；" +
+          "浏览器可能正沿用系统或其它扩展的代理设置"
+      }, false);
+      const stTextUnverified = env.els.statusBar.textContent;
+      t("第4条-c 回读失败的禁用态不得使用「未启用代理（直连）」文案",
+        stTextUnverified.indexOf("未启用代理（直连）") < 0, stTextUnverified);
+      t("第4条-d 回读失败的禁用态必须如实说明无法确证",
+        stTextUnverified.indexOf("无法确证") >= 0, stTextUnverified);
+      // 【L-05·审计修复】reason:"restore_interrupted" 此前在 popup 无文案，
+      //   落到泛化的 error 档「代理异常，流量可能已回退直连」——而该情形是
+      //   「对比窗口的恢复被 SW 回收打断、扩展已按最新设置重新下发」，语义相反。
+      env.popupCtx.renderStatus({
+        status: "error",
+        reason: "restore_interrupted",
+        message: "检测到上一次对比测试的恢复被中断，已按当前设置重新下发代理"
+      }, false);
+      const stTextRestore = env.els.statusBar.textContent;
+      t("L-05-e 恢复被中断不得渲染为「代理异常/可能已回退直连」",
+        stTextRestore.indexOf("代理异常") < 0 && stTextRestore.indexOf("恢复被中断") >= 0,
+        stTextRestore);
     }
+
+    // ---- M-2：重置默认同样必须分辨失败阶段、并消费下发结果 ----
+    //   与第 2 条同族，但路径在 resetDefaults（第 2 条只改了 save）。
+    //   修复前：sync 已恢复成默认值、只有本机旧列表没清掉时报「恢复失败」；
+    //   且完全不消费 reapply 结果 —— 「已恢复默认」与「代理已按默认设置生效」
+    //   被当成同一件事陈述。
+    {
+      const env = buildChainEnv({
+        syncStore: Object.assign({}, BASE_SYNC, { bypassList: "example.com" }),
+        localStore: {},
+        setFilter: (realm, area, obj) =>
+          (realm === "popup" && area === "local" && obj.bypassList === "" ? "模拟 local 清理失败" : null)
+      });
+      const DEF_BYPASS = env.popupCtx.EasyProxy.DEFAULTS.bypassList;
+      await waitUntil(() => env.els.bypassList.value === "example.com");
+      env.click("resetButton");
+      await env.settle(60);
+      env.click("resetButton");
+      await env.settle(220);
+
+      t("M-2-a sync 确实已恢复为默认列表（失败只发生在 local 清理这一步）",
+        env.syncStore.bypassList === DEF_BYPASS,
+        "sync.bypassList.length=" + String(env.syncStore.bypassList).length);
+      t("M-2-b 该阶段不得笼统报「恢复失败」，须如实说清「已恢复默认但本机副本未清除」",
+        env.hint().indexOf("恢复失败") < 0 &&
+        env.hint().indexOf("已恢复默认") >= 0 && env.hint().indexOf("未能清除") >= 0,
+        JSON.stringify(env.hint()));
+      t("M-2-c 提示不得承诺「不受影响」——本机副本存在时它会被当成历史遗留重新生效",
+        env.hint().indexOf("不受影响") < 0 && env.hint().indexOf("重新生效") >= 0,
+        JSON.stringify(env.hint()));
+      t("M-2-e local 的清理动作确实被尝试过（失败是真实的，不是假红）",
+        env.localSetCalls.some(o => o && o.bypassList === ""),
+        JSON.stringify(env.localSetCalls));
+    }
+    {
+      // 成功路径必须消费下发结果：括号里的终态只可能来自 reportApplyOutcome。
+      const env = buildChainEnv({
+        syncStore: Object.assign({}, BASE_SYNC, { bypassList: "example.com" }),
+        localStore: { bypassList: "sensitive.example" }
+      });
+      await waitUntil(() => env.els.bypassList.value === "example.com");
+      env.click("resetButton");
+      await env.settle(60);
+      // 【测试稳定性修复】同 G6：等待提示被替换，替代固定 sleep(260)（实测 166–270 ms，
+      //   正好压在预算上）。成功与否由下方断言判定，等待本身不预设结果。
+      const confirmHintM2d = env.hint();
+      env.click("resetButton");
+      await waitUntil(() => env.hint() !== confirmHintM2d, 3000);
+
+      t("M-2-d 恢复成功后必须按后台实际终态陈述（默认设置下为未启用代理）",
+        env.hint().indexOf("已恢复默认设置（当前未启用代理）") >= 0,
+        JSON.stringify(env.hint()));
+    }
+  }
+
+  console.log("");
+  // ==================== L-08：诊断导出（可观测性） ====================
+  //   后台 getDiagnostics 返回的是「用户会直接贴进公开 issue」的快照，因此
+  //   ① 脱敏是硬要求（不含出口 IP 与代理地址）、② 读取失败必须如实（读不到 ≠ 没有）、
+  //   ③ 内容按文本渲染（存储里的 HTML 不得变成真实节点）—— 逐条守住。
+  //   本段走【真实 background.js 的 getDiagnostics 分支】（经真实消息链路），
+  //   而不是由测试自己编一个响应，否则就测不到 summarizeTest 的脱敏。
+  console.log("== L-08：诊断导出 —— 快照脱敏、失败如实、内容按文本渲染 ==");
+  {
+    const L08_SYNC = { enableProxy: true, proxyType: "socks5", proxyHost: "127.0.0.1", proxyPort: "10808" };
+    const seedSession = {
+      lastState: { status: "applied", at: 1, message: "<img src=x onerror=alert(1)>" },
+      lastTest: {
+        ok: true,
+        exit: { ok: true, ip: EXIT_IP, org: "Example Org" },
+        direct: { ok: true, ip: "192.0.2.1" },
+        ipChanged: true
+      }
+    };
+
+    const env = buildChainEnv({ syncStore: Object.assign({}, L08_SYNC), localStore: {} });
+    await waitUntil(() => proxyTarget(env.proxy.value) === "socks5 127.0.0.1:10808");
+    await env.settle(40);
+    env.setSessionState(seedSession);
+
+    env.click("diagButton");
+    // 完成信号只能等【占位文案消失】—— 占位文案「正在收集诊断信息…」本身含「诊断信息」，
+    //   用它当谓词会立刻为真（本用例首版即踩此坑，故此处写明）。
+    await waitUntil(() => env.els.testResult.textContent.indexOf("正在收集") < 0, 3000);
+    await env.settle(30);          // 让链尾的 .then(done) 复位按钮
+    const diagText = env.els.testResult.textContent;
+
+    t("L-08-a 导出诊断渲染后台快照（含版本号，便于对照提交）",
+      diagText.indexOf("已脱敏") >= 0 && diagText.indexOf(manifestVersion) >= 0,
+      diagText.slice(0, 160));
+    t("L-08-b 快照必须脱敏：不含出口 IP 原文，只保留结构性布尔（hasExit）",
+      diagText.indexOf(EXIT_IP) < 0 && diagText.indexOf("192.0.2.1") < 0 &&
+      diagText.indexOf("\"hasExit\": true") >= 0,
+      diagText.slice(0, 320));
+    t("L-08-c 快照按文本渲染：存储里的 HTML 不产生真实节点（textContent 而非 innerHTML）",
+      env.els.testResult.innerHTML.indexOf("<img") < 0,
+      env.els.testResult.innerHTML.slice(0, 200));
+    t("L-08-d 导出结束后「导出诊断信息」按钮复位（不得永久禁用）",
+      env.els.diagButton.disabled === false, "disabled=" + env.els.diagButton.disabled);
+
+    // 后台无响应（回调 null）：不得停在「正在收集…」，也不得报成成功。
+    const envNull = buildChainEnv({ syncStore: Object.assign({}, L08_SYNC), localStore: {} });
+    await waitUntil(() => proxyTarget(envNull.proxy.value) === "socks5 127.0.0.1:10808");
+    await envNull.settle(40);
+    vm.runInContext('send = function () { return Promise.resolve(null); };', envNull.popupCtx);
+    envNull.click("diagButton");
+    await waitUntil(() => envNull.els.testResult.textContent.indexOf("正在收集") < 0, 3000);
+    await envNull.settle(30);
+    t("L-08-e 后台无响应时如实报失败，不停在「正在收集…」",
+      envNull.els.testResult.textContent.indexOf("无法与后台通信") >= 0 &&
+      envNull.els.testResult.textContent.indexOf("正在收集") < 0,
+      envNull.els.testResult.textContent);
+    t("L-08-f 后台无响应时按钮同样复位",
+      envNull.els.diagButton.disabled === false, "disabled=" + envNull.els.diagButton.disabled);
+
+    // 消息通道异常（rejected promise）：同样如实呈现原因。
+    const envThrow = buildChainEnv({ syncStore: Object.assign({}, L08_SYNC), localStore: {} });
+    await waitUntil(() => proxyTarget(envThrow.proxy.value) === "socks5 127.0.0.1:10808");
+    await envThrow.settle(40);
+    vm.runInContext('send = function () { return Promise.reject(new Error("消息通道异常（测试注入）")); };', envThrow.popupCtx);
+    envThrow.click("diagButton");
+    await waitUntil(() => envThrow.els.testResult.textContent.indexOf("正在收集") < 0, 3000);
+    t("L-08-g 消息通道异常时如实报失败原因",
+      envThrow.els.testResult.textContent.indexOf("消息通道异常（测试注入）") >= 0,
+      envThrow.els.testResult.textContent);
+
+    // session 读取失败：快照必须 ok:false + error，绝不伪装成「没有任何状态」。
+    const envFail = buildChainEnv({ syncStore: Object.assign({}, L08_SYNC), localStore: {} });
+    await waitUntil(() => proxyTarget(envFail.proxy.value) === "socks5 127.0.0.1:10808");
+    await envFail.settle(40);
+    envFail.readMode("bg", "session", "fail");
+    envFail.click("diagButton");
+    await waitUntil(() => envFail.els.testResult.textContent.indexOf("正在收集") < 0, 3000);
+    const failText = envFail.els.testResult.textContent;
+    t("L-08-h session 读取失败时 ok:false 且带 error（读不到 ≠ 没有）",
+      failText.indexOf("\"ok\": false") >= 0 && failText.indexOf("\"error\":") >= 0,
+      failText.slice(0, 220));
   }
 
   console.log("");

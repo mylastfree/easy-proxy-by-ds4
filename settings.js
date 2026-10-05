@@ -1,4 +1,4 @@
-// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.12.0]
+// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.13.0]
 // 刻意不依赖任何 chrome.* API，使 popup 与 Service Worker 可共用同一套逻辑。
 (function (root) {
   'use strict';
@@ -174,6 +174,14 @@
     // IPv6 字面量必然含冒号
     if (head.indexOf(':') >= 0) return true;
 
+    // 【L-12·审计修复】IPv4 前缀长度上限 32。
+    //   此前只查 `Number(tail) > 128`（IPv6 上限），IPv4 分支通过后不再校验 ——
+    //   `192.168.0.0/33` 会被判成「网段」原样保留并下发，而 Chrome 对无效前缀
+    //   静默忽略，于是「配了规则却一条都没生效」。这正是 M-6/M-7 想要消除的
+    //   静默失效形态（程度较轻：是保留而非截断）。现在按「非 CIDR」处理，
+    //   斜杠照常被当作路径分隔符剥掉，得到显式的主机规则而不是一条被静默忽略的网段。
+    if (Number(tail) > 32) return false;
+
     // IPv4 字面量：恰好 4 段、全数字、每段不超过 255
     var parts = head.split('.');
     if (parts.length !== 4) return false;
@@ -285,6 +293,39 @@
     return true;
   }
 
+  // 【L-03】`ip` 字段的形态校验（出口检测响应）。
+  //   背景：SECURITY.md / PRIVACY.md 一直声称响应必须包含「有效的 ip 字段」，而
+  //   background.js 的 normalizeExitPayload 此前只检查「非空 + 长度 ≤45 + 无空白」——
+  //   "not-an-ip" 这类字符串会一路通过，于是无意义的文本被当成出口 IP 展示，
+  //   并据「拿到了 ip」被判为「出口检测成功」。文档与实现必须一致，
+  //   而收紧实现比改文档更符合本项目「如实上报」的基调。
+  //   判据刻意宽松（只排除明显非 IP 的形态，不做完整 RFC 校验，也不做可达性判定）：
+  //     · IPv6：仅十六进制字符、冒号与点（点用于 ::ffff:1.2.3.4 这类内嵌 IPv4），且至少含一个冒号
+  //     · IPv4：恰好 4 段十进制，每段 0-255
+  //   「宁漏勿误伤」：判据不为难合法写法（含前导零、大写十六进制、IPv4 内嵌形式一律放行）。
+  function isIpLiteral(v) {
+    if (typeof v !== 'string' || !v.length || v.length > 45) return false;
+    if (hasWhitespace(v)) return false;
+    if (v.indexOf(':') >= 0) {
+      var hasColon = false;
+      for (var i = 0; i < v.length; i++) {
+        var c = v.charAt(i);
+        if (c === ':') { hasColon = true; continue; }
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F') || c === '.') continue;
+        return false;
+      }
+      return hasColon;
+    }
+    var parts = v.split('.');
+    if (parts.length !== 4) return false;
+    for (var j = 0; j < parts.length; j++) {
+      var p = parts[j];
+      if (!p.length || p.length > 3 || !isAllDigits(p) || Number(p) > 255) return false;
+    }
+    return true;
+  }
+
   function validateSettings(s) {
     var errors = [];
     if (!s.enableProxy) return errors;
@@ -386,6 +427,25 @@
     return looksLikeShadowEdit(syncRaw);
   }
 
+  // 【L-05】状态（status）与子类型（reason）取值的唯一事实来源。
+  //
+  //   背景：这两个取值集合此前只以字面量形式散落在 background.js（写入方）与
+  //   popup.js（渲染方）两处，没有任何机制保证两侧一致。实测缺口：
+  //   `reason:"restore_interrupted"`（对比窗口恢复被 SW 回收打断）在 popup 没有对应
+  //   文案，会落到泛化的 error 档「代理异常，流量可能已回退直连」—— 而该情形的语义
+  //   恰恰相反：扩展没有故障，且已按最新设置重新下发。这正是「新增状态却忘了配文案」
+  //   会静默降级为错误陈述的路径。
+  //
+  //   机制（刻意【不】重写 background.js 的调用点，以免破坏变异锚点）：
+  //   本清单是事实来源，由 tests/manifest.test.js 双向核对 ——
+  //     ① background.js 实际写出的 status / reason 字面量集合必须恰好等于本清单；
+  //     ② popup.js 必须为每个 status 提供 STATUS_TEXT 键，为每个 reason 提供
+  //        `error_<reason>` 键。
+  //   于是「新增一个状态但漏配文案」在 CI 里必然变红，而不是静默落兜底。
+  //   新增取值时三处同步：本清单 → background 的写入点 → popup 的文案。
+  var STATUS = ['applied', 'direct', 'saved_not_applied', 'overridden', 'suspended', 'error'];
+  var REASON = ['read_failed', 'control_unknown', 'restore_interrupted'];
+
   root.EasyProxy = {
     DEFAULTS: DEFAULTS,
     PROXY_TYPES: PROXY_TYPES,
@@ -394,10 +454,13 @@
     TEST_ENDPOINTS: TEST_ENDPOINTS,
     TEST_TIMEOUT_MS: TEST_TIMEOUT_MS,
     COMPARE_EXIT_TIMEOUT_MS: COMPARE_EXIT_TIMEOUT_MS,
+    STATUS: STATUS,
+    REASON: REASON,
     normalizeSettings: normalizeSettings,
     parseBypassList: parseBypassList,
     resolveBypassList: resolveBypassList,
     validateSettings: validateSettings,
+    isIpLiteral: isIpLiteral,
     stripBrackets: stripBrackets,
     estimateBytes: estimateBytes,
     looksLikeShadowEdit: looksLikeShadowEdit,

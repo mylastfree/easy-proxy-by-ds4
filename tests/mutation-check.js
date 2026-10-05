@@ -97,11 +97,35 @@ function removeSentinel() {
 if (fs.existsSync(SENTINEL)) {
   let info = "";
   try { info = fs.readFileSync(SENTINEL, "utf8").trim(); } catch (e) { /* 尽力而为 */ }
+  // 【哨兵守卫·提示硬化（本版新发现，不在审计清单内）】区分哨兵的两种来源 ——
+  //   此前一律按「源文件仍在变异态」报告，并直接给出
+  //   `git checkout -- background.js settings.js popup.js`，
+  //   这个建议在【有未提交真实改动的工作树上是有破坏性的】（会把真实修复与变异体一并丢弃），
+  //   与 MEMORY / CONTRIBUTING 反复强调的「不要在不洁工作树上 git checkout」自相矛盾。
+  //   两种来源的载荷不同，可以直接识别：
+  //     · 真实变异运行 → { pid: <真实进程号>, at: <时间戳> }（每轮不同，几乎不可能是 0）
+  //     · tests/manifest.test.js 的 B-3 自检探针 → 恒为 { pid: 0, at: 0 }
+  //   后者【从不改写源文件】，只是忘了清锁（进程在写探针与 finally 还原之间被强杀）。
+  let isProbeArtifact = false;
+  try {
+    const parsed = JSON.parse(info);
+    isProbeArtifact = !!parsed && parsed.pid === 0 && parsed.at === 0;
+  } catch (e) { /* 无法解析：按真实残留处理（更保守） */ }
   console.error("检测到残留的变异哨兵：" + SENTINEL + (info ? "（" + info + "）" : ""));
-  console.error("这说明上一次变异测试被异常中断，源文件很可能仍停留在变异态。");
-  console.error("若在此状态下继续运行，本门禁会把污染内容当作基线。请先恢复现场：");
-  console.error("  git checkout -- background.js settings.js popup.js");
-  console.error("  rm -f .mutation-in-progress");
+  if (isProbeArtifact) {
+    console.error("哨兵载荷为 {\"pid\":0,\"at\":0} —— 来自 tests/manifest.test.js 的 B-3 自检探针，" +
+      "即上一次【功能测试】在「写探针」与「finally 还原」之间被强杀（Windows 上 SIGTERM 不触发出口钩子）。");
+    console.error("该探针从不改写源文件，因此【不代表】源文件停留在变异态。");
+  } else {
+    console.error("这说明上一次变异测试被异常中断，源文件很可能仍停留在变异态。");
+  }
+  console.error("若在此状态下继续运行，本门禁会把污染内容当作基线。恢复步骤：");
+  console.error("  1) 先判断源文件是否真被污染：跑一次功能测试，全绿即基本可排除（失败则逐个核对）；");
+  console.error("  2) ⚠️ 仅在确认「没有值得保留的未提交改动」后才用 git checkout ——");
+  console.error("     它会把这三个文件里【所有】未提交改动一并丢弃，不只是变异体：");
+  console.error("       git checkout -- background.js settings.js popup.js");
+  console.error("  3) 删除哨兵（任何来源都必须做，否则门禁与打包会一直拒绝）：");
+  console.error("       rm -f .mutation-in-progress");
   process.exit(1);
 }
 
@@ -517,6 +541,19 @@ const mutations = [
     target: "popup",
     from: "  } else if (result.overriddenDuringRestore) {",
     to: "  } else if (false) {",
+    expectFail: true
+  },
+  {
+    // 【L-08·可观测性】诊断快照的【脱敏】是硬要求：该快照会被用户直接复制进公开 issue，
+    //   一旦把 exit.ip 原样带出去，等于把用户的真实出口 IP 公开 —— 这正是「脱敏」
+    //   这句承诺的全部内容。让 summarizeTest 顺手带上原始 ip = 脱敏失效。
+    //   popup 的 L-08-b（快照不得含出口 IP 原文）是它的主守门者。
+    //   之所以需要独立变异：L-08 的其他断言（渲染、失败如实、按钮复位）都覆盖不到
+    //   「哪些字段被保留」这一层 —— 没有它，脱敏退化成一句无人把守的口号。
+    name: "M34 诊断快照脱敏失效（L-08 回归：出口 IP 被原样带出）",
+    target: "bg",
+    from: "    hasExit: !!(t.exit && t.exit.ok),",
+    to: "    hasExit: !!(t.exit && t.exit.ok),\n    exitIp: (t.exit && t.exit.ip) || null,",
     expectFail: true
   }
 ];

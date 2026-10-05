@@ -12,12 +12,21 @@ on:
 permissions:
   contents: read
 
+# 【A6·审计修复】同一分支/PR 上新的 push 会取消仍在跑的上一次运行。
+#   成本证据（实测）：因缺本键，同一提交/同一时段曾两次触发 full CI
+#   （run 37294230923 @10:04 与 37296007019 @10:20；37318997344 @13:43 与
+#   37322425310 @14:09），前一次仍跑满约 23 分钟才结束。
+#   group 里带 ref：tag 触发的运行独立成组，不会被分支上的 push 取消。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: 测试与校验
     runs-on: ubuntu-latest
-    # 【R-6】本 job 跑七套测试 + 完整变异门禁（33 个变异）。
-    #   实测：本机 33 项约 36 分钟；GitHub 上 33 项实测 23 分钟（25 项时 14–15 分钟），
+    # 【R-6】本 job 跑七套测试 + 完整变异门禁（34 个变异）。
+    #   实测：本机 34 项约 36 分钟；GitHub 上 33 项实测 23 分钟（25 项时 14–15 分钟），
     #   即每次提交约 23 分钟 × 3 个矩阵节点。
     #   GitHub 默认 job 上限 6 小时，理论上不会超时；显式设定是为了在门禁被意外放大
     #   （例如变异数量翻倍）时【快速失败】，而不是让一个失控的 job 静默占用长达 6 小时的 runner。
@@ -41,6 +50,10 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node-version }}
+          # 【A6·审计修复】缓存 npm 的下载目录，避免三个矩阵节点各自重下依赖。
+          #   只缓存下载物；安装仍严格走 npm ci（按 package-lock 复现），
+          #   缓存命中不会改变安装结果的确定性。
+          cache: npm
 
       # 【A1】静态 lint 作为 CI 的首个失败点（核心规则：no-undef / no-unused-vars 等；
       #   本仓库曾靠它抓到一处真实的块级作用域逃逸）。devDependencies 仅含 eslint 与

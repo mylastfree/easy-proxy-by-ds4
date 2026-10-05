@@ -2618,6 +2618,14 @@ function t(name, cond, extra) {
     t("第4条-b 消息点明「并非直连」，用户可据此排查",
       typeof st.message === "string" && st.message.indexOf("并非直连") >= 0,
       "message=" + JSON.stringify(st.message));
+    // 【M-1·审计修复】图标标题是独立于状态条的第二处「直连」陈述点（README 的图例
+    //   把红·直 定义为直连，悬停提示同样会展示）。v2.12.0 只改了状态条文案，
+    //   标题仍固定为「未启用代理（直连）」—— 同一屏两处结论相反。
+    const m1TitleSys = env.titleCalls[env.titleCalls.length - 1];
+    t("第4条-i 沿用系统代理时图标标题不得宣称「直连」",
+      typeof m1TitleSys === "string" && m1TitleSys.indexOf("（直连）") < 0 &&
+      m1TitleSys.indexOf("沿用") >= 0,
+      "title=" + JSON.stringify(m1TitleSys));
   }
   {
     // 第 4 条的「读不到 ≠ 直连」分支：清除后回读失败时，必须如实说明"无法确证"，
@@ -2648,6 +2656,11 @@ function t(name, cond, extra) {
     t("第4条-d 回读失败：消息说明无法确证，不宣称已直连",
       typeof st.message === "string" && st.message.indexOf("无法确证") >= 0,
       "message=" + JSON.stringify(st.message));
+    // 【M-1·审计修复】同第4条-i：回读失败档此前连图标标题也一并宣称直连。
+    const m1TitleReadFail = env.titleCalls[env.titleCalls.length - 1];
+    t("第4条-j 回读失败时图标标题不得宣称「直连」",
+      typeof m1TitleReadFail === "string" && m1TitleReadFail.indexOf("直连") < 0,
+      "title=" + JSON.stringify(m1TitleReadFail));
   }
   {
     // 第 4 条的第二处陈述点：chrome.proxy.settings.onChange 回读路径。

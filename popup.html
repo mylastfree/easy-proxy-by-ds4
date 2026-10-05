@@ -60,7 +60,10 @@
 <body>
   <h3>代理设置</h3>
 
-  <div id="statusBar" class="status muted">读取状态中…</div>
+  <!-- 【L-11·审计修复】三处动态文本区补上 live region：
+       它们都由脚本异步改写（状态条 / 提示 / 测试结果），此前没有任何 aria 属性，
+       屏幕阅读器用户完全感知不到「保存后状态变了」「测试完成了」。 -->
+  <div id="statusBar" class="status muted" role="status" aria-live="polite">读取状态中…</div>
 
   <div class="inline">
     <input type="checkbox" id="enableProxy">
@@ -105,7 +108,7 @@ Chrome 已默认直连，无需手动填写。</pre>
     <button id="saveButton">保存设置</button>
     <button id="resetButton">恢复默认</button>
   </div>
-  <div id="hint" class="hint"></div>
+  <div id="hint" class="hint" role="status" aria-live="polite"></div>
 
   <div class="panel">
     <h4>连接测试</h4>
@@ -113,7 +116,12 @@ Chrome 已默认直连，无需手动填写。</pre>
       <button id="testButton">测试当前出口</button>
       <button id="testDirectButton">对比直连出口</button>
     </div>
-    <div id="testResult" class="kv test-result">
+    <div class="btns tight">
+      <!-- 【L-08·审计修复】诊断导出：把后台状态快照一次性渲染成可复制的文本，
+           排障不必再手工翻 Service Worker 控制台。快照已脱敏（不含出口 IP 与代理地址）。 -->
+      <button id="diagButton">导出诊断信息</button>
+    </div>
+    <div id="testResult" class="kv test-result" role="status" aria-live="polite">
       尚未测试。点击「测试当前出口」查看流量实际从哪里出去。
     </div>
   </div>

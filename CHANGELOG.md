@@ -2,6 +2,40 @@
 
 本文件记录本扩展的所有重要变更。
 
+## [2.13.0] - 2026-10-05
+
+关闭对 v2.12.0（`db6ae0c`）的全维度代码审计（评分：阻塞 0 / 严重 0 / 一般 3 / 低 15）中的 3 项「一般」与 10 项「低」，均为「既有修复的残留面」「文档与实现不一致」或「工程配置/可观测性」三类，不涉及并发设计与存储契约。测试断言数 755 → **788**（`manifest.test.js` 75 → 81、`settings.test.js` 101 → 110、`ownership.test.js` 307 → 309、`popup.test.js` 175 → 191），变异门禁 33 → **34** 项（新增 M34，证明诊断快照的脱敏断言承重）。新增可观察契约（`direct` 状态新增 `readFailed` 的前台呈现档 `direct_unverified`、`error` 状态新增消费 `reason:"restore_interrupted"`；`updateIcon` 的 `direct` 档按来源分三档标题），按仓库惯例升 minor。
+
+### 修复（一般）
+
+- **M-1 第 4 条「`clear()` ≠ 强制直连」只落了一半 —— 图标标题仍在宣称直连**：v2.12.0 第 4 条把**状态条文案**按 `systemProxy` 分了档，但两个呈现面没跟上：① `updateIcon("direct")` 的**悬停标题**被固定写成「未启用代理（直连）」，而 README 的图例（红·直＝直连）本身也是一次独立断言 —— 于是「不得宣称直连」这个验收要点只落在状态条上，悬停提示与状态条正文在同一条信息里自相矛盾；② `directState.readFailed`（禁用态「clear 成功但回读实际模式失败」）**前台零消费**（`popup.js` 只认 `systemProxy`），该档落到「未启用代理（直连）」这一句上，与紧随其后的 message「无法确证当前实际生效的模式」直接矛盾。修复：`updateIcon` 的 `direct` 档按**三个语义来源**分档取标题（`direct`＝唯一可宣称直连；`read_failed`＝「已停用本扩展代理，但无法确证当前实际生效的模式」；其它非 `direct` 模式名＝「未启用本扩展代理（当前沿用 〈mode〉）」），禁用分支与 `onChange` 回读路径两处调用点同步传入回读结果；`popup.js` 新增 `direct_unverified` 文案档并消费 `state.readFailed`。
+- **M-2 `resetDefaults()` 没跟 `save()` 的「按阶段分辨失败」**：第 2/3 条的失败分期只修了 `save()` 一条路径，「恢复默认」仍把 `storage.local` 清理失败与「设置根本没恢复」混为一谈（sync 已成功恢复却报「恢复失败」，与事实相反），也**完全不消费**重下发结果。修复：抽出 `reportApplyOutcome(resp, prefix)` 阶梯供两处共用；`resetDefaults()` 增加 `restored` 标记区分「设置未恢复」与「已恢复、后续步骤失败」，并在清理失败文案中**如实说明**：`resetDefaults` 写入 sync 的正是**内置默认列表**，一旦本机另存有一份旧列表，「sync＝默认列表 + local 非空」这一组合同样命中后台的存量污染自愈判据（逐字符相等），自愈会把 sync 清成空占位、本机旧列表重新成为生效值 —— 即用户刚执行的「恢复默认」可能并未真正生效。文案不承诺「不受影响」，只指向唯一可行动作（重试到本机副本被真正清掉），与 SECURITY.md 第 6 条披露的组合同源。
+- **M-3 覆盖率只报告不拦截，且披露不对称**：`.c8rc.json` 无 `check-coverage` ⇒ `npm run coverage` 无论掉到多少都退出 0；README 又只声明行覆盖（`popup ~91%`，实测 89.91%）而**从未披露分支覆盖**（popup 仅 75.52%）。于是断言数漂移会红、覆盖率退化不会 —— 不对称。修复：`.c8rc.json` 开启 `check-coverage` 并落四条门槛（行/语句 85、函数 95、分支 74，留出小幅余量）；README 的覆盖率说明改为**同时给出行覆盖与分支覆盖**。`manifest.test.js` 新增 2 项断言把「门禁开关开启 + 四条阈值齐备」与「README 双披露」固化。
+
+### 修复（低）
+
+- **L-01（承接审计建议 A6）CI/CD 配置缺口**：`package.json` 增 `engines.node >= 20`、新增 `.nvmrc`（`22`）、`ci.yml` 增 `concurrency: { group: <workflow>-<ref>, cancel-in-progress: true }` 与 `setup-node` 的 `cache: npm`。成本证据为实测：因缺 `concurrency`，同一时段两次 push 触发两次 full CI（`37294230923` @10:04 与 `37296007019` @10:20），前一次仍跑满约 23 分钟才结束。`group` 带 `ref` 使 tag 触发的运行独立成组，不会被分支上的 push 取消。
+- **L-02 `SECURITY.md` 第 7 条「只留痕、不做降级」已过期**：M-5 早已实现「250 ms 有界重试 → 仍失败则写 `storage.local` 的 `stateWriteFailed` → 弹窗提示『状态可能过期』」三级降级，同文键表也已写明。更正为如实描述该降级，并**补上它自身的两个边界**：① 降级是「提示」而非「补写」，界面仍显示上一次成功写入的状态结论；② 重试与降级标记都挂在 250 ms 定时器上，SW 恰在该窗口内被回收时二者都不会发生，此时只剩控制台一条告警。
+- **L-03 出口响应「有效的 `ip` 字段」与实现不符**：`SECURITY.md` / `PRIVACY.md` 一直声称响应必须含「有效的 `ip` 字段」，而 `normalizeExitPayload` 此前只判「非空 + 长度 ≤45 + 无空白」—— `"not-an-ip"` 会一路通过，界面把无意义文本当作出口 IP 展示、并据「拿到了 ip」判为「出口检测成功」。修复：`settings.js` 新增 `isIpLiteral`（IPv6：仅十六进制/冒号/点且必含冒号；IPv4：恰好 4 段十进制 0–255；判据刻意宽松、不为难合法写法，不做可达性判定），`normalizeExitPayload` 收敛到它，两份文档措辞与实现对齐。**本版选择收紧实现而非放宽文档**——与「如实上报」的项目基调一致。
+- **L-04 `PRIVACY.md` 摘要「不上传到任何服务器」与同文第 3 节自相矛盾**：摘要称不上传到**任何**服务器，正文却承认 `storage.sync` 经浏览器账号同步。修复：摘要限定为「不上传到**我们自己的**服务器」，并说明 `storage.sync` 的同步由**浏览器厂商的同步服务**完成、本扩展无法读取；键表末句同步更正。
+- **L-05 状态/`reason` 取值无单一事实来源**：两套取值只以字面量散落在 `background.js`（写入方）与 `popup.js`（渲染方），无任何机制保证一致 —— 实测缺口是 `reason:"restore_interrupted"`（对比窗口恢复被 SW 回收打断）在 popup 无文案，落到泛化的「代理异常，流量可能已回退直连」，而该情形的语义**恰恰相反**（扩展没坏、且已按最新设置重新下发）。修复：`settings.js` 新增 `STATUS` / `REASON` 两张常量表作为唯一事实来源，`manifest.test.js` 双向核对（① `background.js` 实际写出的字面量集合必须等于清单；② `popup.js` 必须为每个 status 提供 `STATUS_TEXT` 键、为每个 reason 提供 `error_<reason>` 键），`popup.js` 补 `error_restore_interrupted` 文案并新增消费分支。
+- **L-06 两个经典脚本无严格模式**：`background.js`（classic service worker）与 `popup.js` 均未声明 `'use strict'`，隐式全局赋值、静默失败的写入、`this` 装箱都无法被静态规则拦住。补上，与 `settings.js` 一致。
+- **L-08 可观测性（28 处 `console.*`、无诊断导出）**：新增「导出诊断信息」按钮 + 后台 `getDiagnostics` 消息，把 `lastState` / `lastTest` / `pendingRestore` / `suspendDepth` / `suspendDirty` / 版本一次性渲染成可复制的纯文本，排障不必再手工翻 SW 控制台。**脱敏是硬要求**（快照会被用户直接复制进公开 issue）：不含出口 IP（只保留「是否拿到出口 / 是否变化」等结构性信息）、不含代理地址与端口（只保留状态结论里已有的模式名）。渲染用 `textContent` 而非 `innerHTML`，读取失败同样如实上报（`ok:false` + `error`），并补 `.catch` 防止异常留在 `Uncaught (in promise)`。
+  - **该功能在首跑用例时当场抓出一个真缺陷**：`exportDiagnostics()` **没有 `return`**，而调用点写的是 `exportDiagnostics().catch(renderTestError)`（与 `runTest` 同一契约）—— 于是每次点击都同步抛 `TypeError: Cannot read properties of undefined (reading 'catch')`，按钮永久停在 disabled、结果区停在「正在收集…」，正是 R7-08 要消灭的「异常路径卡死」形态。已补 `return`。**这条缺陷是被 L-08 新增的用例（按钮必须复位）抓出来的，不是靠人工复查** —— 新增功能必须同时补断言，否则缺陷只会用户在真机上遇到。
+  - 用例 8 项（`L-08-a`…`-h`：渲染与版本号、脱敏（不得含出口 IP 原文）、按文本渲染（存储里的 HTML 不成为真实节点）、按钮复位、后台无响应如实、通道异常如实、session 读取失败 `ok:false`+`error`），并新增变异 **M34** 把「脱敏」钉死（`summarizeTest` 一旦顺手带上 `exit.ip`，`L-08-b` 必然变红）。
+- **L-11 界面无 `aria-*`**：`#statusBar` / `#hint` / `#testResult` 三处动态文本区补 `role="status" aria-live="polite"` —— 它们都由脚本异步改写，此前屏幕阅读器用户完全感知不到「保存后状态变了」「测试完成了」。
+- **L-12 `isCidr` 不校验 IPv4 前缀长度**：此前只查 `Number(tail) > 128`（IPv6 上限），IPv4 分支通过后不再校验 —— `192.168.0.0/33` 被判成「网段」原样保留并下发，而 Chrome 对无效前缀**静默忽略**，于是「配了规则却一条都没生效」。修复：补 `Number(tail) > 32 → 非 CIDR`，斜杠照常被当作路径分隔符剥掉，得到一条显式主机规则而非被静默忽略的网段（与 M-6/M-7 消除静默失效的取向一致）。
+
+### 其他
+
+- 版本 2.12.0 → 2.13.0（manifest / package / lock / 三个源文件头 / README / CHANGELOG 同步）；断言数与变异数同步至 README、CONTRIBUTING、ARCHITECTURE、ci.yml 四处。
+- **更正一处自 v2.12.0 起就已失真的注释**（本轮新发现，不在审计清单内）：`background.js` 的 `reapply` 分支写着「本分支在产品代码中**没有**任何调用方（popup 从不发送）」—— 自 v2.12.0 的 `confirmApplied()` 起即已不成立，本版 `resetDefaults()` 又新增一处调用。注释已按事实改写（列出两处真实调用方与三点用途）。这类「注释断言与代码事实相反」的漂移与 L-02 / L-03 / L-04 同型，说明**每次新增调用点时都应回头 grep 一遍该函数被写进哪几处注释/文档**。
+- **哨兵守卫的提示硬化**（本轮新发现，不在审计清单内）：`tests/mutation-check.js` 的启动守卫此前对任何残留哨兵都按「源文件仍停留在变异态」报告，并直接建议 `git checkout -- background.js settings.js popup.js` —— 这个建议在**有未提交真实改动的开发树上是有破坏性的**（会把真实修复连同变异体一起丢弃），与 `MEMORY.md` / `CONTRIBUTING.md` 反复强调的「不要在不洁工作树上 `git checkout`」自相矛盾。现在按哨兵**载荷**区分两个来源：真实变异运行写 `{ pid: <真实进程号>, at: <时间戳> }`，而 `tests/manifest.test.js` 的 B-3 自检探针恒为 `{ "pid":0,"at":0 }`（该探针**从不改写源文件**）。后者会明确说明「不代表源文件被污染」，恢复步骤也改为「先跑一次功能测试确认 → 再判断是否需要 checkout」，并显式警告 `git checkout --` 会丢弃这三个文件里的**全部**未提交改动。
+- **如实声明：本版未在本机跑完变异门禁，最终以 CI 为准。** 本机执行环境带有「单轮批量删除配额」安全策略（`CODEBUDDY_SAFE_DELETE_BULK_*`，超配额即拒绝删除并要求确认）。而变异门禁的每一轮都要删除临时目录与哨兵，34 项 × 7 套测试累计远超配额 ⇒ 子进程里的 `fs.rmSync` 被拒 ⇒ `manifest.test.js` 的 B-3 断言与「严格还原现场」失败 ⇒ **门禁基线失败而中止**。经核实这是**环境限制，不是仓库缺陷**：同一命令在干净环境（沙箱绕过 / CI）下基线全绿、七套 788 项全过；已按规范**不去绕过该安全策略**。因此本机完成的门禁项为：`npx eslint .` = 0、七套功能测试 **788 项全绿**、覆盖率门禁通过（行 94.61% / 分支 85.58% / 函数 100%）、打包 `dist/easy-proxy-by-ds4-2.13.0`；**变异门禁 34 项交由 CI（干净 Linux runner）核验**。新增的 M34 已静态核对：注入锚点在 `background.js` 中唯一，且 `summarizeTest` 一旦带出 `exit.ip`，`L-08-b`（快照不得含出口 IP 原文）必然变红。
+- **测试稳定性修复（非功能变更，不改变断言数与断言语义）**：`tests/popup.test.js` 中三处「点击 → 固定 `settle(N)` → 断言异步结果」的写法实测处于预算边缘 —— 第二次点击后的链路含一次真实下发往返（`reapply` → `applyProxy`，其中逐条清理遗留作用域 = 十余次 `setTimeout(0)` 跳），在 Node 里实测完成时间 **166–270 ms**，而预算分别是 150 / 240 / 260 ms，机器负载高时偶发假红（本机 10 次采样中复现 2 次）。改为等待**完成信号**（G6 / M-2-d 等提示被替换、第 1 条等提示进入终态），既不预设结果文本（各断言保持独立且仍可被变异门禁证伪），也不再受负载漂移影响；连跑 10 次 popup、4 次全套均全绿。
+- 未处置并明确留待后续：**L-07** 注释编号无索引（254 处 / 9 个前缀族）、**L-09**（已随 L-02 如实写入文档，代码未改）、**L-10** `applyProxyCore` 超大函数、**L-13** host 白名单含 `_` 未实测、**L-14** `tools/package.js` 的 `main()` 与 G1 的 skip 分支无覆盖、**L-15** 真实浏览器 E2E 冒烟（因 `ERR_BLOCKED_BY_CLIENT` 未完成，`docs/E2E-SMOKE.md` 手工清单不变 —— **仍是打 tag 的前置条件**）。
+- 上一版（v2.12.0）遗留的其它审计建议（A2 / A3 / A5 / A7 等）不在本版范围。
+
 ## [2.12.0] - 2026-10-05
 
 关闭一份独立外部安全审查报告（针对 `c1c8054` / v2.11.0）指出的 6 条缺陷 —— 全部落在「代理恢复、配置保存、状态误报」三类，该报告本身确认无后门 / RCE / 提权 / XSS。项目方逐条核验后判定 **6/6 成立**；其中第 1 条的关键前提（Chromium 对「写入值与库中原值完全相同」的 `storage.set` 既不派发 `onChanged`、也不写盘）已用 Chromium 一手源码 `components/value_store/leveldb_value_store.cc` 的 `LeveldbValueStore::AddToBatch()` 证实（生成 changes 前先做 `*old_value != value` 比对，相同则跳过 push 并跳过 `batch->Put`）。测试断言数 727 → **755**（`ownership.test.js` 293 → 307、`popup.test.js` 161 → 175），变异门禁 25 → **33** 项（新增 M26–M33，逐条证明新护栏承重）。新增可观察契约（`systemProxy` / `readFailed` / `overriddenDuringRestore`，以及保存后按**实际结果**分级的诚实文案），按仓库惯例升 minor。

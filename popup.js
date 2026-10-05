@@ -1,4 +1,6 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.12.0]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.13.0]
+// 【L-06·审计修复】补上全局严格模式（理由同 background.js：classic script 默认非严格）。
+'use strict';
 var S = window.EasyProxy;
 
 // 【M-1】用户可直接编辑的表单字段。storage 变化触发的表单重绘，
@@ -24,6 +26,7 @@ var el = {
   hint: document.getElementById("hint"),
   testButton: document.getElementById("testButton"),
   testDirectButton: document.getElementById("testDirectButton"),
+  diagButton: document.getElementById("diagButton"),
   testResult: document.getElementById("testResult")
 };
 
@@ -34,6 +37,13 @@ var STATUS_TEXT = {
   //   （system / pac_script / auto_detect）：此时【不是】直连，
   //   不能沿用上面那句「未启用代理（直连）」。background 会在该情形下带 systemProxy 字段。
   direct_system_proxy: ["未启用本扩展代理：沿用浏览器/系统自身的代理设置", "muted"],
+  // 【M-1·审计修复】禁用态的第三档：clear() 成功、但回读实际模式失败。
+  //   与 direct_system_proxy 同属「不得宣称直连」的下位分支，成因不同：
+  //   那一档是回读成功但非 direct，本档是回读本身失败（读不到 ≠ 是直连，与 R7-01 同源）。
+  //   背景：background 早已在 directState 上写 readFailed，但前台只消费 systemProxy，
+  //   于是本档落到「未启用代理（直连）」这一句上 —— 与紧随其后的 message
+  //   「无法确证当前实际生效的模式」在同一条状态条里直接矛盾。
+  direct_unverified: ["未启用本扩展代理：无法确证当前实际生效的模式", "warn"],
   saved_not_applied: ["已保存，但尚未生效", "warn"],
   overridden: ["设置被企业策略或其它扩展接管", "warn"],
   // suspended 是「连接测试进行中，暂时跳过下发」的临时状态，
@@ -46,6 +56,12 @@ var STATUS_TEXT = {
   // 【R9-02】控制权无法确证时同样是"本次未改动代理"；
   //   不得沿用"代理异常，流量可能已回退直连"——没有写入任何东西时那句话与事实相反。
   error_control_unknown: ["无法确证代理控制权，本次未改动代理", "warn"],
+  // 【L-05·审计修复】error 档的第三种来源：上一次对比窗口的「清除 → 恢复」被 SW 回收
+  //   打断。它与「代理故障」语义相反 —— 扩展没有坏，而且已经按最新设置重新下发；
+  //   此前本档没有文案，落到泛化的 error 档「代理异常，流量可能已回退直连」，
+  //   把一次自动恢复指向了错误的排障方向（与 R7-01-F / R9-02 同族）。
+  //   取值集合以 settings.js 的 REASON 为唯一事实来源，由 manifest.test.js 双向核对。
+  error_restore_interrupted: ["对比测试的恢复被中断：已按当前设置重新下发代理", "warn"],
   // 【R8-04】状态本身没读到（session.get 失败）。与 direct 的区别是本质性的：
   //   这一档下我们【根本不知道】代理现在是什么状态，必须如实说不知道；
   //   用 muted 档的直连文案会把「读不到」谎报成「用户没开代理」。
@@ -151,9 +167,14 @@ function renderStatus(state, readFailed) {
   var key = state.status;
   // 【第 4 条·审计修复】禁用态带 systemProxy 时，实际生效的是浏览器/系统自身的代理，
   //   不是直连 —— 取单独文案，避免把「沿用系统代理」谎报成「直连」。
+  // 【M-1·审计修复】并补上「回读失败」这一档：background 早已写 readFailed，
+  //   前台此前只消费 systemProxy，导致本档复用「未启用代理（直连）」的文案，
+  //   与同一条状态条里 message 的「无法确证」直接矛盾（读不到 ≠ 是直连）。
   if (key === "direct" && state.systemProxy) key = "direct_system_proxy";
+  else if (key === "direct" && state.readFailed === true) key = "direct_unverified";
   if (state.status === "error" && state.reason === "read_failed") key = "error_read_failed";
   else if (state.status === "error" && state.reason === "control_unknown") key = "error_control_unknown";
+  else if (state.status === "error" && state.reason === "restore_interrupted") key = "error_restore_interrupted";
   var row = STATUS_TEXT[key] || ["状态未知", "muted"];
   var text = row[0];
   if (state.errors && state.errors.length) text += "：" + state.errors.join("；");
@@ -367,6 +388,32 @@ async function runTest(compare) {
     el.testButton.disabled = false;
     el.testDirectButton.disabled = false;
   }
+}
+
+/* ==================== 诊断导出（L-08） ==================== */
+
+// 【L-08·审计修复】把后台的状态快照渲染成可直接复制的纯文本。
+//   两处刻意的实现选择：
+//     · 用 textContent 而非 innerHTML —— 快照内容来自存储，天然不可注入；
+//     · 失败同样如实呈现（后台无响应 / 通道异常各给一档），不得静默停在「正在收集…」。
+function exportDiagnostics() {
+  el.diagButton.disabled = true;
+  el.testResult.textContent = "正在收集诊断信息…";
+  var done = function () { el.diagButton.disabled = false; };
+  // 【必须 return】调用点写的是 `exportDiagnostics().catch(renderTestError)`（与 runTest 同一
+  //   契约）。若这里不把 Promise 交出去，`undefined.catch` 会在点击时同步抛 TypeError ——
+  //   按钮停在 disabled、结果区停在「正在收集…」，正是 R7-08 要消灭的「异常路径卡死」形态。
+  //   （本缺陷由 L-08 新增的用例在首跑时抓出。）
+  return send({ action: "getDiagnostics" }).then(function (resp) {
+    if (!resp) {
+      el.testResult.textContent = "诊断失败：无法与后台通信（请关闭后重新打开弹窗再试）。";
+      return;
+    }
+    el.testResult.textContent = "诊断信息（已脱敏：不含你的出口 IP 与代理地址；可直接复制进 issue）：\n" +
+      JSON.stringify(resp, null, 2);
+  }, function (err) {
+    el.testResult.textContent = "诊断失败（消息通道异常）：" + ((err && err.message) || err);
+  }).then(done, done);
 }
 
 /* ==================== 加载与保存 ==================== */
@@ -789,30 +836,40 @@ function save() {
 //
 //   ⇒ 当本次保存不会产生存储变化时，显式请求一次重下发，并以【后台下发结果】作为提示依据。
 //     与事件驱动的下发共用 background 的 applyChain 串行队列，两者不会交错。
+// 【M-2·审计修复】「消费后台下发结果 → 给诚实文案」的阶梯，抽出来供 save() 与
+//   resetDefaults() 共用。
+//   背景：这段阶梯此前只存在于 confirmApplied 内部，于是「恢复默认」既不分辨失败
+//   阶段、也完全不消费下发结果 —— sync 已恢复成默认值、只有本机旧列表没清掉时报
+//   「恢复失败」；通道异常时同样报「恢复失败」，而在「已恢复默认，但代理没生效」
+//   这种最需要说清的情形下反而只说「已恢复默认设置」。第 2 条的修复只覆盖了 save()
+//   一条路径，这里是同族路径的补齐（与项目自身总结的 M-3 教训同型）。
+//   prefix = 「动作本身已经成功」的那半句，后半句由本阶梯按后台实际结果给出。
+function reportApplyOutcome(resp, prefix) {
+  if (!resp) {
+    showHint(prefix + "，但未能与后台确认是否已生效（后台无响应）。" +
+      "可点击「测试当前出口」确认，或关闭后重新打开弹窗。", "warn");
+  } else if (resp.ok === true && resp.status === "applied") {
+    showHint(prefix + "，且代理已按当前配置生效。", "ok");
+  } else if (resp.ok === true && resp.status === "direct") {
+    showHint(prefix + "（当前未启用代理）。", "ok");
+  } else if (resp.ok === true && resp.status === "suspended") {
+    // 连接测试进行中：后台已记脏，测试收尾会按最新设置下发。
+    showHint(prefix + "；连接测试结束后会自动下发。", "warn");
+  } else if (resp.ok === true && resp.status === "overridden") {
+    showHint(prefix + "，但代理设置被企业策略或其它扩展接管，本次未下发。" +
+      "请检查企业策略或其它扩展。", "warn");
+  } else {
+    // error / saved_not_applied / 未知档：存储已写入，但代理【没有】生效。
+    //   绝不能沿用「已保存 / 已恢复」——那正是本条要修的假成功。
+    var why = (resp.errors && resp.errors[0]) || resp.message || resp.status || "原因未知";
+    showHint(prefix + "，但代理未能生效：" + why, "error");
+  }
+}
+
 function confirmApplied(sigChanged, silent) {
   if (sigChanged) return Promise.resolve(null);
   return send({ action: "reapply" }).then(function (resp) {
-    if (!silent) {
-      if (!resp) {
-        showHint("设置已保存，但未能与后台确认是否已生效（后台无响应）。" +
-          "可点击「测试当前出口」确认，或关闭后重新打开弹窗。", "warn");
-      } else if (resp.ok === true && resp.status === "applied") {
-        showHint("设置已保存，且代理已按当前配置生效。", "ok");
-      } else if (resp.ok === true && resp.status === "direct") {
-        showHint("设置已保存（当前未启用代理）。", "ok");
-      } else if (resp.ok === true && resp.status === "suspended") {
-        // 连接测试进行中：后台已记脏，测试收尾会按最新设置下发。
-        showHint("设置已保存；连接测试结束后会自动下发。", "warn");
-      } else if (resp.ok === true && resp.status === "overridden") {
-        showHint("设置已保存，但代理设置被企业策略或其它扩展接管，本次未下发。" +
-          "请检查企业策略或其它扩展。", "warn");
-      } else {
-        // error / saved_not_applied / 未知档：存储已写入，但代理【没有】生效。
-        //   绝不能沿用「设置已保存」——那正是本条要修的假成功。
-        var why = (resp.errors && resp.errors[0]) || resp.message || resp.status || "原因未知";
-        showHint("设置已保存，但代理未能生效：" + why, "error");
-      }
-    }
+    if (!silent) reportApplyOutcome(resp, "设置已保存");
     return resp;
   }, function (err) {
     if (!silent) {
@@ -845,14 +902,44 @@ function resetDefaults() {
   }
   pendingResetConfirm = false;
   el.resetButton.textContent = "恢复默认";
+  // 【M-2·审计修复】按阶段分辨失败 + 消费下发结果，与 save() 同构（共用 reportApplyOutcome）。
+  //   restored 标记用于把「设置根本没恢复」与「已恢复、但后续步骤失败」分开 ——
+  //   后者沿用「恢复失败」与事实相反（用户会以为什么都没改）。
+  var restored = false;
   setStorage("sync", S.DEFAULTS).then(function () {
-    return setStorage("local", { bypassList: "" });
+    return setStorage("local", { bypassList: "" }).catch(function (err) {
+      throw phaseError("local_cleanup", (err && err.message) || err);
+    });
   }).then(function () {
+    restored = true;
     // 【R8-01】用户明确要求恢复默认：此时内容可信，解除「读取失败」的禁用态。
     markLoadOk();
     renderForm(S.normalizeSettings(S.DEFAULTS));
-    showHint("已恢复默认设置", "ok");
-  }).catch(function (err) {
+    // 存储一定被改写（除非本来就是默认值）→ onChanged 会驱动下发；这里仍显式请求
+    //   一次并按其结果陈述，因为「已恢复默认」不等于「代理已按默认设置生效」。
+    return send({ action: "reapply" });
+  }).then(function (resp) {
+    reportApplyOutcome(resp, "已恢复默认设置");
+  }, function (err) {
+    if (err && err.phase === "local_cleanup") {
+      // 只清 local 失败，sync 已恢复默认 —— 用「恢复失败」会与事实相反。
+      // 措辞必须如实，且**不能**承诺「不受影响」：取值规则是「sync 非空优先，为空则
+      //   回退 local」，而 resetDefaults 写进 sync 的正是【内置默认列表】；一旦本机
+      //   还存有另一份列表，这种「sync == 默认列表 + local 非空」的组合同样命中后台的
+      //   存量污染自愈判据（isLegacyShadowed 是逐字符相等），自愈会把 sync 清成空串占位，
+      //   于是本机那份旧列表【重新成为生效值】—— 也就是说用户刚执行的「恢复默认」
+      //   可能并未真正生效（与 SECURITY.md 第 6 条披露的组合同源）。
+      //   这里如实说明并指向唯一可行的动作：重试，直到本机副本被真正清掉。
+      showHint("设置已恢复默认；但本机保存的旧绕过列表副本未能清除。若本机确实还存有" +
+        "另一份列表，它会被当作「历史遗留」重新生效 —— 即你之前的列表可能仍在绕过代理。" +
+        "请重试「恢复默认」直到不再出现本提示。（" + ((err && err.message) || err) + "）", "error");
+      return;
+    }
+    if (restored) {
+      showHint("已恢复默认设置，但无法确认代理是否生效（消息通道异常：" +
+        ((err && err.message) || err) + "）。可点击「测试当前出口」确认。", "warn");
+      return;
+    }
     showHint("恢复失败：" + ((err && err.message) || err), "error");
   });
 }
@@ -865,6 +952,8 @@ el.resetButton.addEventListener("click", resetDefaults);
 //   将来抛出，也不会留下 Uncaught (in promise)，失败原因照样显示在结果区。
 el.testButton.addEventListener("click", function () { runTest(false).catch(renderTestError); });
 el.testDirectButton.addEventListener("click", function () { runTest(true).catch(renderTestError); });
+// 【L-08】诊断导出同样补一层 .catch：runTest 的教训（异常不复位按钮）在此适用。
+el.diagButton.addEventListener("click", function () { exportDiagnostics().catch(renderTestError); });
 
 // 任一入口（含其它窗口 / 同步设备）改动存储，都刷新当前界面
 chrome.storage.onChanged.addListener(function (changes, areaName) {

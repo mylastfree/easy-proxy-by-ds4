@@ -215,6 +215,24 @@ console.log("== V-01：遮蔽现场「编辑后保存」的识别（纯函数）
   t("V-01-k 默认列表被删行后（不再是前缀）→ 不判为污染现场（宁漏勿误伤）",
     S.looksLikeShadowEdit(DEF.split(NL).slice(1).join(NL)) === false);
 }
+
+console.log("== L-03：出口检测 ip 字段的形态校验 ==");
+// 文档（SECURITY.md / PRIVACY.md）声称响应必须包含「有效的 ip 字段」，
+// 而旧判据只查「非空 + 长度 ≤45 + 无空白」—— "not-an-ip" 会通过并被当成出口 IP 展示。
+// 判据收敛到 settings.js 的 isIpLiteral，示例即文档与实现的同一事实来源。
+t("L-03-a 合法 IPv4 通过", S.isIpLiteral("203.0.113.7") === true);
+t("L-03-b 合法 IPv6 通过", S.isIpLiteral("2001:db8::1") === true);
+t("L-03-c IPv4 内嵌 IPv6 形式通过（::ffff:1.2.3.4）",
+  S.isIpLiteral("::ffff:192.0.2.1") === true);
+t("L-03-d 非 IP 文本被拒（旧判据会放行 not-an-ip）",
+  S.isIpLiteral("not-an-ip") === false);
+t("L-03-e 越界 IPv4 被拒", S.isIpLiteral("256.1.1.1") === false);
+t("L-03-f 段数不足被拒", S.isIpLiteral("1.2.3") === false);
+t("L-03-g 含非十六进制字符的冒号串被拒", S.isIpLiteral("gggg::1") === false);
+t("L-03-h 空串 / 带空白 / 超长一律被拒",
+  S.isIpLiteral("") === false && S.isIpLiteral(" 1.2.3.4 ") === false &&
+  S.isIpLiteral("a".repeat(46)) === false);
+t("L-03-i 非字符串输入不崩溃", S.isIpLiteral(null) === false && S.isIpLiteral(12345) === false);
 console.log("");
 // 【G1】文档一致性自检：README 声明的本套件断言数必须与实际通过数一致
 {
