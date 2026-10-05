@@ -2669,6 +2669,44 @@ function t(name, cond, extra) {
       typeof st.message === "string" && st.message.indexOf("并非直连") >= 0,
       "message=" + JSON.stringify(st.message));
   }
+  {
+    // 第 4 条 / 上一轮审计建议 A1（同源）的验收场景：清除成功，但回读到的实际配置
+    //   是【另一份 fixed_servers】（企业策略或其它扩展下发的），而不是 direct。
+    //   A1 的原始建议是「此时落 error 而非 direct」；本实现刻意改为
+    //   「status 仍为 direct（本扩展确实已停用）+ 如实写入 systemProxy + 文案说明并非直连」，
+    //   理由：调用方是【用户主动关闭开关】，此时报 error/红图标会把自己的正确停用
+    //   说成故障 —— 那是与「状态≠事实」同型的另一种失实。要点是【不得宣称直连】，
+    //   而不是把每一种非 direct 都叫错误。此处按该判据取证。
+    const env = buildEnv({ fetchDelay: 20 });
+    await ready(env, "10808");
+    let foreignFixed = false;
+    env.setClearHook((o, cb) => {
+      if (o.scope === "regular") foreignFixed = true;
+      setTimeout(() => { if (cb) cb(); }, 0);
+    });
+    env.setGetHook((n, o, cb, dg) => {
+      if (foreignFixed) {
+        return setTimeout(() => cb({
+          value: {
+            mode: "fixed_servers",
+            rules: { singleProxy: { scheme: "http", host: "corp-proxy.example", port: "3128" } }
+          },
+          levelOfControl: "controllable_by_this_extension"
+        }), 0);
+      }
+      return dg(o, cb);
+    });
+    await setSync(env, Object.assign({}, BASE, { enableProxy: false }));
+    await drain(env);
+    const st = env.sessionStore.lastState || {};
+    t("第4条-g 清除后实际生效的是外部 fixed_servers：不得当作我方生效，也不得宣称直连",
+      st.status === "direct" && st.systemProxy === "fixed_servers" && st.readFailed !== true,
+      "lastState=" + JSON.stringify(st));
+    t("第4条-h 文案点明「并非直连」并给出实际模式",
+      typeof st.message === "string" && st.message.indexOf("并非直连") >= 0 &&
+      st.message.indexOf("fixed_servers") >= 0,
+      "message=" + JSON.stringify(st.message));
+  }
 
   console.log("");
   console.log("== 外部审查修复（v2.12.0）：第 5 条 旧状态重试不得覆盖新状态 ==");
