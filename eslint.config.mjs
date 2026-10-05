@@ -8,7 +8,7 @@
 //   · tests/**：Node.js（require / process / __dirname）
 export default [
   {
-    ignores: ["node_modules/", "dist/"]
+    ignores: ["node_modules/", "dist/", ".worktrees/"]
   },
   {
     // 本配置文件自身是 ES Module
@@ -50,6 +50,18 @@ export default [
       "no-async-promise-executor": "error",
       "require-atomic-updates": "off", // 与本仓库的串行队列设计语义冲突（队列本身保证原子性）
       "eqeqeq": ["error", "smart"]
+    }
+  },
+  {
+    // 工具脚本：Node 环境（tools/package.js 使用 __dirname / process）
+    files: ["tools/**/*.js"],
+    languageOptions: {
+      globals: {
+        require: "readonly",
+        module: "readonly",
+        process: "readonly",
+        __dirname: "readonly"
+      }
     }
   },
   {
