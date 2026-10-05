@@ -353,6 +353,39 @@ console.log("== 判据单一实现（G3：遮蔽现场判据收敛到 settings.j
 }
 
 console.log("");
+console.log("== 文档声明一致性扩展（M-2/M-3：出口端点清单与 devDependencies 白名单）==");
+{
+  // 【M-2·审计修复】出口检测端点清单必须与实现一致地出现在所有对外文档里。
+  //   成因：README 隐私段只写了主端点 ipinfo.io、漏掉两个备用端点，与 PRIVACY.md /
+  //   SECURITY.md / settings.js 四处不一致（同一 README 的「安全」段却是对的）。
+  //   商店审核要求如实披露全部数据接收方，隐私摘要与实际网络行为不符属硬性风险。
+  //   事实来源取 settings.js 的 TEST_ENDPOINTS 数组字面量（静态解析，不引入运行时依赖）。
+  const block = (settingsJs.match(/var TEST_ENDPOINTS = \[([\s\S]*?)\];/) || [])[1] || "";
+  const endpoints = [...block.matchAll(/'(https:\/\/[^']+)'/g)].map((m) => m[1]);
+  t("能从 settings.js 解析出 TEST_ENDPOINTS 端点清单（≥2）",
+    endpoints.length >= 2, JSON.stringify(endpoints));
+  for (const doc of ["README.md", "PRIVACY.md", "SECURITY.md"]) {
+    const src = read(doc);
+    const missing = endpoints.filter((u) => src.indexOf(u) < 0);
+    t(doc + " 完整披露全部出口检测端点（防止端点清单漂移）",
+      missing.length === 0, missing.length ? "缺少: " + missing.join(", ") : "");
+  }
+
+  // 【M-3·审计修复】CONTRIBUTING 的 devDependencies 陈述必须与实际依赖一致。
+  //   成因：CONTRIBUTING 曾写「当前仅 ESLint」，而 M-4 已引入 c8；G1 守卫只覆盖
+  //   断言数/变异数，拦不住「依赖清单」这类陈述的漂移（S-2 同型缺陷）。
+  //   事实来源取 package.json，要求 CONTRIBUTING 逐名出现（大小写不敏感）。
+  const pkg = JSON.parse(read("package.json"));
+  const devDeps = Object.keys(pkg.devDependencies || {});
+  t("package.json 声明了 devDependencies", devDeps.length > 0, JSON.stringify(devDeps));
+  const contribLower = read("CONTRIBUTING.md").toLowerCase();
+  const missingDeps = devDeps.filter((d) => contribLower.indexOf(d.toLowerCase()) < 0);
+  t("CONTRIBUTING 逐名声明全部 devDependencies（防止依赖清单陈述漂移）",
+    devDeps.length > 0 && missingDeps.length === 0,
+    missingDeps.length ? "未声明: " + missingDeps.join(", ") : "devDeps=" + JSON.stringify(devDeps));
+}
+
+console.log("");
 // 【G1】文档一致性自检：README 声明的本套件断言数必须与实际通过数一致
 {
   const g1 = require("./g1-consistency.js").g1ConsistencyCheck("tests/manifest.test.js", pass);

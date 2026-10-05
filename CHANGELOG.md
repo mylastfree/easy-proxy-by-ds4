@@ -2,6 +2,21 @@
 
 本文件记录本扩展的所有重要变更。
 
+## [2.11.0] - 2026-10-05
+
+关闭 v2.10.0 全维度生产上线前审计（评分 88.6/100，阻塞 0 / 严重 0 / 一般 3 / 建议 8）的 3 项「一般」问题（M1 / M2 / M3）——均为既有修复的残留面或文档漂移，不涉及并发设计与存储契约。测试断言数 709 → **727**（`settings.test.js` 89 → 101、`manifest.test.js` 69 → 75），变异门禁 23 → **25** 项（新增 M24 / M25）。新增可观察契约（保存前校验新增两类拒绝：方括号滥用、主机无有效字符），按仓库惯例升 minor。
+
+### 修复（一般）
+
+- **M1（P2）主机名校验缺口 —— M-6 的残留面**：`hasInvalidHostChar` 把 `[` 与 `]` **无条件**列入合法字符白名单，而「必须是 IPv6 字面量」的判定（`isIpV6Shape`）只在 host **含冒号**时触发 —— 于是方括号只在与冒号共存时才受约束，残留下一整类漏放。探针实测：`a[b].com` / `[]` / `[abc]` / `foo]bar` / `[a]b` / `.` / `..` 在修复前**全部通过**保存前校验，错误被推迟到 `chrome.proxy.settings.set` 阶段并被归因为「代理异常」，把用户引去排查代理软件；其中 `[]` 经 `stripBrackets` 还会归一成**空串 host** 下发。修复：`settings.js` 新增两条独立判据 —— ① `hasInvalidBracketUse`：含括号时要求括号配对，且括号内必须是**含冒号**的 IPv6 形状（`[abc]` 必须靠「含冒号」区分，因为 `isIpV6Shape('abc')` 返回真：a / b / c 都是十六进制字符）；② `hasNoHostLabel`：host 至少含一个字母或数字。两条判据的拒绝文案各自如实说明成因（刻意不把 `.` 报成「方括号用法错误」，避免指向错误的排障方向）。防误伤底线：`::1` / `fe80::1` / `[::1]` / `[fe80::1]` / `2001:db8::1` 与全部常规主机名继续零错误。新增 12 项断言（`settings.test.js` M-7 段）并纳入变异门禁 —— M24 覆盖方括号判据、**M25 覆盖无标签判据（后者非冗余：`.` 不含方括号，M24 覆盖不到）**。
+- **M2（P2）README 隐私段端点披露不完整**：README「隐私说明」段只写了主端点 `ipinfo.io`，漏掉 v2.9.0 C-3 引入的两个备用端点（`ipapi.co` / `api.ipify.org`），与 `PRIVACY.md` / `SECURITY.md` / `settings.js` 四处不一致（同一 README 的「安全」段反而是对的）。商店审核要求如实披露全部数据接收方，隐私摘要与实际网络行为不符属硬性风险。修复：README 改为与 `PRIVACY.md` 一致的多端点表述。**根因治理**：`manifest.test.js` 新增 4 项断言，以 `settings.js` 的 `TEST_ENDPOINTS` 为唯一事实来源**反向校验** README / PRIVACY.md / SECURITY.md 三份文档，此后端点清单漂移 CI 直接变红。
+- **M3（P3）CONTRIBUTING 的 devDependencies 陈述漂移**：`CONTRIBUTING.md` 写「devDependencies 只允许开发工具（当前仅 ESLint）」，而 M-4 已引入 `c8` —— 与 S-2 同型的文档漂移，且 G1 守卫只覆盖断言数 / 变异数，**拦不住「依赖清单」这类陈述**。修复：更正为「当前：ESLint 静态检查、c8 覆盖率」；`manifest.test.js` 新增 2 项断言，以 `package.json` 的 `devDependencies` 为事实来源要求 CONTRIBUTING 逐名声明。
+
+### 其他
+
+- 版本 2.10.0 → 2.11.0（manifest / package / lock / 三个源文件头 / README / CHANGELOG 同步）；断言数与变异数同步至 README、CONTRIBUTING、ARCHITECTURE、ci.yml 四处。
+- 本轮由一份独立的全维度上线前审计驱动；该审计的 8 项「建议」（禁用路径缺下发后回读校验、注释编号无索引、超大函数拆分、E2E 未自动化、可观测性、`engines`/CI 并发与缓存、无障碍 live region、文档时长声明）**未在本版处置**。
+
 ## [2.10.0] - 2026-10-05
 
 关闭 v2.9.0 独立生产上线前复审的全部问题：2 项严重（S-1 / S-2）、5 项一般（M-1 / M-2 / M-3 / M-4 / M-5）、6 项建议（A-1 – A-6）。测试从 683 项断言扩至 **709 项**（变异门禁 23 项，全部拦截）；新增 c8 覆盖率门禁（`npm run coverage`）与真实浏览器 E2E 冒烟清单（`docs/E2E-SMOKE.md`）。新增可观察契约（未启用分支新增 `reason:"control_unknown"` 与被接管时的 `status:"overridden"` 上报；出口测试在启用代理时渲染第三方出口知情提示），按仓库惯例升 minor。

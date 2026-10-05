@@ -1,4 +1,4 @@
-// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.10.0]
+// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.11.0]
 // 刻意不依赖任何 chrome.* API，使 popup 与 Service Worker 可共用同一套逻辑。
 (function (root) {
   'use strict';
@@ -227,6 +227,46 @@
     return false;
   }
 
+  // 【M-7】主机「形态」收口 · 判据一：方括号只能用于包裹 IPv6 地址。
+  //
+  //   成因（M-6 的残留面，探针实测复现）：hasInvalidHostChar 把 [ 与 ] **无条件**列入
+  //   白名单，而「必须是 IPv6 字面量」的判定（isIpV6Shape）只在 host **含冒号**时触发
+  //   —— 于是方括号只在与冒号共存时才受约束，残留下一整类漏放。修复前以下写法全部
+  //   通过保存前校验：
+  //     a[b].com / foo]bar / [a]b → 括号未配对（stripBrackets 不剥取），Chrome 必拒
+  //     []                       → 剥括号后为空串，会被当作空 host 下发
+  //     [abc]                    → 剥括号后是纯字母，不是 IPv6。注意不能只靠
+  //                                isIpV6Shape 判定：它对 'abc' 返回真（a/b/c 都是
+  //                               十六进制字符），必须再要求括号内**含冒号**才能区分
+  //     . / ..                   → 纯分隔符串，任何合法主机形态都不可能长这样
+  //   与 M-6 同一目标：把 Chrome 必拒写法拦在保存之前，而不是推迟到 set 阶段被拒后
+  //   归因为「代理异常」，把用户引去排查代理软件。
+  //
+  //   防误伤底线：::1 / fe80::1 / [::1] / [fe80::1] / 2001:db8::1 与全部常规主机名
+  //   必须继续零错误（settings.test.js 的 M-6 / M-7 段把守）。
+  function hasInvalidBracketUse(s) {
+    if (s.indexOf('[') < 0 && s.indexOf(']') < 0) return false;
+    var bare = stripBrackets(s);
+    // 有括号但未配对（stripBrackets 原样返回）→ 非法：a[b].com / foo]bar / [a]b
+    if (bare === s) return true;
+    // [] → 剥括号后为空串；[abc] → 剥括号后不含冒号（IPv6 字面量必然含冒号）
+    if (!bare || bare.indexOf(':') < 0) return true;
+    // 括号内必须是真正的 IPv6 形状（仅 [0-9a-fA-F:.]）
+    return !isIpV6Shape(bare);
+  }
+
+  // 【M-7】主机「形态」收口 · 判据二：至少含一个字母或数字。
+  //   覆盖无方括号的纯分隔符串：`.` / `..` / `---` 不是任何合法主机形态（Chrome 必拒）。
+  //   与判据一拆成两条，是为了让拒绝文案如实说明各自原因 —— 把 `.` 报成「方括号用法错误」
+  //   会指向错误的排障方向，与本项目「如实上报」的基调相悖。
+  function hasNoHostLabel(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) return false;
+    }
+    return true;
+  }
+
   // 【M-6】含冒号的 host 必须整体形如 IPv6 字面量（仅 [0-9a-fA-F:.]，允许 [] 包裹）。
   //   looksLikeHostPort 只识别「单冒号 + 全数字端口」，拦不住 example.com:8080:90
   //   （两个冒号）与 host:abc（冒号后非数字）—— 这些写法此前一路漏到 set 阶段才失败。
@@ -266,6 +306,15 @@
     } else if (hasInvalidHostChar(s.proxyHost)) {
       // 【M-6】合法字符白名单：字母、数字、点、连字符、下划线（IPv6 另见下一条）。
       errors.push('代理地址包含无效字符，只允许字母、数字、点、连字符（IPv6 可含冒号与方括号）');
+    } else if (hasInvalidBracketUse(s.proxyHost)) {
+      // 【M-7】方括号只能包裹 IPv6 地址（如 [::1]）。
+      //   必须在 hasInvalidHostChar 之后、冒号判定之前：前者只判「字符合法性」，
+      //   本判据才判「形态合法性」；放在冒号之前才能覆盖「无冒号」的方括号漏放面。
+      errors.push('代理地址无效：方括号只能用于包裹 IPv6 地址（如 [::1]）；请检查是否误写了 a[b].com 这类形式');
+    } else if (hasNoHostLabel(s.proxyHost)) {
+      // 【M-7】至少含一个字母或数字：`.`、`..`、`---` 这类纯分隔符串不是合法主机
+      //   （Chrome 必拒）。文案如实说明原因，不得复用方括号那条。
+      errors.push('代理地址无效：至少需要包含一个字母或数字');
     } else if (s.proxyHost.indexOf(':') >= 0 && !isIpV6Shape(s.proxyHost)) {
       // 【M-6】含冒号但不是 IPv6 字面量：example.com:8080:90、host:abc 等
       //   Chrome 必拒写法在此拦截（注意必须放在 isAsciiHost 之后，且合法 IPv6 不得误伤）。

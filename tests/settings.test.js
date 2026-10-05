@@ -121,6 +121,34 @@ M6_ALLOW.forEach(function (h) {
   t("M-6 防误伤：" + h, errs.length === 0, JSON.stringify(errs));
 });
 
+console.log("== M-7：方括号用法与主机形态收口（M-6 的残留面）==");
+// M-6 把 [ 与 ] 无条件列入合法字符白名单，而 isIpV6Shape 只在 host 含冒号时触发 ——
+// 于是「无冒号的方括号」整类漏放（探针实测：修复前以下写法全部通过保存前校验），
+// 错误被推迟到 set 阶段并归因为「代理异常」，把用户引去排查代理软件。
+const M7_BRACKET_REJECT = ["a[b].com", "[]", "[abc]", "foo]bar", "[a]b"];
+M7_BRACKET_REJECT.forEach(function (h) {
+  const errs = S.validateSettings(Object.assign({}, ok, { proxyHost: h }));
+  t("M-7 方括号滥用被拒：" + JSON.stringify(h), errs.length > 0, JSON.stringify(errs));
+});
+// 纯分隔符串（无方括号）：同样必须拒绝 —— [] 之外的第二种「无有效字符」形态
+const M7_LABELLESS = [".", ".."];
+M7_LABELLESS.forEach(function (h) {
+  const errs = S.validateSettings(Object.assign({}, ok, { proxyHost: h }));
+  t("M-7 无有效字符的主机被拒：" + JSON.stringify(h), errs.length > 0, JSON.stringify(errs));
+});
+// 防误伤：合法 IPv6 的带括号形态必须继续零错误（收口不得把 IPv6 一起打掉）
+const M7_ALLOW = ["[::1]", "[fe80::1]", "[2001:db8::1]"];
+M7_ALLOW.forEach(function (h) {
+  const errs = S.validateSettings(Object.assign({}, ok, { proxyHost: h }));
+  t("M-7 防误伤（带括号 IPv6）：" + h, errs.length === 0, JSON.stringify(errs));
+});
+t("M-7 方括号类拒绝文案指向方括号用法",
+  S.validateSettings(Object.assign({}, ok, { proxyHost: "a[b].com" }))
+    .some(function (m) { return m.indexOf("方括号") >= 0; }));
+t("M-7 无标签类拒绝文案不得复用方括号说明（如实上报成因）",
+  S.validateSettings(Object.assign({}, ok, { proxyHost: "." }))
+    .some(function (m) { return m.indexOf("方括号") < 0 && m.indexOf("字母或数字") >= 0; }));
+
 console.log("== C-3：出口检测端点容错配置 ==");
 t("TEST_ENDPOINTS 为多端点数组（≥2）",
   Array.isArray(S.TEST_ENDPOINTS) && S.TEST_ENDPOINTS.length >= 2, JSON.stringify(S.TEST_ENDPOINTS));

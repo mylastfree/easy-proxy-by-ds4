@@ -402,6 +402,27 @@ const mutations = [
     from: "    } else if (s.proxyHost.indexOf(':') >= 0 && !isIpV6Shape(s.proxyHost)) {",
     to: "    } else if (false) {",
     expectFail: true
+  },
+  {
+    // 【M-7】方括号用法收口失效：a[b].com / [] / [abc] / foo]bar / [a]b 这类
+    //   「括号未配对、或括号内不是 IPv6」的写法重新漏到 set 阶段并被归因为「代理异常」。
+    //   这是 M-6 的残留面 —— M-6 只覆盖了「含冒号」的形态，无冒号的方括号整类漏放。
+    //   settings 的 M-7 段（方括号拒绝断言）是它的主守门者。
+    name: "M24 方括号用法收口失效（M-7 回归：a[b].com / [] 类必拒写法漏放）",
+    target: "set",
+    from: "    } else if (hasInvalidBracketUse(s.proxyHost)) {",
+    to: "    } else if (false) {",
+    expectFail: true
+  },
+  {
+    // 【M-7】主机「无有效字符」判据失效：`.` / `..` 这类纯分隔符串重新通过保存前校验。
+    //   它是【独立判据】而非方括号那条的冗余 —— `.` 根本不含方括号，M24 的变异覆盖不到，
+    //   必须自己有变异才能证明 settings 的 M-7 无标签断言是承重的。
+    name: "M25 主机无有效字符判据失效（M-7 回归：. / .. 漏放）",
+    target: "set",
+    from: "    } else if (hasNoHostLabel(s.proxyHost)) {",
+    to: "    } else if (false) {",
+    expectFail: true
   }
 ];
 

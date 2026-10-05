@@ -2,7 +2,7 @@
 
 ## 基本约定
 
-- **运行时零依赖、零构建**：源码保持纯 JavaScript（MV3），不引入框架或打包工具。devDependencies 只允许开发工具（当前仅 ESLint）。
+- **运行时零依赖、零构建**：源码保持纯 JavaScript（MV3），不引入框架或打包工具。devDependencies 只允许开发工具（当前：ESLint 静态检查、c8 覆盖率）。
 - **单一实现原则**：业务判据与取值规则只允许在 `settings.js` 存在一份实现，popup 与 background 共用。发现第二份内联实现 = 缺陷。
 - **「读不到 ≠ 没有」**：任何 `chrome.storage` / `chrome.proxy.settings.get` 读取失败都必须显式分支上报，绝不归一成默认值继续走写路径。
 - **绝不写 `local` 的唯一副本**：自动逻辑不得触碰 `storage.local.bypassList`；清空只能发生在用户明确知情并确认的操作里。
@@ -29,9 +29,9 @@
 
 ```powershell
 npm run lint        # ESLint（CI 首个失败点）
-npm test            # 七套功能测试（709 项断言，tests/run-all.js 统一入口）
+npm test            # 七套功能测试（727 项断言，tests/run-all.js 统一入口）
 npm run coverage    # 可选：c8 覆盖率报告
-npm run mutation    # 变异门禁（23 项，本机约 15 分钟）
+npm run mutation    # 变异门禁（25 项，本机约 15 分钟）
 npm run package     # 可选：验证打包清单
 ```
 
