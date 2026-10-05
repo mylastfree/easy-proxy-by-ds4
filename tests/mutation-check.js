@@ -71,6 +71,40 @@ if (dirtyAtStart && dirtyAtStart.size) {
   console.log("");
 }
 
+// 【B-3·上线准入修复】变异运行哨兵。
+//   事故背景：dist/easy-proxy-by-ds4-2.10.0/popup.js 曾被写入 M22 的变异体
+//   （`function activeEditableId() {\n  return null;\n  ...`，与 mutations 里 M22
+//   的 to 串逐字节一致）—— 说明打包动作发生在变异运行期间，把变异体复制进了
+//   发布产物。一旦这样的产物上传商店，用户拿到的是被故意破坏的代码。
+//   处置：开始改写源文件之前落一个哨兵文件，还原时一并清除（挂在同一个幂等函数
+//   上，避免「源文件已还原但哨兵仍在」的假锁定）；tools/package.js 见到哨兵即
+//   拒绝打包。一个写、一个拒，构成互斥。
+const SENTINEL = path.join(rootDir, ".mutation-in-progress");
+function removeSentinel() {
+  try { fs.rmSync(SENTINEL, { force: true }); } catch (e) { /* 尽力而为 */ }
+}
+
+// 【B-4·上线准入修复】残留哨兵守卫 —— 位置必须在 originals 读取【之前】。
+//   实测（Windows / Git Bash）：kill -INT 无法触发 Node 的 process.on("SIGINT")
+//   处理器，进程退出时五类出口钩子一个都没执行 —— 源文件停留在变异体上、哨兵一并
+//   残留。也就是说 S-1 的「信号安全还原」在 Windows 本地开发场景下【实际不生效】，
+//   而这一点在 Linux/CI 上永远不会暴露。
+//   真正的危险在于：若此时直接重跑，下面的 originals 读到的就是【污染后的内容】，
+//   此后所有「还原」都还原成污染体，整个门禁建立在错误基线上，且完全静默。
+//   因此启动即拒绝，并给出确切的恢复命令。
+//   刻意【不自动 checkout】：工作区可能同时存在维护者的真实未提交改动，
+//   静默丢弃不可接受；由人来判断并执行恢复命令，符合本项目「显式失败」的基调。
+if (fs.existsSync(SENTINEL)) {
+  let info = "";
+  try { info = fs.readFileSync(SENTINEL, "utf8").trim(); } catch (e) { /* 尽力而为 */ }
+  console.error("检测到残留的变异哨兵：" + SENTINEL + (info ? "（" + info + "）" : ""));
+  console.error("这说明上一次变异测试被异常中断，源文件很可能仍停留在变异态。");
+  console.error("若在此状态下继续运行，本门禁会把污染内容当作基线。请先恢复现场：");
+  console.error("  git checkout -- background.js settings.js popup.js");
+  console.error("  rm -f .mutation-in-progress");
+  process.exit(1);
+}
+
 const originals = {
   bg: fs.readFileSync(targets.bg, "utf8"),
   set: fs.readFileSync(targets.set, "utf8"),
@@ -96,19 +130,8 @@ const eol = {
 //   exit / SIGINT / SIGTERM / uncaughtException / unhandledRejection 五类出口，
 //   任何一条路径退出都会先还原。幂等性：内容与原始一致就跳过写入，
 //   重复触发（如 SIGINT 处理器之后再触发 exit）无副作用。
-// 【B-3·上线准入修复】变异运行哨兵。
-//   事故背景：dist/easy-proxy-by-ds4-2.10.0/popup.js 曾被写入 M22 的变异体
-//   （`function activeEditableId() {\n  return null;\n  ...`，与下方 M22 的 to 串
-//   逐字节一致）—— 说明打包动作发生在变异运行期间，把变异体复制进了发布产物。
-//   一旦这样的产物上传商店，用户拿到的是被故意破坏的代码。
-//   处置：开始改写源文件之前落一个哨兵文件，还原时一并清除（挂在同一个幂等
-//   函数上，保证不会出现「源文件已还原但哨兵仍在」的假锁定）；
-//   tools/package.js 见到哨兵即拒绝打包。一个写、一个拒，构成互斥。
-const SENTINEL = path.join(rootDir, ".mutation-in-progress");
-function removeSentinel() {
-  try { fs.rmSync(SENTINEL, { force: true }); } catch (e) { /* 尽力而为 */ }
-}
-
+// 【B-3/B-4】哨兵常量与「残留哨兵守卫」定义在文件上方 ——
+//   守卫必须早于 originals 读取执行，理由见那一段的注释。
 function restoreAll() {
   for (const key of Object.keys(targets)) {
     try {

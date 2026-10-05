@@ -39,6 +39,22 @@ npm run package     # 可选：验证打包清单
 
 全部通过且 `git status --porcelain` 为空后再提交（变异脚本会临时改写源文件，CI 会核验工作区洁净）。
 
+> ⚠️ **Windows 上中断变异门禁会留下污染，必须手动恢复。**
+> 实测：Windows / Git Bash 下 `Ctrl-C`（`kill -INT`）**无法触发** Node 的 `process.on("SIGINT")`
+> 处理器，进程直接退出，`background.js` / `settings.js` / `popup.js` 会停留在变异体上，
+> 并残留哨兵文件 `.mutation-in-progress`（即「信号安全还原」在 Windows 本地不生效，
+> 该问题在 Linux/CI 上不会出现）。此时重新运行本门禁会被**启动守卫拒绝**——这是有意设计，
+> 因为带着污染继续跑会把污染内容当作基线。按提示恢复即可：
+>
+> ```bash
+> git checkout -- background.js settings.js popup.js
+> rm -f .mutation-in-progress
+> ```
+>
+> 打包动作同样被哨兵拦住（`tools/package.js` 见到哨兵即拒绝），因此被中断时**不会**产出
+> 含变异体的发布包。若不慎把污染代码提交了出去，CI 的「工作区洁净核验」与
+> `manifest.test.js` 的逐字节比对会兜底拦截。
+
 ## 报告问题
 
 缺陷报告请用仓库的 Issue 模板；**安全问题一律走 [SECURITY.md](SECURITY.md) 的私密渠道**，不要开公开 Issue。
