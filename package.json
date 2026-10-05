@@ -1,6 +1,6 @@
 {
   "name": "easy-proxy-by-ds4",
-  "version": "2.9.0",
+  "version": "2.10.0",
   "private": true,
   "description": "一键让 Chrome 走本地代理（SOCKS5 / HTTPS），局域网默认直连，内置出口检测",
   "license": "MIT",
@@ -9,12 +9,14 @@
     "url": "https://github.com/mylastfree/easy-proxy-by-ds4.git"
   },
   "scripts": {
-    "test": "node tests/manifest.test.js && node tests/settings.test.js && node tests/background.test.js && node tests/fix-safety.test.js && node tests/concurrency.test.js && node tests/ownership.test.js && node tests/popup.test.js",
+    "test": "node tests/run-all.js",
     "mutation": "node tests/mutation-check.js",
     "lint": "eslint .",
-    "package": "node tools/package.js"
+    "package": "node tools/package.js",
+    "coverage": "c8 node tests/run-all.js"
   },
   "devDependencies": {
+    "c8": "^12.0.0",
     "eslint": "^9.18.0"
   }
 }

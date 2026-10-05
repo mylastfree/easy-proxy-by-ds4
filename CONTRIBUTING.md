@@ -29,10 +29,13 @@
 
 ```powershell
 npm run lint        # ESLint（CI 首个失败点）
-npm test            # 七套功能测试（616 项断言）
-npm run mutation    # 变异门禁（19 项，本机约 15 分钟）
+npm test            # 七套功能测试（702 项断言，tests/run-all.js 统一入口）
+npm run coverage    # 可选：c8 覆盖率报告
+npm run mutation    # 变异门禁（23 项，本机约 15 分钟）
 npm run package     # 可选：验证打包清单
 ```
+
+发布前另须完成 `docs/E2E-SMOKE.md` 的真实浏览器冒烟清单。
 
 全部通过且 `git status --porcelain` 为空后再提交（变异脚本会临时改写源文件，CI 会核验工作区洁净）。
 

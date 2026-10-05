@@ -113,8 +113,8 @@ function buildEnv() {
   sandbox.window = sandbox;
   sandbox.__probe = probe;
   vm.createContext(sandbox);
-  vm.runInContext(settingsSrc, sandbox);
-  vm.runInContext(popupSrc, sandbox);
+  vm.runInContext(settingsSrc, sandbox, { filename: path.join(__dirname, '..', 'settings.js') });
+  vm.runInContext(popupSrc, sandbox, { filename: path.join(__dirname, '..', 'popup.js') });
 
   return {
     sandbox, els, msg, calls,
@@ -340,7 +340,7 @@ function buildChainEnv(opts) {
     Number, String, Math, Boolean, Error, AbortController,
     fetch: () => Promise.reject(new Error("chain env 未提供 fetch 桩"))
   };
-  bgCtx.importScripts = () => vm.runInContext(settingsSrc, bgCtx);
+  bgCtx.importScripts = () => vm.runInContext(settingsSrc, bgCtx, { filename: path.join(__dirname, '..', 'settings.js') });
 
   popupCtx.chrome = makeChrome("popup");
   bgCtx.chrome = makeChrome("bg");
@@ -349,9 +349,9 @@ function buildChainEnv(opts) {
 
   vm.createContext(popupCtx);
   vm.createContext(bgCtx);
-  vm.runInContext(settingsSrc, popupCtx);
-  vm.runInContext(popupSrc, popupCtx);
-  vm.runInContext(bgSrcForChain, bgCtx);
+  vm.runInContext(settingsSrc, popupCtx, { filename: path.join(__dirname, '..', 'settings.js') });
+  vm.runInContext(popupSrc, popupCtx, { filename: path.join(__dirname, '..', 'popup.js') });
+  vm.runInContext(bgSrcForChain, bgCtx, { filename: path.join(__dirname, '..', 'background.js') });
 
   return {
     els, popupCtx, bgCtx, proxy, syncStore, localStore, sessionStore, syncSetCalls, localSetCalls,
@@ -759,7 +759,7 @@ function t(name, cond, extra) {
     const sboxB = { TextEncoder: TextEncoder };
     sboxB.self = sboxB; sboxB.globalThis = sboxB;
     vm.createContext(sboxB);
-    vm.runInContext(settingsSrc, sboxB);
+    vm.runInContext(settingsSrc, sboxB, { filename: path.join(__dirname, '..', 'settings.js') });
     const DEFAULTS_B = sboxB.EasyProxy.DEFAULTS;
     const LONG_B = Array.from({ length: 950 }, (_, i) => "legacy-" + (i + 1) + ".internal.example").join("\n");
 
@@ -807,7 +807,7 @@ function t(name, cond, extra) {
     const sboxC = { TextEncoder: TextEncoder };
     sboxC.self = sboxC; sboxC.globalThis = sboxC;
     vm.createContext(sboxC);
-    vm.runInContext(settingsSrc, sboxC);
+    vm.runInContext(settingsSrc, sboxC, { filename: path.join(__dirname, '..', 'settings.js') });
     const DEFAULTS_C = sboxC.EasyProxy.DEFAULTS;
 
     // C-1：sync 是用户自己写的短列表（逐字符 ≠ 默认列表），local 里残留着一份过期副本 ——
@@ -892,7 +892,7 @@ function t(name, cond, extra) {
     const sboxR9 = { TextEncoder: TextEncoder };
     sboxR9.self = sboxR9; sboxR9.globalThis = sboxR9;
     vm.createContext(sboxR9);
-    vm.runInContext(settingsSrc, sboxR9);
+    vm.runInContext(settingsSrc, sboxR9, { filename: path.join(__dirname, '..', 'settings.js') });
     const DEF_R9 = sboxR9.EasyProxy.DEFAULTS.bypassList;
     const NL = String.fromCharCode(10);
     const LONG_R9 = Array.from({ length: 500 }, (_, i) => "r9-" + (i + 1) + ".internal.example").join(NL);
@@ -956,7 +956,7 @@ function t(name, cond, extra) {
     const sboxF = { TextEncoder: TextEncoder };
     sboxF.self = sboxF; sboxF.globalThis = sboxF;
     vm.createContext(sboxF);
-    vm.runInContext(settingsSrc, sboxF);
+    vm.runInContext(settingsSrc, sboxF, { filename: path.join(__dirname, '..', 'settings.js') });
     const DEF_F = sboxF.EasyProxy.DEFAULTS.bypassList;
     const MAX_F = sboxF.EasyProxy.MAX_SYNC_BYTES_PER_ITEM;
     const NL_F = String.fromCharCode(10);
@@ -1073,7 +1073,7 @@ function t(name, cond, extra) {
     const sboxV = { TextEncoder: TextEncoder };
     sboxV.self = sboxV; sboxV.globalThis = sboxV;
     vm.createContext(sboxV);
-    vm.runInContext(settingsSrc, sboxV);
+    vm.runInContext(settingsSrc, sboxV, { filename: path.join(__dirname, '..', 'settings.js') });
     const DEF_V = sboxV.EasyProxy.DEFAULTS.bypassList;
     const NL_V = String.fromCharCode(10);
     const LONG_V = Array.from({ length: 500 }, (_, i) => "v1-" + (i + 1) + ".internal.example").join(NL_V);
@@ -1373,7 +1373,7 @@ function t(name, cond, extra) {
     const sboxS1 = { TextEncoder: TextEncoder };
     sboxS1.self = sboxS1; sboxS1.globalThis = sboxS1;
     vm.createContext(sboxS1);
-    vm.runInContext(settingsSrc, sboxS1);
+    vm.runInContext(settingsSrc, sboxS1, { filename: path.join(__dirname, '..', 'settings.js') });
     const DEF_S1 = sboxS1.EasyProxy.DEFAULTS.bypassList;
     const NL_S1 = String.fromCharCode(10);
     const LONG_S1 = Array.from({ length: 500 }, (_, i) => "s1-" + (i + 1) + ".internal.example").join(NL_S1);
@@ -1471,7 +1471,7 @@ function t(name, cond, extra) {
     const sboxG6 = { TextEncoder: TextEncoder };
     sboxG6.self = sboxG6; sboxG6.globalThis = sboxG6;
     vm.createContext(sboxG6);
-    vm.runInContext(settingsSrc, sboxG6);
+    vm.runInContext(settingsSrc, sboxG6, { filename: path.join(__dirname, '..', 'settings.js') });
     const DEF_G6 = sboxG6.EasyProxy.DEFAULTS;
 
     const envG6 = buildChainEnv({
@@ -1583,8 +1583,8 @@ function t(name, cond, extra) {
     sandbox.globalThis = sandbox;
     sandbox.window = sandbox;
     vm.createContext(sandbox);
-    vm.runInContext(settingsSrc, sandbox);
-    vm.runInContext(popupSrc, sandbox);
+    vm.runInContext(settingsSrc, sandbox, { filename: path.join(__dirname, '..', 'settings.js') });
+    vm.runInContext(popupSrc, sandbox, { filename: path.join(__dirname, '..', 'popup.js') });
     return {
       sandbox, els, syncStore, localStore, storageListeners,
       fireStorageChange: (changes, area) => { for (const f of storageListeners.slice()) f(changes, area); },

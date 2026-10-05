@@ -170,6 +170,14 @@ function renderTest(result) {
       ? (s.proxyType + " " + s.proxyHost + ":" + s.proxyPort)
       : "未启用";
     html += "<div><b>代理配置</b>" + escapeHtml(proxyText) + "</div>";
+    // 【A-6·审计修复】第三方出口知情提示前移到 UI：此前「流量经第三方代理服务器
+    //   出去、其运营方可见目标地址」这一事实只存在于 README/SECURITY 文档，
+    //   用户在扩展界面得不到任何提示。出口测试正是感知这一事实的最佳时机 ——
+    //   此刻用户看到的就是代理服务器的出口，把知情提示放在同一屏最合适。
+    if (s.enableProxy) {
+      html += '<div class="t-muted">提示：启用第三方代理后，你的流量会经由该代理服务器出去' +
+        "（其运营方可以看到你访问的目标地址）；「当前出口」显示的就是代理服务器的出口。</div>";
+    }
   }
 
   if (result.activeMode) {
@@ -265,7 +273,11 @@ function escapeHtml(s) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    // 【A-3·审计修复】补转义单引号：当前所有插值都在文本节点上下文（不可利用），
+    //   但 escapeHtml 是公共转义出口，一旦被复用到单引号属性插值（如 title='...'）
+    //   缺这条就会成为注入点。纵深防御按最坏上下文假设补齐。
+    .replace(/'/g, "&#39;");
 }
 
 // 【R7-08】测试请求失败的统一出口。
@@ -601,8 +613,18 @@ function save() {
           "关闭并重新打开弹窗，或等待后台自动恢复后再确认。", "warn");
       })
     : (oversize
-        ? setStorage("local", { bypassList: settings.bypassList }).then(function () {
-            return setStorage("sync", Object.assign({}, settings, { bypassList: "" }));
+        // 【M-3·审计修复】有序写入：先写 sync 空串占位，后写 local 用户列表。
+        //   此前顺序（先 local 后 sync）在 sync 写入失败时会把系统留在
+        //   「local = 新长列表、sync = 旧非空列表」的不一致中间态：
+        //   resolveBypassList 的「sync 非空优先」规则让旧值继续遮蔽新列表，
+        //   此后用户点一次保存还可能经 clearLocalBypassIfAny 把 local 也清掉
+        //   （R8-02 的丢数据链）。反序后两个失败模式都收敛为「如实报错、
+        //   有效值回退到旧 local」，不再产生遮蔽中间态：
+        //     · sync 占位失败 → 链路中断报错，local 与 sync 都未被改动；
+        //     · local 写入失败 → 报错；sync="" + 旧 local → 生效值回退旧列表，
+        //       新值丢失但无遮蔽、无覆盖，且用户看到失败提示。
+        ? setStorage("sync", Object.assign({}, settings, { bypassList: "" })).then(function () {
+            return setStorage("local", { bypassList: settings.bypassList });
           }).then(function () {
             showHint("绕过列表较长，已存于本地（不跨设备同步）", "warn");
           })

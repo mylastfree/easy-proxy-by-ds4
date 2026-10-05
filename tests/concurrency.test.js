@@ -75,7 +75,7 @@ function buildEnv(opts) {
   };
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
-  sandbox.importScripts = function () { vm.runInContext(settingsSrc, sandbox); };
+  sandbox.importScripts = function () { vm.runInContext(settingsSrc, sandbox, { filename: path.join(__dirname, '..', 'settings.js') }); };
   sandbox.fetch = function () {
     return new Promise(function (resolve) {
       setTimeout(function () {
@@ -158,7 +158,7 @@ sandbox.chrome = {
   };
 
   vm.createContext(sandbox);
-  vm.runInContext(bgSrc, sandbox);
+  vm.runInContext(bgSrc, sandbox, { filename: path.join(__dirname, '..', 'background.js') });
   return { sandbox: sandbox, syncStore: syncStore, sessionStore: sessionStore,
            setCalls: setCalls, listeners: listeners, iconCalls: iconCalls, titleCalls: titleCalls,
            fetchLog: fetchLog,

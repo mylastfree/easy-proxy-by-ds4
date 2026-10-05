@@ -20,6 +20,10 @@ desktop.ini
 node_modules/
 dist/
 
+# 覆盖率产物（M-4：c8 的 text/lcov 报告）
+coverage/
+*.lcov
+
 # 本地助手记忆目录：不入库。
 #   CI 有「变异后 git status --porcelain 必须为空」的硬门禁，
 #   未跟踪的本地目录会被误判为变异未还原造成的污染。

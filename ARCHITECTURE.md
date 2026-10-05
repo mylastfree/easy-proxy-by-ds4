@@ -73,7 +73,7 @@ readSettings/readBypassText ──失败──▶ error(reason:"read_failed")   
 
 | 护栏 | 文件 |
 | --- | --- |
-| 7 套功能测试（616 项断言，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
-| 变异门禁（19 项：每个修复点被故意破坏后护栏必须变红） | `tests/mutation-check.js` |
+| 7 套功能测试（702 项断言，`tests/run-all.js` 统一入口，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
+| 变异门禁（23 项：每个修复点被故意破坏后护栏必须变红；S-1 加固后任何退出路径（含信号与未捕获异常）均幂等还原源文件，并以运行前后工作区快照比对判定污染） | `tests/mutation-check.js` |
 | 文档一致性（断言数/变异数声明 vs 实际） | `tests/g1-consistency.js` + `tests/manifest.test.js` |
 | CI（lint → 7 套测试 → 变异 → 工作区洁净核验） | `.github/workflows/ci.yml` |

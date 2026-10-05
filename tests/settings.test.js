@@ -8,7 +8,7 @@ const settingsPath = path.join(__dirname, '..', 'settings.js');
 const sandbox = { TextEncoder: TextEncoder, console: console };
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
-vm.runInContext(fs.readFileSync(settingsPath, 'utf8'), sandbox);
+vm.runInContext(fs.readFileSync(settingsPath, 'utf8'), sandbox, { filename: settingsPath });
 const S = sandbox.EasyProxy;
 
 let pass = 0;

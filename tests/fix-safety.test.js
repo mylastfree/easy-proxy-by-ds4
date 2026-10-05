@@ -56,7 +56,7 @@ function buildEnv(opts) {
   };
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
-  sandbox.importScripts = () => vm.runInContext(settingsSrc, sandbox);
+  sandbox.importScripts = () => vm.runInContext(settingsSrc, sandbox, { filename: path.join(__dirname, '..', 'settings.js') });
 
   sandbox.fetch = () => new Promise((resolve, reject) => {
     if (fetchBehaviour === "reject") {
@@ -119,7 +119,7 @@ function buildEnv(opts) {
   };
 
   vm.createContext(sandbox);
-  vm.runInContext(bgSrc, sandbox);
+  vm.runInContext(bgSrc, sandbox, { filename: path.join(__dirname, '..', 'background.js') });
   return { sandbox, syncStore, localStore, sessionStore, applied, listeners,
            getProxyActive: () => proxyActive };
 }
@@ -211,7 +211,7 @@ function t(name, cond, extra) {
     const sb = { TextEncoder, console };
     sb.globalThis = sb;
     vm.createContext(sb);
-    vm.runInContext(settingsSrc, sb);
+    vm.runInContext(settingsSrc, sb, { filename: path.join(__dirname, '..', 'settings.js') });
     const S = sb.EasyProxy;
     const legal = ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "127.0.0.0/8",
       "fe80::/10", "2001:db8::/32", "100.64.0.0/10", "224.0.0.0/4",

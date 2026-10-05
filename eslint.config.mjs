@@ -8,7 +8,7 @@
 //   · tests/**：Node.js（require / process / __dirname）
 export default [
   {
-    ignores: ["node_modules/", "dist/", ".worktrees/"]
+    ignores: ["node_modules/", "dist/", ".worktrees/", "coverage/"]
   },
   {
     // 本配置文件自身是 ES Module

@@ -1,0 +1,6 @@
+{
+  "all": false,
+  "include": ["**/background.js", "**/settings.js", "**/popup.js"],
+  "exclude": ["**/node_modules/**", "**/tests/**", "**/tools/**"],
+  "reporter": ["text", "lcov"]
+}

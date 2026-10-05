@@ -442,6 +442,41 @@ async function applyProxyCore() {
 
   // 1) 未启用：清除常规作用域
   if (!settings.enableProxy) {
+    // 【M-1·审计修复】写前控制权确证（与下方启用分支 3.5 同一基调）：
+    //   此前禁用分支不做任何控制权检查就 clearProxyScope("regular") 并宣称 direct。
+    //   若此刻代理已被企业策略或其它扩展接管，这次 clear 要么无效、要么构成夺权式
+    //   写入，而状态却被写成 "direct" —— 与本项目反复修复的「状态≠事实」缺陷族同型
+    //   （外部接管 + 未启用时，真实流量可能仍走外部代理）。
+    //   处置与启用分支 R9-02 的严格策略一致：控制权未知 → 放弃写入并如实报
+    //   control_unknown；已确证被接管 → 报 overridden，绝不清除、绝不宣称直连。
+    //   注意：禁用分支的清除动作同样会触碰 chrome.proxy.settings，因此它不是
+    //   "只读路径"，不能豁免于「未确证即拒绝」。
+    var preDirect = await readProxyDetailsWithRetry(3);
+    var preDirectLevel = preDirect ? preDirect.levelOfControl : null;
+    if (!preDirectLevel) {
+      var unkDirectMsg = "未启用代理，但无法确证代理控制权（回读失败或缺少 levelOfControl），" +
+        "已放弃清除以免对外部接管方造成干扰";
+      console.warn(unkDirectMsg);
+      updateIcon("error", "control_unknown");
+      writeState({
+        status: "error",
+        reason: "control_unknown",
+        message: unkDirectMsg,
+        at: Date.now()
+      });
+      return { ok: false, status: "error", errors: [unkDirectMsg] };
+    }
+    if (!isControllableByUs(preDirectLevel)) {
+      updateIcon("overridden");
+      writeState({
+        status: "overridden",
+        levelOfControl: preDirectLevel,
+        message: "未启用代理，但当前代理设置被企业策略或其它扩展接管，本扩展未做任何改动",
+        at: Date.now()
+      });
+      return { ok: true, status: "overridden", levelOfControl: preDirectLevel };
+    }
+
     try {
       // R6-04：记录本次下发意图（直连），供 onChange 回声抑制按值比对。
       lastIntent = { mode: "direct" };
@@ -1062,6 +1097,14 @@ chrome.runtime.onInstalled.addListener(function (details) {
       if (typeof rawHost !== 'string' || !rawHost.trim()) patch.proxyHost = S.DEFAULTS.proxyHost;
       var rawPort = items && items.proxyPort;
       if (typeof rawPort !== 'string' || !rawPort.trim()) patch.proxyPort = S.DEFAULTS.proxyPort;
+      // 【A-1·审计修复】与 update 分支同一防线：sync 里残留的非法 proxyType
+      //   （历史缺陷版本写入或云端脏数据）不能原样留给下发路径 ——
+      //   install 分支此前只补空缺、不清洗非法值，与 update 分支行为不一致。
+      //   只清洗【键存在但值非法】的情形：键缺失走上面的空缺补写，正常值绝不触碰。
+      var allowedInstallTypes = S.PROXY_TYPES.map(function (pt) { return pt.value; });
+      if (items && items.proxyType && allowedInstallTypes.indexOf(items.proxyType) < 0) {
+        patch.proxyType = S.DEFAULTS.proxyType;
+      }
       // bypassList 的三态判据与 update 分支完全一致（键缺失 + local 无值 才算"从未配置"）：
       //   重装场景下 local 必然为空，但 sync 里【有】用户列表 → 不补，用户配置得以保留。
       chrome.storage.local.get(['bypassList'], function (localItems) {
@@ -1166,7 +1209,12 @@ chrome.runtime.onInstalled.addListener(function (details) {
 
         if (Object.keys(patch).length) {
           chrome.storage.sync.set(patch, function () {
-            void chrome.runtime.lastError;
+            // 【A-2·审计修复】写回失败必须留痕：此前 `void chrome.runtime.lastError`
+            //   静默吞掉补空缺的写回失败，界面与日志都无从追溯；缺省值补写失败
+            //   意味着本次升级后配置仍不完整，至少要在 SW 日志里留下线索。
+            //   不改变控制流：无论成败都继续下发（与原行为一致），只补可见性。
+            var wbErr = chrome.runtime.lastError;
+            if (wbErr) console.warn("升级补空缺写回失败:", wbErr.message);
             applyProxySerial();
           });
         } else {

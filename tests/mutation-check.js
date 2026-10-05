@@ -42,6 +42,35 @@ function detectEol(s) { return s.indexOf("\r\n") >= 0 ? "\r\n" : "\n"; }
 function toLf(s) { return s.split("\r\n").join("\n"); }
 function restoreEol(s, eol) { return eol === "\n" ? s : s.split("\n").join(eol); }
 
+// 【S-1·审计修复】工作区污染判定：变异脚本允许在有未提交改动的开发树上运行
+//   （CONTRIBUTING 的提交前自检流程本来就是「先跑变异、后提交」），因此不硬性
+//   拒绝脏工作区；但启动时快照 git status，运行结束时若三个变异目标文件
+//   （background.js / settings.js / popup.js）出现【启动时没有】的改动行，
+//   只可能是变异未还原造成的污染 —— 直接判 BAD 并以非 0 退出。
+//   判定刻意只看这三个文件：门禁运行期间维护者对其它文件（文档等）的正常
+//   编辑与本门禁无关，不构成污染，也不得因此误报。
+//   git 不可用（个别 CI 沙箱）时跳过该核验，不阻塞门禁。
+const MUTATION_TARGET_PATHS = ["background.js", "settings.js", "popup.js"];
+function mutationTargetSnapshot() {
+  const r = spawnSync("git", ["status", "--porcelain"], {
+    cwd: rootDir, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8"
+  });
+  if (r.error || r.status !== 0) return null;
+  const dirty = new Set();
+  for (const line of String(r.stdout || "").split(/\r?\n/)) {
+    if (line.length > 3 && MUTATION_TARGET_PATHS.indexOf(line.slice(3)) >= 0) {
+      dirty.add(line.slice(3));
+    }
+  }
+  return dirty;
+}
+const dirtyAtStart = mutationTargetSnapshot();
+if (dirtyAtStart && dirtyAtStart.size) {
+  console.log("提示：变异目标文件存在既有改动（" + dirtyAtStart.size + " 个，已快照）。" +
+    "门禁结束时若出现【新增】的目标文件改动，将被判定为变异污染并失败。");
+  console.log("");
+}
+
 const originals = {
   bg: fs.readFileSync(targets.bg, "utf8"),
   set: fs.readFileSync(targets.set, "utf8"),
@@ -59,6 +88,39 @@ const eol = {
   set: detectEol(originals.set),
   popup: detectEol(originals.popup)
 };
+
+// 【S-1·审计修复】信号安全还原。此前还原只靠 try/finally：
+//   进程被 SIGINT/SIGTERM/kill 或未捕获异常打断时 finally 可能根本不执行 ——
+//   实测复现过：background.js 停留在变异体上（`} else if (true) {`），
+//   后续所有测试都跑在被污染代码上。现在把还原抽成幂等函数，并注册到
+//   exit / SIGINT / SIGTERM / uncaughtException / unhandledRejection 五类出口，
+//   任何一条路径退出都会先还原。幂等性：内容与原始一致就跳过写入，
+//   重复触发（如 SIGINT 处理器之后再触发 exit）无副作用。
+function restoreAll() {
+  for (const key of Object.keys(targets)) {
+    try {
+      if (fs.readFileSync(targets[key], "utf8") !== originals[key]) {
+        fs.writeFileSync(targets[key], originals[key]);
+      }
+    } catch (e) {
+      // 还原失败只能尽力而为：exit 钩子里抛错会掩盖原始退出码。
+      // 正常路径下的还原结果由结尾的 readback 校验（restored）兜底核验。
+    }
+  }
+}
+process.on("exit", restoreAll);
+process.on("SIGINT", function () { restoreAll(); process.exit(130); });
+process.on("SIGTERM", function () { restoreAll(); process.exit(143); });
+process.on("uncaughtException", function (err) {
+  restoreAll();
+  console.error("变异测试自身抛出未捕获异常，已还原源文件：" + ((err && err.stack) || err));
+  process.exit(1);
+});
+process.on("unhandledRejection", function (err) {
+  restoreAll();
+  console.error("变异测试自身出现未处理的 Promise 拒绝，已还原源文件：" + ((err && err.stack) || err));
+  process.exit(1);
+});
 
 // 只要有一个测试文件失败，就认为变异被拦截。
 // 返回值语义（第四轮起为结构化结果，避免 -1 与断言失败混淆）：
@@ -358,9 +420,7 @@ try {
       blocked ? "已被拦截" : "未被拦截", hit, false]);
   }
 } finally {
-  fs.writeFileSync(targets.bg, originals.bg);
-  fs.writeFileSync(targets.set, originals.set);
-  fs.writeFileSync(targets.popup, originals.popup);
+  restoreAll();
 }
 
 console.log("变异测试结果：");
@@ -373,8 +433,17 @@ for (const r of rows) {
 const restored = fs.readFileSync(targets.bg, "utf8") === originals.bg &&
                  fs.readFileSync(targets.set, "utf8") === originals.set &&
                  fs.readFileSync(targets.popup, "utf8") === originals.popup;
+
+// 【S-1】工作区污染终检：与启动快照比对，变异目标文件的任何新增改动都判为污染。
+const dirtyAtEnd = mutationTargetSnapshot();
+let newDirty = [];
+if (dirtyAtStart && dirtyAtEnd) {
+  newDirty = [...dirtyAtEnd].filter(function (f) { return !dirtyAtStart.has(f); });
+  console.log("变异目标文件新增改动（污染判定）：" +
+    (newDirty.length ? JSON.stringify(newDirty) : "无"));
+}
 console.log("");
 console.log("达标 " + ok + " 项，未达标 " + miss + " 项，注入失败 " + injectFail + " 项，" +
   "门禁自身失效(BAD) " + bad + " 项");
 console.log("原文件已恢复：" + (restored ? "是" : "否"));
-process.exit((miss > 0 || injectFail > 0 || bad > 0 || !restored) ? 1 : 0);
+process.exit((miss > 0 || injectFail > 0 || bad > 0 || !restored || newDirty.length > 0) ? 1 : 0);

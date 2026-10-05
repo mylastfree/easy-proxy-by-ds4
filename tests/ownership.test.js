@@ -114,7 +114,7 @@ function buildEnv(opts) {
     Number, String, Math, Boolean, Error, AbortController
   };
   sandbox.self = sandbox; sandbox.globalThis = sandbox;
-  sandbox.importScripts = () => vm.runInContext(settingsSrc, sandbox);
+  sandbox.importScripts = () => vm.runInContext(settingsSrc, sandbox, { filename: path.join(__dirname, '..', 'settings.js') });
   sandbox.fetch = function () {
     fetchCount++; const n = fetchCount;
     return new Promise(resolve => setTimeout(() => {
@@ -215,7 +215,7 @@ function buildEnv(opts) {
   sandbox.chrome.proxy.settings._apply = applyEffective;
 
   vm.createContext(sandbox);
-  vm.runInContext(bgSrc, sandbox);
+  vm.runInContext(bgSrc, sandbox, { filename: path.join(__dirname, '..', 'background.js') });
   return { sandbox, syncStore, localStore, sessionStore, stateWrites, setCalls, setConfigs, clearCalls, timeline, fetchLog, listeners, iconCalls, titleCalls,
     getEffective: () => effective, isProxyActive: () => proxyActive,
     openWindow: () => { windowOpen = true; }, closeWindow: () => { windowOpen = false; },
@@ -1822,7 +1822,7 @@ function t(name, cond, extra) {
     const sbox = { TextEncoder: TextEncoder };
     sbox.self = sbox; sbox.globalThis = sbox;
     vm.createContext(sbox);
-    vm.runInContext(settingsSrc, sbox);
+    vm.runInContext(settingsSrc, sbox, { filename: path.join(__dirname, '..', 'settings.js') });
     const DEFAULTS = sbox.EasyProxy.DEFAULTS;
 
     function fireUpdate(env) {
@@ -1994,7 +1994,7 @@ function t(name, cond, extra) {
     const sbox8 = { TextEncoder: TextEncoder };
     sbox8.self = sbox8; sbox8.globalThis = sbox8;
     vm.createContext(sbox8);
-    vm.runInContext(settingsSrc, sbox8);
+    vm.runInContext(settingsSrc, sbox8, { filename: path.join(__dirname, '..', 'settings.js') });
     const DEFAULTS8 = sbox8.EasyProxy.DEFAULTS;
     const LONG8 = Array.from({ length: 950 }, (_, i) => "legacy-" + (i + 1) + ".internal.example").join("\n");
     // 与默认列表【等长、等条数】但内容不同的用户列表：近似判据会误伤它，逐字符判据不会。
@@ -2148,7 +2148,7 @@ function t(name, cond, extra) {
       const sboxV4 = { TextEncoder: TextEncoder };
       sboxV4.self = sboxV4; sboxV4.globalThis = sboxV4;
       vm.createContext(sboxV4);
-      vm.runInContext(settingsSrc, sboxV4);
+      vm.runInContext(settingsSrc, sboxV4, { filename: path.join(__dirname, '..', 'settings.js') });
       const DEFAULT_V4 = sboxV4.EasyProxy.DEFAULTS;
 
       function fireInstall(env) {
@@ -2373,6 +2373,53 @@ function t(name, cond, extra) {
     t("C-1-i legacyClearFailed 列出失败的作用域",
       Array.isArray(stB.legacyClearFailed) && stB.legacyClearFailed.indexOf("incognito_persistent") >= 0,
       "lastState=" + JSON.stringify(stB));
+  }
+
+  console.log("");
+  console.log("== M-1：禁用路径写前控制权确证（审计修复护栏）==");
+  {
+    // 修复前：禁用分支不做任何控制权检查就 clearProxyScope("regular") 并宣称 direct。
+    //   外部接管 + 未启用时，这次 clear 要么无效要么构成夺权式写入，而状态却被写成
+    //   "direct" —— 与项目反复修复的「状态≠事实」缺陷族同型。修复后与启用分支
+    //   R9-02 同一基调：未知即拒绝（control_unknown）、被接管即报 overridden。
+    {
+      const env = buildEnv({ fetchDelay: 20 });
+      await ready(env, "10808");
+      env.externalSet("controlled_by_other_extensions", "10.0.0.1", "10810");
+      // 冷启动与启用阶段已有合法 clear（遗留作用域清理），这里只断言
+      // 【禁用这次 apply】不新增任何 clear —— 快照后增量必须为 0。
+      const clearsBefore = env.clearCalls.length;
+      await setSync(env, Object.assign({}, BASE, { enableProxy: false }));
+      await drain(env);
+      const st = env.sessionStore.lastState || {};
+      t("M-1-a 外部接管下禁用：状态为 overridden（不得宣称 direct）",
+        st.status === "overridden", "lastState=" + JSON.stringify(st));
+      t("M-1-b 外部接管下禁用：绝不清除任何作用域（不夺权）",
+        env.clearCalls.length === clearsBefore,
+        "clears=" + JSON.stringify(env.clearCalls) + "（快照前 " + clearsBefore + "）");
+      t("M-1-c 外部接管下禁用：如实记录接管的控制方",
+        st.levelOfControl === "controlled_by_other_extensions",
+        "levelOfControl=" + JSON.stringify(st.levelOfControl));
+      t("M-1-d 外部接管下禁用：说明文案点明本扩展未做任何改动",
+        typeof st.message === "string" && st.message.indexOf("未做任何改动") >= 0,
+        "message=" + JSON.stringify(st.message));
+    }
+    {
+      const env = buildEnv({ fetchDelay: 20 });
+      await ready(env, "10808");
+      // 回读结果缺 levelOfControl = 控制权未知（与 R3-04-R1 同一模拟手法）
+      env.setGetHook((n, o, cb) => { setTimeout(() => cb({ value: { mode: "direct" } }), 0); });
+      const clearsBeforeF = env.clearCalls.length;
+      await setSync(env, Object.assign({}, BASE, { enableProxy: false }));
+      await drain(env);
+      const st = env.sessionStore.lastState || {};
+      t("M-1-e 控制权未知时禁用：报 control_unknown（放弃清除）",
+        st.status === "error" && st.reason === "control_unknown",
+        "lastState=" + JSON.stringify(st));
+      t("M-1-f 控制权未知时禁用：绝不清除任何作用域",
+        env.clearCalls.length === clearsBeforeF,
+        "clears=" + JSON.stringify(env.clearCalls) + "（快照前 " + clearsBeforeF + "）");
+    }
   }
 
   console.log("");

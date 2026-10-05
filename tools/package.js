@@ -8,16 +8,19 @@
 //   dist/easy-proxy-by-ds4-<version>/，并打印产物清单供人工核对。
 // 可复现性：产物内容完全由文件清单决定，清单与 manifest.version 进 git，任何人在
 //   任意机器上对同一提交执行本脚本都得到逐字节相同的产物（纯复制，无构建步骤）。
+//
+// 【M-2·审计修复】本脚本是发布产物的唯一来源，此前零测试、CI 不跑打包。
+//   现在把「清单校验」与「复制动作」抽成可注入 destRoot 的纯函数并导出，
+//   tests/manifest.test.js 直接对它们断言（产物清单、排除契约、逐字节保真）；
+//   脚本本体仅在直接执行时进入 main()，被 require 时零副作用。
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.join(__dirname, "..");
-const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
-const version = manifest.version;
 
 // 运行时文件清单 = manifest 直接或间接引用的文件 + manifest 自身。
-// 新增源文件时必须同步此清单（清单缺失会在下方存在性校验中报错）。
+// 新增源文件时必须同步此清单（清单缺失会在 missingFromManifest / pack 中报错）。
 const RUNTIME_FILES = [
   "manifest.json",
   "settings.js",
@@ -34,37 +37,60 @@ const RUNTIME_FILES = [
   "icon-green-128.png"
 ];
 
-// 校验：manifest 引用到的每个文件都必须在清单里（防止加文件忘了同步）
-const referenced = new Set();
-referenced.add(manifest.background && manifest.background.service_worker);
-referenced.add(manifest.action && manifest.action.default_popup);
-for (const k of Object.keys(manifest.icons || {})) referenced.add(manifest.icons[k]);
-for (const k of Object.keys((manifest.action && manifest.action.default_icon) || {})) {
-  referenced.add(manifest.action.default_icon[k]);
-}
-const missing = [...referenced].filter(f => f && !RUNTIME_FILES.includes(f));
-if (missing.length) {
-  console.error("错误：manifest 引用的文件未包含在打包清单中：" + missing.join(", "));
-  process.exit(1);
+// 校验：manifest 引用到的每个文件都必须在清单里（防止加文件忘了同步）。
+// 纯函数：不读盘、不退出进程，返回缺失文件数组（空数组 = 通过）。
+function missingFromManifest(manifest, files) {
+  const list = files || RUNTIME_FILES;
+  const referenced = new Set();
+  referenced.add(manifest.background && manifest.background.service_worker);
+  referenced.add(manifest.action && manifest.action.default_popup);
+  for (const k of Object.keys(manifest.icons || {})) referenced.add(manifest.icons[k]);
+  for (const k of Object.keys((manifest.action && manifest.action.default_icon) || {})) {
+    referenced.add(manifest.action.default_icon[k]);
+  }
+  return [...referenced].filter(f => f && !list.includes(f));
 }
 
-const dest = path.join(root, "dist", "easy-proxy-by-ds4-" + version);
-fs.rmSync(dest, { recursive: true, force: true });
-fs.mkdirSync(dest, { recursive: true });
+// 打包到 <destRoot>/easy-proxy-by-ds4-<version>/，返回 { dest, version, copied }。
+// 纯复制，无构建步骤；发现清单缺失或源文件不存在时抛错（由调用方决定如何呈现）。
+function pack(destRoot) {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
+  const version = manifest.version;
+  const missing = missingFromManifest(manifest);
+  if (missing.length) {
+    throw new Error("manifest 引用的文件未包含在打包清单中：" + missing.join(", "));
+  }
+  const dest = path.join(destRoot, "easy-proxy-by-ds4-" + version);
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(dest, { recursive: true });
+  const copied = [];
+  for (const f of RUNTIME_FILES) {
+    const src = path.join(root, f);
+    if (!fs.existsSync(src)) {
+      throw new Error("清单中的文件不存在：" + f);
+    }
+    fs.copyFileSync(src, path.join(dest, f));
+    copied.push(f);
+  }
+  return { dest, version, copied };
+}
 
-console.log("打包 easy-proxy-by-ds4 v" + version + " -> " + path.relative(root, dest));
-for (const f of RUNTIME_FILES) {
-  const src = path.join(root, f);
-  if (!fs.existsSync(src)) {
-    console.error("错误：清单中的文件不存在：" + f);
+function main() {
+  try {
+    const { dest, version, copied } = pack(path.join(root, "dist"));
+    console.log("打包 easy-proxy-by-ds4 v" + version + " -> " + path.relative(root, dest));
+    for (const f of copied) {
+      console.log("  + " + f + "  (" + fs.statSync(path.join(root, f)).size + " B)");
+    }
+    console.log("");
+    console.log("已排除非运行文件：tests/、.github/、docs、元文件与依赖目录。");
+    console.log("产物就绪：" + path.relative(root, dest));
+  } catch (e) {
+    console.error("错误：" + (e && e.message || e));
     process.exit(1);
   }
-  fs.copyFileSync(src, path.join(dest, f));
-  console.log("  + " + f + "  (" + fs.statSync(src).size + " B)");
 }
 
-// 刻意排除（A3）：tests/、.github/、.editorconfig、CHANGELOG.md、README.md、
-//   SECURITY.md、LICENSE、package.json、eslint.config.mjs、tools/、node_modules/
-console.log("");
-console.log("已排除非运行文件：tests/、.github/、docs、元文件与依赖目录。");
-console.log("产物就绪：" + path.relative(root, dest));
+if (require.main === module) main();
+
+module.exports = { RUNTIME_FILES, missingFromManifest, pack };

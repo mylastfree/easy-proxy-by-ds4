@@ -185,6 +185,79 @@ console.log("== 文档声明数一致性（G1：合计 = 各行之和；变异�
   t("README 声明的变异数与 mutation-check.js 实际定义数一致",
     !!declaredMut && Number(declaredMut) === mutationCount,
     "README=" + (declaredMut || "未声明") + "；实际=" + mutationCount);
+
+  // 【S-2·审计修复】G1 扩展：CONTRIBUTING.md / ARCHITECTURE.md / ci.yml 里的同类
+  //   数值声明此前只靠人工维护，已经漂移过一次（文档写 616/19/18，实际 683/23）。
+  //   现在与 README 同规则把守：凡出现数值声明，必须与实际一致，漂移即 CI 变红。
+  const totalAsserts = rows.reduce((a, b) => a + b, 0);
+  const contrib = read("CONTRIBUTING.md");
+  const arch = read("ARCHITECTURE.md");
+  const ciSrc = read(".github/workflows/ci.yml");
+  const contribAsserts = (contrib.match(/功能测试（(\d+) 项断言/) || [])[1];
+  t("CONTRIBUTING.md 声明的断言数与实际一致",
+    !!contribAsserts && Number(contribAsserts) === totalAsserts,
+    "CONTRIBUTING=" + (contribAsserts || "未声明") + "；实际=" + totalAsserts);
+  const contribMut = (contrib.match(/变异门禁（(\d+) 项/) || [])[1];
+  t("CONTRIBUTING.md 声明的变异数与实际一致",
+    !!contribMut && Number(contribMut) === mutationCount,
+    "CONTRIBUTING=" + (contribMut || "未声明") + "；实际=" + mutationCount);
+  const archAsserts = (arch.match(/功能测试（(\d+) 项断言/) || [])[1];
+  t("ARCHITECTURE.md 声明的断言数与实际一致",
+    !!archAsserts && Number(archAsserts) === totalAsserts,
+    "ARCHITECTURE=" + (archAsserts || "未声明") + "；实际=" + totalAsserts);
+  const archMut = (arch.match(/变异门禁（(\d+) 项/) || [])[1];
+  t("ARCHITECTURE.md 声明的变异数与实际一致",
+    !!archMut && Number(archMut) === mutationCount,
+    "ARCHITECTURE=" + (archMut || "未声明") + "；实际=" + mutationCount);
+  const ciMut = (ciSrc.match(/完整变异门禁（(\d+) 个变异）/) || [])[1];
+  t("ci.yml 注释中的变异数与实际一致",
+    !!ciMut && Number(ciMut) === mutationCount,
+    "ci.yml=" + (ciMut || "未声明") + "；实际=" + mutationCount);
+}
+
+console.log("");
+console.log("== 打包脚本（M-2：发布产物的唯一来源必须有测试护栏）==");
+{
+  const os = require("node:os");
+  const { RUNTIME_FILES, missingFromManifest, pack } = require("../tools/package.js");
+
+  t("真实 manifest.json 的全部引用都在打包清单中",
+    missingFromManifest(mf).length === 0,
+    JSON.stringify(missingFromManifest(mf)));
+
+  // 注入一个清单未收录的引用，必须被逐名检出（护栏有效性自证）
+  const fake = JSON.parse(JSON.stringify(mf));
+  fake.action.default_popup = "popup2.html";
+  t("清单遗漏 manifest 引用会被检出",
+    JSON.stringify(missingFromManifest(fake)) === JSON.stringify(["popup2.html"]),
+    JSON.stringify(missingFromManifest(fake)));
+
+  // 打包到临时目录做产物断言，不污染仓库工作区
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "easy-proxy-pack-"));
+  try {
+    const { dest, version, copied } = pack(tmp);
+    t("pack 返回的复制清单与 RUNTIME_FILES 一致",
+      JSON.stringify([...copied].sort()) === JSON.stringify([...RUNTIME_FILES].sort()),
+      JSON.stringify(copied));
+    const produced = fs.readdirSync(dest).sort();
+    t("产物目录内容与打包清单完全一致（无多余、无遗漏）",
+      JSON.stringify(produced) === JSON.stringify([...RUNTIME_FILES].sort()),
+      JSON.stringify(produced));
+    t("产物目录名与 manifest.version 一致",
+      path.basename(dest) === "easy-proxy-by-ds4-" + version,
+      path.basename(dest));
+    t("产物不含 tests/ 与 node_modules/（A3 排除契约）",
+      !fs.existsSync(path.join(dest, "tests")) &&
+      !fs.existsSync(path.join(dest, "node_modules")));
+    t("产物 manifest.json 与源文件逐字节一致",
+      fs.readFileSync(path.join(dest, "manifest.json"))
+        .equals(fs.readFileSync(path.join(rootDir, "manifest.json"))));
+    t("产物 popup.js 与源文件逐字节一致",
+      fs.readFileSync(path.join(dest, "popup.js"))
+        .equals(fs.readFileSync(path.join(rootDir, "popup.js"))));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 console.log("");

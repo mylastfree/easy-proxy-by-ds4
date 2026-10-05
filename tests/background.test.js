@@ -76,7 +76,7 @@ function buildEnv(opts) {
   };
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
-  sandbox.importScripts = () => vm.runInContext(settingsSrc, sandbox);
+  sandbox.importScripts = () => vm.runInContext(settingsSrc, sandbox, { filename: path.join(__dirname, '..', 'settings.js') });
 
   sandbox.fetch = (url, init) => {
     fetchCount++;
@@ -167,7 +167,7 @@ function buildEnv(opts) {
   };
 
   vm.createContext(sandbox);
-  vm.runInContext(bgSrc, sandbox);
+  vm.runInContext(bgSrc, sandbox, { filename: path.join(__dirname, '..', 'background.js') });
 
   return { sandbox, syncStore, localStore, sessionStore, applied, listeners,
            getProxyActive: () => proxyActive,
@@ -252,7 +252,7 @@ function t(name, cond, extra) {
       const sb = { TextEncoder, console };
       sb.globalThis = sb;
       vm.createContext(sb);
-      vm.runInContext(settingsSrc, sb);
+      vm.runInContext(settingsSrc, sb, { filename: path.join(__dirname, '..', 'settings.js') });
       return sb.EasyProxy;
     })();
     // 修复后 settings.js 应导出 resolveBypassList
@@ -275,7 +275,7 @@ function t(name, cond, extra) {
       const sb = { TextEncoder, console };
       sb.globalThis = sb;
       vm.createContext(sb);
-      vm.runInContext(settingsSrc, sb);
+      vm.runInContext(settingsSrc, sb, { filename: path.join(__dirname, '..', 'settings.js') });
       return sb.EasyProxy;
     })();
     t("192.168.0.0/16 仍识别为网段", S.parseBypassList("192.168.0.0/16")[0] === "192.168.0.0/16");

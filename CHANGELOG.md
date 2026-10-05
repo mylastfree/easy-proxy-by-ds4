@@ -2,6 +2,36 @@
 
 本文件记录本扩展的所有重要变更。
 
+## [2.10.0] - 2026-10-05
+
+关闭 v2.9.0 独立生产上线前复审的全部问题：2 项严重（S-1 / S-2）、5 项一般（M-1 / M-2 / M-3 / M-4 / M-5）、6 项建议（A-1 – A-6）。测试从 683 项断言扩至 **702 项**（变异门禁仍 23 项，全部拦截）；新增 c8 覆盖率门禁（`npm run coverage`）与真实浏览器 E2E 冒烟清单（`docs/E2E-SMOKE.md`）。新增可观察契约（未启用分支新增 `reason:"control_unknown"` 与被接管时的 `status:"overridden"` 上报；出口测试在启用代理时渲染第三方出口知情提示），按仓库惯例升 minor。
+
+### 修复（严重）
+
+- **S-1（P0）变异脚本非信号安全**：`tests/mutation-check.js` 此前只靠 `try/finally` 还原被变异的源文件，进程被 SIGINT/SIGTERM/kill 或未捕获异常打断时还原不执行 —— 实测复现过 `background.js` 停留在变异体上，后续全部测试跑在被污染代码上（若此时打包会把变异代码发出去）。修复：还原动作抽成幂等函数并注册到 `exit` / `SIGINT` / `SIGTERM` / `uncaughtException` / `unhandledRejection` 五类出口；启动时快照 `git status --porcelain`，结束时任何【新增】工作区改动判为变异污染并以非 0 退出（既有改动的开发树仍可运行，不阻断「提交前先跑变异」流程）。
+- **S-2（P0）质量数字文档漂移**：`CONTRIBUTING.md` / `ARCHITECTURE.md` 写 616 项断言 / 19 项变异、`ci.yml` 注释写 18 个变异，实际为 683 / 23。根因是 G1 一致性门禁只解析 README。修复：数值全部按实测同步，并把 CONTRIBUTING / ARCHITECTURE / ci.yml 的同类声明纳入 `manifest.test.js` 的 G1 扩展守卫 —— 此后再漂移 CI 直接变红。
+
+### 修复（一般）
+
+- **M-1（P1）禁用路径缺写前控制权确证**：未启用分支此前不做任何控制权检查就清除 `regular` 并宣称 `direct`；外部接管 + 未启用时构成夺权式写入且状态与事实相反。修复：与启用分支 R9-02 同一基调 —— 控制权未知（有界重试后仍读不到 `levelOfControl`）报 `error/reason:"control_unknown"` 并放弃清除；已确证被接管报 `status:"overridden"` 并如实记录控制方，绝不清除。新增 6 项断言（ownership M-1 段）。
+- **M-2（P2）打包脚本零测试、CI 不跑打包**：`tools/package.js` 是发布产物唯一来源却零护栏。修复：重构为可 require 的纯函数（`missingFromManifest` / `pack`，`require.main` 守卫零副作用），`manifest.test.js` 新增 8 项断言（清单覆盖、注入检出、临时目录产物逐文件比对、A3 排除契约、manifest/popup 逐字节保真）；CI 新增「打包脚本自检」步骤。
+- **M-3（P2）超长列表保存非原子**：先写 `local` 再写 sync 占位，sync 失败会留下「sync 旧值遮蔽 local 新列表」的不一致中间态（后续保存可能经 `clearLocalBypassIfAny` 演变为数据丢失）。修复：有序写入改为「先写 sync 空串占位、后写 local」—— 两个失败模式都收敛为「如实报错、生效值回退旧 local」，不再产生遮蔽中间态。
+- **M-4（P2）无覆盖率度量、无真实浏览器 E2E**：新增 `c8` 覆盖率门禁（`npm run coverage`，CI 仅 Node 22 跑一次）：`background.js` 94.5% / `settings.js` 99.4% / `popup.js` 91.1% 行覆盖（函数 100%）。测试以 `vm.runInContext` 注入源码时统一补 `filename` 参数，使 V8 覆盖块可映射回源文件；`npm test` 收敛到 `tests/run-all.js` 统一入口（修复 c8 在 Windows 上无法包装 npm.cmd 的问题）。新增 `docs/E2E-SMOKE.md` 发布前人工冒烟清单。
+- **M-5（P2）CI 用 `npm install` 与可复现声明不一致**：改为 `npm ci`，lockfile 不同步时快速失败。
+
+### 修复（建议）
+
+- **A-1** install 分支补缺时同步清洗非法 `proxyType`（与 update 分支同一防线）。
+- **A-2** update 补缺写回的 `chrome.runtime.lastError` 由静默吞掉改为 `console.warn` 留痕。
+- **A-3** `escapeHtml` 补转义单引号（按最坏属性上下文假设的纵深防御）。
+- **A-4** `popup.html` 清除最后两处残留内联 style（`btns.tight` / `test-result` 类）。
+- **A-5** 清理已合并的残留 worktree `fix-round5-p2` / `fix-round6-p1` 及对应分支。
+- **A-6** 第三方出口知情提示前移到 UI：出口测试在启用代理时如实说明「流量经该代理服务器出去、其运营方可见目标地址」。
+
+### 其他
+
+- 版本 2.9.0 → 2.10.0（manifest / package / lock / README 同步）；测试断言数 702、覆盖率与 E2E 冒烟清单见 README「开发与测试」。
+
 ## [2.9.0] - 2026-10-05
 
 关闭第二轮生产上线前审计的全部「严重」与「一般」问题：3 项严重（C-1 / C-2 / C-3）、6 项一般（M-1 – M-6）。新增可观察契约（`storage.local` 新键 `stateWriteFailed`、direct 状态新增 `legacyClearFailed` 字段、出口检测新增备用端点 `TEST_ENDPOINTS`），按仓库惯例升 minor。测试从 616 项断言扩至 **683 项**，变异门禁从 19 项扩至 **23 项**。

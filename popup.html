@@ -52,6 +52,9 @@
     /* 【A5】测试结果区的两档文字色，供 popup.js 的动态渲染使用（替代内联 style） */
     .t-muted { color: #5a6772; }
     .t-error { color: #a3251b; }
+    /* 【A-4·审计修复】清除静态标记里的残留内联 style：样式只走类，消除双轨 */
+    .btns.tight { margin-top: 0; }
+    .test-result { margin-top: 10px; color: #5a6772; }
   </style>
 </head>
 <body>
@@ -106,11 +109,11 @@ Chrome 已默认直连，无需手动填写。</pre>
 
   <div class="panel">
     <h4>连接测试</h4>
-    <div class="btns" style="margin-top:0">
+    <div class="btns tight">
       <button id="testButton">测试当前出口</button>
       <button id="testDirectButton">对比直连出口</button>
     </div>
-    <div id="testResult" class="kv" style="margin-top:10px;color:#5a6772">
+    <div id="testResult" class="kv test-result">
       尚未测试。点击「测试当前出口」查看流量实际从哪里出去。
     </div>
   </div>

@@ -16,7 +16,7 @@ jobs:
   test:
     name: 测试与校验
     runs-on: ubuntu-latest
-    # 【R-6】本 job 跑七套测试 + 完整变异门禁（18 个变异），实测本机约 15 分钟、
+    # 【R-6】本 job 跑七套测试 + 完整变异门禁（23 个变异），实测本机约 15 分钟、
     #   GitHub 上约 8-9 分钟。GitHub 默认 job 上限 6 小时，理论上不会超时；
     #   显式设定是为了在门禁被意外放大（例如变异数量翻倍）时【快速失败】，
     #   而不是让一个失控的 job 静默占用长达 6 小时的 runner。
@@ -40,11 +40,13 @@ jobs:
           node-version: ${{ matrix.node-version }}
 
       # 【A1】静态 lint 作为 CI 的首个失败点（核心规则：no-undef / no-unused-vars 等；
-      #   本仓库曾靠它抓到一处真实的块级作用域逃逸）。devDependencies 仅含 eslint，
-      #   运行时依旧零依赖。
+      #   本仓库曾靠它抓到一处真实的块级作用域逃逸）。devDependencies 仅含 eslint 与
+      #   c8（覆盖率），运行时依旧零依赖。
+      # 【M-5·审计修复】npm install → npm ci：严格按 package-lock 安装，
+      #   与「可复现」声明一致；lockfile 不同步时直接失败而不是静默解析新版本。
       - name: Lint（ESLint）
         run: |
-          npm install --no-fund --no-audit
+          npm ci --no-fund --no-audit
           npm run lint
 
       # 本项目运行时零依赖，无需额外安装 —— 直接跑测试
@@ -80,6 +82,16 @@ jobs:
 
       - name: popup 交互测试（R7-08：异常必须复位按钮）
         run: node tests/popup.test.js
+
+      # 【M-2·审计修复】发布产物的唯一来源必须在 CI 可复现：跑一次真实打包。
+      #   dist/ 在 .gitignore 中，不会影响后续的「工作区洁净」核验。
+      - name: 打包脚本自检（产物可复现）
+        run: npm run package
+
+      # 【M-4·审计修复】覆盖率度量：矩阵只跑一次（Node 22），不拖慢其余节点。
+      - name: 覆盖率（c8，仅 Node 22）
+        if: matrix.node-version == 22
+        run: npm run coverage
 
       # 发布 tag 一致性（R3-02）：tag 触发时，tag 名必须与 manifest.version 完全对应。
       # 只校验，不创建也不移动 tag —— 创建正式 tag 属于发布动作。
