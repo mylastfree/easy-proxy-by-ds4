@@ -1,4 +1,4 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.9.0]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.10.0]
 var S = window.EasyProxy;
 
 // 【M-1】用户可直接编辑的表单字段。storage 变化触发的表单重绘，

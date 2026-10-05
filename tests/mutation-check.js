@@ -96,6 +96,19 @@ const eol = {
 //   exit / SIGINT / SIGTERM / uncaughtException / unhandledRejection 五类出口，
 //   任何一条路径退出都会先还原。幂等性：内容与原始一致就跳过写入，
 //   重复触发（如 SIGINT 处理器之后再触发 exit）无副作用。
+// 【B-3·上线准入修复】变异运行哨兵。
+//   事故背景：dist/easy-proxy-by-ds4-2.10.0/popup.js 曾被写入 M22 的变异体
+//   （`function activeEditableId() {\n  return null;\n  ...`，与下方 M22 的 to 串
+//   逐字节一致）—— 说明打包动作发生在变异运行期间，把变异体复制进了发布产物。
+//   一旦这样的产物上传商店，用户拿到的是被故意破坏的代码。
+//   处置：开始改写源文件之前落一个哨兵文件，还原时一并清除（挂在同一个幂等
+//   函数上，保证不会出现「源文件已还原但哨兵仍在」的假锁定）；
+//   tools/package.js 见到哨兵即拒绝打包。一个写、一个拒，构成互斥。
+const SENTINEL = path.join(rootDir, ".mutation-in-progress");
+function removeSentinel() {
+  try { fs.rmSync(SENTINEL, { force: true }); } catch (e) { /* 尽力而为 */ }
+}
+
 function restoreAll() {
   for (const key of Object.keys(targets)) {
     try {
@@ -107,6 +120,10 @@ function restoreAll() {
       // 正常路径下的还原结果由结尾的 readback 校验（restored）兜底核验。
     }
   }
+  // 【B-3】哨兵与源文件还原同生共死：挂在同一个幂等函数上，
+  //   五类退出路径（exit / SIGINT / SIGTERM / uncaughtException /
+  //   unhandledRejection）都会走到这里，因此不会留下假锁定。
+  removeSentinel();
 }
 process.on("exit", restoreAll);
 process.on("SIGINT", function () { restoreAll(); process.exit(130); });
@@ -385,6 +402,17 @@ console.log("");
 
 const rows = [];
 let ok = 0, miss = 0, bad = 0, injectFail = 0;
+
+// 【B-3】进入变异循环前落哨兵，让并发进行的打包动作立刻失败。
+//   写不进去就中止门禁：宁可这次不跑变异，也不能在「无法声明自己正在变异」
+//   的状态下改写源文件 —— 那正是事故发生时无人察觉的窗口。
+try {
+  fs.writeFileSync(SENTINEL, JSON.stringify({ pid: process.pid, at: Date.now() }));
+} catch (e) {
+  console.error("无法写入变异哨兵文件（" + SENTINEL + "），" +
+    "为避免产出被污染的发布包，门禁中止：" + ((e && e.message) || e));
+  process.exit(1);
+}
 
 try {
   for (const m of mutations) {

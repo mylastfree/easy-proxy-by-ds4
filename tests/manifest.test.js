@@ -50,6 +50,36 @@ console.log("== 发布一致性：manifest.version 与 CHANGELOG 首条必须对
 }
 
 console.log("");
+console.log("== 发布一致性：三个源文件头 [vX.Y.Z] 必须与 manifest.version 对齐 ==");
+{
+  // 【B-2·审计修复】CONTRIBUTING.md 声明「版本号必须四处同步：manifest.json、
+  //   三个源文件头（[vX.Y.Z]）、README.md、CHANGELOG.md 首条 —— tests/manifest.test.js
+  //   与各文件的 G1 自检会拦截不一致」。
+  //   但实测这条断言此前【根本不存在】：2.10.0 提交里 background.js / popup.js /
+  //   settings.js 的文件头仍停留在 [v2.9.0]（提交改了 background.js 50 行、
+  //   popup.js 28 行，唯独第 1 行版本号没碰），CI 却一路全绿 ——
+  //   文档承诺的门禁是【假的】。这里补上，让声明变成事实。
+  //
+  //   额外一条「正则必须匹配到每个文件」是必需的：若只做逐文件比对，
+  //   一旦文件头格式漂移（例如去掉 [vX.Y.Z] 标记），match 返回 null，
+  //   比对会因 undefined === undefined 之外的情形而静默通过 —— 重演同一个坑。
+  const SRC_FILES = ["background.js", "popup.js", "settings.js"];
+  const headerVersion = (src) => {
+    const m = src.match(/^\/\/[^\n]*\[v(\d+\.\d+\.\d+)\]/m);
+    return m ? m[1] : null;
+  };
+  const declared = SRC_FILES.map((f) => headerVersion(read(f)));
+  t("三个源文件都能解析出版本头 [vX.Y.Z]（防格式漂移导致静默通过）",
+    declared.every((v) => v !== null),
+    SRC_FILES.map((f, i) => f + "=" + JSON.stringify(declared[i])).join("；"));
+  SRC_FILES.forEach((f, i) => {
+    t(f + " 文件头版本与 manifest.version 一致",
+      declared[i] === mf.version,
+      f + "=" + declared[i] + " / manifest=" + mf.version);
+  });
+}
+
+console.log("");
 console.log("== 权限最小化 ==");
 const perms = (mf.permissions || []).slice().sort();
 t("权限恰为 proxy + storage",
@@ -255,6 +285,28 @@ console.log("== 打包脚本（M-2：发布产物的唯一来源必须有测试�
     t("产物 popup.js 与源文件逐字节一致",
       fs.readFileSync(path.join(dest, "popup.js"))
         .equals(fs.readFileSync(path.join(rootDir, "popup.js"))));
+
+    // 【B-3】变异哨兵互斥：哨兵在位时打包必须失败。
+    //   事故背景：dist/ 里曾出现 M22 变异体（packaging 跑在变异运行期间）。
+    //   这条断言证明「打包脚本自己拦得住」，而不是靠人记得不要并发。
+    {
+      const sentinel = path.join(rootDir, ".mutation-in-progress");
+      const existed = fs.existsSync(sentinel);
+      const backup = existed ? fs.readFileSync(sentinel, "utf8") : null;
+      try {
+        fs.writeFileSync(sentinel, JSON.stringify({ pid: 0, at: 0 }));
+        let threw = null;
+        try { pack(tmp); } catch (e) { threw = e; }
+        t("变异哨兵在位时 pack 必须拒绝打包（B-3：防止产物含变异体）",
+          !!threw && /变异测试正在运行/.test(threw.message),
+          threw ? threw.message : "未抛错（护栏失效）");
+      } finally {
+        // 严格还原现场：原本没有哨兵就必须删掉，避免在仓库根留下残留文件。
+        if (existed && backup !== null) fs.writeFileSync(sentinel, backup);
+        else fs.rmSync(sentinel, { force: true });
+      }
+      t("B-3 断言结束后哨兵已清除（不污染工作区）", !fs.existsSync(sentinel));
+    }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

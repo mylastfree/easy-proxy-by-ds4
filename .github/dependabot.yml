@@ -2,6 +2,12 @@
 # 供应链最小信任的配套措施：本仓库运行时零依赖，唯一的依赖面是 CI 的 GitHub Actions。
 # dependabot 每周核查 actions 升级并开 PR，升级经人工评审后合入 ——
 # 与 ci.yml 中「Actions 固定到 commit SHA」配合：SHA 保证不可变，dependabot 保证可升级。
+#
+# 【C-3·上线准入修复】原配置只覆盖 github-actions，devDependencies
+#   （eslint / c8 及其上百个传递依赖）既不在自动升级范围内，CI 又用
+#   --no-audit 关闭了审计 —— npm 依赖侧完全没有持续防线。
+#   当前实测 0 漏洞、且运行时零依赖，实际风险面很小，但「今天安全 ≠ 明天安全」，
+#   防线必须在流水线里，而不是靠人记得手动跑一次 npm audit。
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -11,3 +17,14 @@ updates:
     commit-message:
       prefix: "ci"
     labels: ["ci"]
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # 运行时零依赖，因此升级范围只涉及开发工具；分组的目的是避免
+    # eslint / c8 的传递依赖各开一个 PR 造成噪音。
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels: ["dependencies"]

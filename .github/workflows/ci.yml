@@ -49,6 +49,15 @@ jobs:
           npm ci --no-fund --no-audit
           npm run lint
 
+      # 【C-3·上线准入修复】依赖漏洞门禁。
+      #   此前 dependabot 只覆盖 github-actions，本步骤又不存在，而 npm ci 还带着
+      #   --no-audit —— npm 侧（eslint / c8 及其传递依赖）完全没有持续防线。
+      #   运行时零依赖使风险面很小，但防线必须在流水线里：新增 CVE 时应当直接变红，
+      #   而不是靠维护者记得手动跑一次。
+      #   阈值取 high：moderate/low 多为开发工具的传递依赖噪音，不阻断发布。
+      - name: 依赖漏洞审计（npm audit）
+        run: npm audit --audit-level=high
+
       # 本项目运行时零依赖，无需额外安装 —— 直接跑测试
       - name: 语法校验
         run: |

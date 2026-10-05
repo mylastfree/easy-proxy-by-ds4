@@ -28,3 +28,8 @@ coverage/
 #   CI 有「变异后 git status --porcelain 必须为空」的硬门禁，
 #   未跟踪的本地目录会被误判为变异未还原造成的污染。
 .workbuddy/
+
+# 变异运行哨兵（B-3）：变异期间存在，tools/package.js 见到即拒绝打包。
+#   不忽略它，一旦变异进程被 kill -9 残留，会被洁净门禁误判为污染；
+#   同时它也是「当前正在变异」的唯一对外信号。
+.mutation-in-progress

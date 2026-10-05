@@ -4,7 +4,7 @@
 
 ## [2.10.0] - 2026-10-05
 
-关闭 v2.9.0 独立生产上线前复审的全部问题：2 项严重（S-1 / S-2）、5 项一般（M-1 / M-2 / M-3 / M-4 / M-5）、6 项建议（A-1 – A-6）。测试从 683 项断言扩至 **702 项**（变异门禁仍 23 项，全部拦截）；新增 c8 覆盖率门禁（`npm run coverage`）与真实浏览器 E2E 冒烟清单（`docs/E2E-SMOKE.md`）。新增可观察契约（未启用分支新增 `reason:"control_unknown"` 与被接管时的 `status:"overridden"` 上报；出口测试在启用代理时渲染第三方出口知情提示），按仓库惯例升 minor。
+关闭 v2.9.0 独立生产上线前复审的全部问题：2 项严重（S-1 / S-2）、5 项一般（M-1 / M-2 / M-3 / M-4 / M-5）、6 项建议（A-1 – A-6）。测试从 683 项断言扩至 **708 项**（变异门禁仍 23 项，全部拦截）；新增 c8 覆盖率门禁（`npm run coverage`）与真实浏览器 E2E 冒烟清单（`docs/E2E-SMOKE.md`）。新增可观察契约（未启用分支新增 `reason:"control_unknown"` 与被接管时的 `status:"overridden"` 上报；出口测试在启用代理时渲染第三方出口知情提示），按仓库惯例升 minor。
 
 ### 修复（严重）
 
@@ -31,6 +31,16 @@
 ### 其他
 
 - 版本 2.9.0 → 2.10.0（manifest / package / lock / README 同步）；测试断言数 702、覆盖率与 E2E 冒烟清单见 README「开发与测试」。
+
+### 上线准入收尾（提审前第三次审计）
+
+发布物本身未变（2.10.0 尚未发布、未打 tag），以下均为**发布治理**层面的修复，不涉及运行时行为、不新增可观察契约、不改存储键：
+
+- **B-2 假绿门禁**：`CONTRIBUTING.md` 声明「三个源文件头（`[vX.Y.Z]`）由 `tests/manifest.test.js` 与 G1 自检拦截」，但实测该断言**根本不存在** —— 2.10.0 提交里 `background.js` / `popup.js` / `settings.js` 的文件头仍停在 `[v2.9.0]`，CI 却一路全绿。修复：文件头对齐至 `2.10.0`；`manifest.test.js` 新增 4 条断言（逐文件比对 + 「正则必须匹配到每个文件」防格式漂移静默通过）。
+- **C-1 根因（发布产物被变异污染）**：`dist/easy-proxy-by-ds4-2.10.0/popup.js` 中曾残留 M22 变异体（`activeEditableId` 被改成恒返回 `null`，与 `tests/mutation-check.js` 的 `to` 串逐字节一致）—— 打包动作跑在变异运行期间，把故意破坏的代码复制进了发布产物。修复：`tests/mutation-check.js` 在改写源文件前落哨兵 `.mutation-in-progress`（与 `restoreAll` 同生共死，五类退出路径均清除）；`tools/package.js` 见哨兵即拒绝打包，并在复制完成后逐字节自校验产物（覆盖「打包中途源文件被改写」的竞态），不一致即删除产物并报错。`manifest.test.js` 新增 2 条断言固化该互斥。
+- **C-3 依赖漏洞门禁缺失**：`dependabot.yml` 只覆盖 `github-actions`，CI 又以 `--no-audit` 关闭审计，npm 侧（eslint / c8 及传递依赖）无任何持续防线。修复：dependabot 增加 npm 生态（weekly）；CI 新增 `npm audit --audit-level=high` 步骤。
+
+测试断言数 702 → **708**（`manifest.test.js` 62 → 68），变异门禁仍 23 项。
 
 ## [2.9.0] - 2026-10-05
 
