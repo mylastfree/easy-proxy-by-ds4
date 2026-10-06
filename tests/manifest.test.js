@@ -327,6 +327,42 @@ console.log("== 文档声明数一致性（G1：合计 = 各行之和；变异�
 }
 
 console.log("");
+console.log("== 命名规则（G7：商店对 name 的两条硬规则 + 仓库内文档一致性）==");
+{
+  // 【G7·成因】2026-10-06 改名时发现：此前对 `name` 只有一条「是非空字符串」的断言，
+  //   而商店对名称实际有两条硬规则，一条门禁都没有 —— 提审物料里的
+  //   「文案红线自查：名称不含 Chrome」纯靠人工勾选，改错名字不会变红。
+  //   名称是用户在【安装对话框 / chrome://extensions / 商店页】三处看到的第一信息，
+  //   且超长会被商店【直接拒绝上传】，故补上。
+  const mfName = mf.name;
+
+  // 硬规则一：长度。官方 manifest 参考明确 name「The maximum length is 75 characters」，
+  //   且 2024-02-29 起由「英文 45 / 其它语言不限」改为【通用 75】——超长会阻断上传。
+  t("G7-a name 不超过 75 字符（商店硬限；超长会被直接拒绝上传）",
+    typeof mfName === "string" && mfName.length > 0 && mfName.length <= 75,
+    "\"" + mfName + "\" 共 " + (mfName ? mfName.length : 0) + " 字符");
+
+  // 硬规则二：不得含 Google 商标。官方 Branding Guidelines 原文：
+  //   「Don't use any Google trademarks or any confusingly similar marks as the name
+  //    of your extension or company without written permission from Google.」
+  //   用大小写不敏感的整词匹配（两侧都不是字母），避免误伤 "Chromebook" 之外的合法词。
+  t("G7-b name 不含 Google 商标词（chrome / google / chromium）",
+    typeof mfName === "string" && !/(^|[^a-z])(chrome|google|chromium)([^a-z]|$)/i.test(mfName),
+    mfName);
+
+  // 一致性：与【仓库内】文档对齐。刻意【不】读 .workbuddy/ 下的提审物料 ——
+  //   那不在仓库里、CI 上根本不存在，读它会让测试依赖环境，
+  //   违反本仓「测试必须环境无关」的硬约束（同 B-5 / M-3 的取舍）。
+  const readmeTitle = (read("README.md").match(/^#\s+(.+?)\s*$/m) || [])[1];
+  t("G7-c README 的 H1 标题 = manifest.name（改名后漏改 README 即红）",
+    readmeTitle === mfName,
+    "README=\"" + readmeTitle + "\" / manifest=\"" + mfName + "\"");
+  t("G7-d PRIVACY.md 声明的适用产品 = manifest.name（隐私政策的产品名必须与清单一致）",
+    read("PRIVACY.md").indexOf("**适用产品**：" + mfName) >= 0,
+    "PRIVACY.md 中未找到「**适用产品**：" + mfName + "」");
+}
+
+console.log("");
 console.log("== 打包脚本（M-2：发布产物的唯一来源必须有测试护栏）==");
 {
   const os = require("node:os");
@@ -358,7 +394,7 @@ console.log("== 打包脚本（M-2：发布产物的唯一来源必须有测试�
       JSON.stringify(produced) === JSON.stringify([...RUNTIME_FILES].sort()),
       JSON.stringify(produced));
     t("产物目录名与 manifest.version 一致",
-      path.basename(dest) === "easy-proxy-by-ds4-" + version,
+      path.basename(dest) === "minimal-permission-proxy-" + version,
       path.basename(dest));
     t("产物不含 tests/ 与 node_modules/（A3 排除契约）",
       !fs.existsSync(path.join(dest, "tests")) &&
@@ -473,10 +509,10 @@ console.log("== 打包脚本 CLI 入口（L-2：发布产物唯一来源的退�
     t("runCli 成功路径返回退出码 0", code === 0, "code=" + code);
     t("runCli 成功路径不写任何错误日志", errs.length === 0, errs.join(" | "));
     t("runCli 成功路径确实产出 <名>-<版本> 目录",
-      fs.existsSync(path.join(cliTmp, "easy-proxy-by-ds4-" + cliVersion)),
+      fs.existsSync(path.join(cliTmp, "minimal-permission-proxy-" + cliVersion)),
       fs.readdirSync(cliTmp).join(", "));
     t("runCli 成功路径把产物目录打印到 log（CLI 行为未因可测化而改变）",
-      logs.some((l) => l.indexOf("easy-proxy-by-ds4-" + cliVersion) >= 0),
+      logs.some((l) => l.indexOf("minimal-permission-proxy-" + cliVersion) >= 0),
       logs.join(" | "));
   } finally {
     fs.rmSync(cliTmp, { recursive: true, force: true });
@@ -542,7 +578,7 @@ console.log("== 打包脚本 CLI 入口（L-2：发布产物唯一来源的退�
   //   从未被执行过。这里刻意用「故障注入」而非真实并发：临时把 fs.copyFileSync
   //   换成「复制后把目标写坏」，从而确定性地触发不一致检出（真实并发无法稳定复现）。
   const corruptTmp = fs.mkdtempSync(path.join(os2.tmpdir(), "easy-proxy-corrupt-"));
-  const corruptDest = path.join(corruptTmp, "easy-proxy-by-ds4-" + cliVersion);
+  const corruptDest = path.join(corruptTmp, "minimal-permission-proxy-" + cliVersion);
   const realCopyFileSync = fs.copyFileSync;
   let eCorrupt = null;
   try {
@@ -571,34 +607,34 @@ console.log("== 打包脚本 CLI 入口（L-2：发布产物唯一来源的退�
 console.log("");
 console.log("== 打包后清理旧版产物（L-2：dist/ 里并存旧版本会让使用者选中旧代码）==");
 {
-  // 【L-2·工作区报告修复】dist/ 下曾长期并存 easy-proxy-by-ds4-2.11.0 与 …-2.13.0，
+  // 【L-2·工作区报告修复】dist/ 下曾长期并存 minimal-permission-proxy-2.11.0 与 …-2.13.0，
   //   而源码已推进到更高版本 —— 使用者按习惯直接加载 / 上传 dist/ 下的目录时会选中旧版本。
   //   README 的警示只能提醒，消除不了诱因（旧产物还在那儿）。
   //   清理放在 runCli 里、且只在 pack 成功之后，因此本组断言同时钉住四件事：
   //     ① 成功后才清 —— 失败时保住上一次可用产物，不许越修越坏；
-  //     ② 只清「同前缀 + 版本号形态」的目录 —— 不误伤 easy-proxy-by-ds4-backup 这类同名目录；
+  //     ② 只清「同前缀 + 版本号形态」的目录 —— 不误伤 minimal-permission-proxy-backup 这类同名目录；
   //     ③ 幂等 —— 连续两次打包不能把上一次的发布包删掉；
   //     ④ 清理不进 pack() —— 产物生成逻辑必须保持「只写自己那一个目录」的纯粹性。
   const os3 = require("node:os");
   const { runCli: runCliPkg, pack: packPkg, cleanStaleArtifacts } = require("../tools/package.js");
   const pkgVersion = JSON.parse(read("manifest.json")).version;
-  const curDir = "easy-proxy-by-ds4-" + pkgVersion;
+  const curDir = "minimal-permission-proxy-" + pkgVersion;
 
   const dTmp = fs.mkdtempSync(path.join(os3.tmpdir(), "easy-proxy-dist-"));
   try {
     // 四种干扰：两个旧版产物 + 一个同名非版本目录 + 一个无关目录
-    fs.mkdirSync(path.join(dTmp, "easy-proxy-by-ds4-1.0.0"));
-    fs.mkdirSync(path.join(dTmp, "easy-proxy-by-ds4-2.0.0"));
-    fs.mkdirSync(path.join(dTmp, "easy-proxy-by-ds4-backup"));
+    fs.mkdirSync(path.join(dTmp, "minimal-permission-proxy-1.0.0"));
+    fs.mkdirSync(path.join(dTmp, "minimal-permission-proxy-2.0.0"));
+    fs.mkdirSync(path.join(dTmp, "minimal-permission-proxy-backup"));
     fs.mkdirSync(path.join(dTmp, "unrelated"));
     runCliPkg({ destRoot: dTmp, packOpts: { selfCheck: true }, log: () => {}, logErr: () => {} });
     t("打包成功后清理同前缀旧版产物目录",
-      !fs.existsSync(path.join(dTmp, "easy-proxy-by-ds4-1.0.0")) &&
-      !fs.existsSync(path.join(dTmp, "easy-proxy-by-ds4-2.0.0")),
+      !fs.existsSync(path.join(dTmp, "minimal-permission-proxy-1.0.0")) &&
+      !fs.existsSync(path.join(dTmp, "minimal-permission-proxy-2.0.0")),
       fs.readdirSync(dTmp).join(", "));
     t("只清「同前缀 + 版本号形态」：当前版本 / 同名非版本 / 无关目录一律保留",
       fs.existsSync(path.join(dTmp, curDir)) &&
-      fs.existsSync(path.join(dTmp, "easy-proxy-by-ds4-backup")) &&
+      fs.existsSync(path.join(dTmp, "minimal-permission-proxy-backup")) &&
       fs.existsSync(path.join(dTmp, "unrelated")),
       fs.readdirSync(dTmp).join(", "));
     runCliPkg({ destRoot: dTmp, packOpts: { selfCheck: true }, log: () => {}, logErr: () => {} });
@@ -619,19 +655,19 @@ console.log("== 打包后清理旧版产物（L-2：dist/ 里并存旧版本会�
       action: { default_popup: "popup.html" },
       icons: { "16": "icon-red-16.png" } // 全部在清单内，但夹具里没有这些文件
     }));
-    fs.mkdirSync(path.join(dTmp2, "easy-proxy-by-ds4-1.0.0"));
+    fs.mkdirSync(path.join(dTmp2, "minimal-permission-proxy-1.0.0"));
     const codeFail = runCliPkg({
       destRoot: dTmp2, packOpts: { root: dFix, selfCheck: true },
       log: () => {}, logErr: () => {}
     });
     t("打包失败时不清理任何旧产物（不得毁掉上一次可用产物）",
-      codeFail === 1 && fs.existsSync(path.join(dTmp2, "easy-proxy-by-ds4-1.0.0")),
+      codeFail === 1 && fs.existsSync(path.join(dTmp2, "minimal-permission-proxy-1.0.0")),
       "code=" + codeFail + " 剩余=" + fs.readdirSync(dTmp2).join(", "));
 
     let packThrew = false;
     try { packPkg(dTmp2, { root: dFix, selfCheck: true }); } catch (e) { packThrew = true; }
     t("直接调用 pack() 不清理任何目录（清理归属 CLI 层，不进产物生成逻辑）",
-      packThrew && fs.existsSync(path.join(dTmp2, "easy-proxy-by-ds4-1.0.0")),
+      packThrew && fs.existsSync(path.join(dTmp2, "minimal-permission-proxy-1.0.0")),
       "抛错=" + packThrew + " 剩余=" + fs.readdirSync(dTmp2).join(", "));
 
     t("cleanStaleArtifacts 对不存在的 destRoot 返回空数组且不抛错",
@@ -648,8 +684,8 @@ console.log("== 打包后清理旧版产物（L-2：dist/ 里并存旧版本会�
   //   用**故障注入**（临时替换 fs.statSync，让某一个旧目录抛错）而不是伪造权限：
   //   伪造权限无法稳定复现，且在不同 CI runner 上表现不一致。
   const dTmp3 = fs.mkdtempSync(path.join(os3.tmpdir(), "easy-proxy-distbusy-"));
-  const busy = "easy-proxy-by-ds4-3.0.0";
-  const free = "easy-proxy-by-ds4-4.0.0";
+  const busy = "minimal-permission-proxy-3.0.0";
+  const free = "minimal-permission-proxy-4.0.0";
   let removedDebris = null;
   try {
     fs.mkdirSync(path.join(dTmp3, busy));

@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: 安全问题请走私密渠道
-    url: https://github.com/mylastfree/easy-proxy-by-ds4/security/advisories/new
+    url: https://github.com/mylastfree/minimal-permission-proxy/security/advisories/new
     about: 漏洞请勿公开提交，请使用 GitHub 私密漏洞报告
   - name: 使用问题与写法说明
-    url: https://github.com/mylastfree/easy-proxy-by-ds4/blob/main/README.md
+    url: https://github.com/mylastfree/minimal-permission-proxy/blob/main/README.md
     about: 绕过列表写法、已知边界与连接测试说明，先看 README

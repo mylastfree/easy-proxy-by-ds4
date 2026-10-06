@@ -4,7 +4,7 @@
 
 如果你发现了安全问题，**请不要开公开 Issue**，改用以下任一私密渠道：
 
-1. **GitHub 私密漏洞报告（推荐）**：在本仓库的 [Security](https://github.com/mylastfree/easy-proxy-by-ds4/security) 页签点击「Report a vulnerability」。
+1. **GitHub 私密漏洞报告（推荐）**：在本仓库的 [Security](https://github.com/mylastfree/minimal-permission-proxy/security) 页签点击「Report a vulnerability」。
 2. 也可通过 GitHub 主页的联系方式直接联系维护者。
 
 请在报告中尽量包含：影响版本、复现步骤、预期与实际结果、以及你判断的影响范围。

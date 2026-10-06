@@ -72,7 +72,7 @@ if (dirtyAtStart && dirtyAtStart.size) {
 }
 
 // 【B-3·上线准入修复】变异运行哨兵。
-//   事故背景：dist/easy-proxy-by-ds4-2.10.0/popup.js 曾被写入 M22 的变异体
+//   事故背景：dist/minimal-permission-proxy-2.10.0/popup.js 曾被写入 M22 的变异体
 //   （`function activeEditableId() {\n  return null;\n  ...`，与 mutations 里 M22
 //   的 to 串逐字节一致）—— 说明打包动作发生在变异运行期间，把变异体复制进了
 //   发布产物。一旦这样的产物上传商店，用户拿到的是被故意破坏的代码。

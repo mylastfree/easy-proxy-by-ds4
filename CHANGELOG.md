@@ -2,6 +2,76 @@
 
 本文件记录本扩展的所有重要变更。
 
+## [2.16.0] - 2026-10-06
+
+**改名：`Easy Proxy by DS4` → `Minimal Permission Proxy`**，仓库与 slug 同步由
+`easy-proxy-by-ds4` 改为 `minimal-permission-proxy`。并补上**命名规则门禁（G7）**。
+
+按 CONTRIBUTING 的分级表，本版为 **minor** —— 改的是「清单字段」（`manifest.name`），
+且它是用户在**安装对话框 / `chrome://extensions` / 商店页**三处看到的第一信息，
+属用户可见的身份变化，而非纯内部改动。
+
+### 为什么改名
+
+1. **旧名 `DS4` 有品牌歧义**：`DS4` 是 DualShock 4 的通用缩写。这不必然构成商标问题，
+   但在商店这种全球场景下会让部分用户误以为是索尼相关产品 —— 对一个**上架前**的产品，
+   这是纯损失。改名的**时机成本**也是最低的：扩展 ID 由商店在首次上传时分配且永久不变，
+   所以改名换不掉 ID、也不会丢用户；而**尚未上传** ⇒ 连「改名要走一次重新审核」都不存在。
+   一旦上架过，改名的代价会显著上升（要走一次审核，且 listing 的 slug 已固化）。
+2. **新名直接对上审核方的政策语言**：Chrome Web Store 的 **Minimum Permission** 政策
+   已把「最小权限」从建议升为**强制** —— 原文「Extensions must require only the narrowest
+   set of permissions necessary… we are now making that recommendation a requirement for all
+   extensions」，并明确「may not require permissions they do not need for their current
+   functionality, regardless of future plans」，还要求「include a list of permissions used
+   and the reasons you require them」在 listing 里。本扩展**只申请 `proxy` + `storage`、
+   零 `host_permissions`**，名称直接把这个事实写进牌子。
+3. **查重后的取舍（已逐个实证，不是凭感觉）**：更直觉的候选**全部被占**——
+   `Simple Proxy`（商店至少两个同名，另有 `Simple Proxy Switcher` 60K 用户）、
+   `Minimal Proxy`（GitHub 上有功能近乎相同的 MV3 项目）、`SlimProxy`（`slimproxy.com`
+   是商业代理服务）、`Just Proxy`（`Just Proxy VPN`，且其定位是解锁区域限制，
+   与本扩展「不提供也不内置任何代理服务」正好相反）。`Minimal Permission Proxy` 未搜到占用。
+   ⚠️ 需说明的前提：**商店并不保证名称唯一**（不同 ID 可同名），重名不会导致被拒，
+   代价是搜索发现度与被误认 —— 所以这是优化项，不是合规项。
+
+### G7：命名规则门禁（新增 4 项断言，865 → **869**）
+
+**成因**：整改清单里的「文案红线自查：名称不含 Chrome」是**人工勾选**的；而实测
+`tests/manifest.test.js` 对 `name` 只有一条「是非空字符串」断言 —— 商店对名称的两条硬规则
+**一条门禁都没有**，改错名字不会变红。改名正是最该把它钉死的一次。四条断言：
+
+- **G7-a** `name` ≤ **75 字符**。官方 manifest 参考明确 `name` 的最大长度是 75，且
+  2024-02-29 起由「英文 45 / 其它语言不限」改为**通用 75**；**超长会被商店直接拒绝上传**。
+- **G7-b** `name` 不含 Google 商标词（`chrome` / `google` / `chromium`，大小写不敏感整词匹配）。
+  依据是官方 Branding Guidelines：「Don't use any Google trademarks or any confusingly
+  similar marks as the **name** of your extension … without written permission from Google」。
+- **G7-c** README 的 H1 标题 == `manifest.name`；**G7-d** `PRIVACY.md` 的「适用产品」==
+  `manifest.name`。改名后漏改仓库内文档即红。
+  **刻意不读 `.workbuddy/` 下的提审物料**：那不在仓库里、CI 上根本不存在，读它会让测试
+  依赖环境，违反本仓「测试必须环境无关」的硬约束（与 B-5 / M-3 同一取舍）。
+
+### 改名范围（39 处 slug + 4 处展示名）
+
+- **展示名（4 处）**：`manifest.json` 的 `name`、`README.md` 的 H1、`PRIVACY.md` 的中英两处。
+- **slug（39 处）**：`tools/package.js` 的产物目录前缀与 `VERSION_DIR_RE` 正则（**硬编码**，
+  非取自 `package.json`）、`tests/manifest.test.js` 的 18 处（含 16 处产物目录名断言与夹具）、
+  `manifest.json` 的 `homepage_url`、`package.json` 的 `name` 与 `repository.url`、
+  `package-lock.json` ×2、`.github/ISSUE_TEMPLATE/config.yml` ×2、`README.md` 的 badge URL、
+  `PRIVACY.md` ×2、`SECURITY.md` 的私密报告入口。
+- **刻意不改**：① `CHANGELOG.md` 的历史条目（历史记录里的旧目录名在当时是真的）；
+  ② **仓库所在的磁盘目录名**（会牵动绝对路径与本地工具）。
+- ⚠️ **变异锚点未被触碰**：39 处替换在 `background.js` / `settings.js` / `popup.js`
+  三处**零命中**，而变异门禁的目标文件恰是这三个（`MUTATION_TARGET_PATHS`），
+  因此 34 项锚点的逐字节契约不受本版影响。
+
+### 验证
+
+- `npx eslint .` → 0
+- `npm test` → 七套 **869 项全绿**（manifest 124 / settings 114 / fix-safety 46 /
+  concurrency 19 / background 40 / ownership 310 / popup 216）；G7 四条全 PASS，
+  G1「合计 = 各行之和」与编号族登记门禁同时通过
+- `npm run package` → `dist/minimal-permission-proxy-2.16.0`（逐字节自校验通过）
+- 变异门禁与 E2E 由 CI 在推送后运行（本机未跑满轮）
+
 ## [2.15.4] - 2026-10-06
 
 上架准入评估（`.workbuddy/audit/上架准入评估-v2.15.3.md`，判定 79/100）列出的

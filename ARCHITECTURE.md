@@ -73,7 +73,7 @@ readSettings/readBypassText ──失败──▶ error(reason:"read_failed")   
 
 | 护栏 | 文件 |
 | --- | --- |
-| 7 套功能测试（865 项断言，`tests/run-all.js` 统一入口，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
+| 7 套功能测试（869 项断言，`tests/run-all.js` 统一入口，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
 | 真实浏览器 E2E 冒烟（45 项断言，opt-in `npm run e2e`；Playwright 驱动真实 Chromium 加载**打包产物**，覆盖六条主干：「启用 → applied」「禁用 → 未残留 + 回到基线」「外部接管 → overridden 且不夺权」「**真实流量归属**（测试内自起最小 SOCKS5 + 本地源站，判据是正文由谁返回 + 两个计数器）」「**存储配额降级**（~11.9 KB 绕过列表 → local，且核实降级后整份列表被 `chrome.proxy.settings` 采用）」「**含下划线主机名**（L-13：保存前放行 → 下发 applied → 回读 host 逐字一致）」。刻意与 `npm test` / CI 门禁解耦：需要可选依赖 `playwright-core` 与 Chromium 二进制，属于发布前人工门禁而非零依赖门禁；其断言数由 `tests/manifest.test.js` 的静态扫描门禁把守（E2E 不进 G1 运行期自检）。明文 HTTP 链路已自动化；**HTTPS/CONNECT 隧道与真实外网出口 IP 仍为人工项**） | `tests/e2e-smoke.js` + `tests/e2e/fixtures/interloper/` |
 | 变异门禁（34 项：每个修复点被故意破坏后护栏必须变红；S-1 加固后任何退出路径（含信号与未捕获异常）均幂等还原源文件，并以运行前后工作区快照比对判定污染；B-3 起改写源文件前落哨兵 `.mutation-in-progress`，`tools/package.js` 见到即拒绝打包 —— 例外仅在「显式 `selfCheck` + 目标位于系统临时目录」两条件同时满足时生效，发布 CLI 永不满足） | `tests/mutation-check.js` |
 | 文档一致性（断言数/变异数声明 vs 实际） | `tests/g1-consistency.js` + `tests/manifest.test.js` |
@@ -95,7 +95,7 @@ readSettings/readBypassText ──失败──▶ error(reason:"read_failed")   
 | **A** | 代码审计 / 整改条目（早期轮次） | A-1…A-6、A1…A6 | `background.js`、`popup.js`、`popup.html`、`ci.yml` |
 | **B** | 上线准入整改条目 | B-2…B-5 | `tools/package.js`、`tests/manifest.test.js`、`tests/mutation-check.js` |
 | **C** | 并发 / 契约（存储与所有权）整改条目 | C-1…C-3 | `settings.js`、`background.js` |
-| **G** | 门禁与文档一致性自检编号（G1 = 文档声明数自检） | G1…G6 | `tests/*.test.js`、`popup.js`、`background.js` |
+| **G** | 门禁与文档一致性自检编号（G1 = 文档声明数自检，G7 = 命名规则门禁） | G1…G7 | `tests/*.test.js`、`popup.js`、`background.js` |
 | **L** | 审计「低」级问题（含 `L-05` 与 `L-5` 两种写法并存） | L-01…L-12、L-1…L-8 | 全仓 |
 | **M** | 审计「中」级问题（**与变异编号 M1…M34 同名不同域**） | M-1…M-7 | 全仓 |
 | **R** | 各轮复审缺陷编号（数字即轮次：R6/R7/R8/R9） | R6-01…R9-05 | `background.js`、`popup.js` |

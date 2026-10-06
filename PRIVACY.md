@@ -1,6 +1,6 @@
 # 隐私政策（Privacy Policy）
 
-**适用产品**：Easy Proxy by DS4（Chrome 扩展）
+**适用产品**：Minimal Permission Proxy（Chrome 扩展）
 **生效日期**：2026-10-05
 **最近更新**：2026-10-05
 
@@ -85,18 +85,18 @@
 
 如对本隐私政策或数据处理方式有疑问：
 
-- 提交 Issue：<https://github.com/mylastfree/easy-proxy-by-ds4/issues>
+- 提交 Issue：<https://github.com/mylastfree/minimal-permission-proxy/issues>
 - 安全问题请走仓库的 [私密漏洞报告渠道](SECURITY.md)，不要开公开 Issue。
 
 ---
 
 ## English Summary
 
-**Easy Proxy by DS4** does not collect, transmit, or store any personal data on any server. It has no backend server, no analytics, and no crash reporting.
+**Minimal Permission Proxy** does not collect, transmit, or store any personal data on any server. It has no backend server, no analytics, and no crash reporting.
 
 - **Permissions**: only `proxy` and `storage`. **No `host_permissions`** are requested, so the extension cannot read page content, browsing history, or cookies.
 - **Only outbound request**: when you click the exit-IP test button, the extension performs a plain HTTPS GET to one of `ipinfo.io`, `ipapi.co`, or `api.ipify.org` to read your exit IP. No identifiers, cookies, or configuration values are sent. No request occurs unless you click.
 - **Local storage only**: proxy settings, bypass list, and runtime status are kept in `chrome.storage` on your own device and are never uploaded.
 - **No third-party sharing** beyond the exit-IP endpoints described above, and no sale of user data.
 
-Contact: <https://github.com/mylastfree/easy-proxy-by-ds4/issues>
+Contact: <https://github.com/mylastfree/minimal-permission-proxy/issues>

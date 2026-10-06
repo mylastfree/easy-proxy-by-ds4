@@ -5,7 +5,7 @@
 // 背景：此前直接把整个仓库目录当扩展加载/打包，tests/（约 300 KB，含 child_process
 //   用法）、.github/、CHANGELOG.md 等非运行文件会一并进入发布产物，扩大包体与攻击面。
 // 本脚本从 manifest.json 读取版本号，把【仅运行时需要的文件】复制到
-//   dist/easy-proxy-by-ds4-<version>/，并打印产物清单供人工核对。
+//   dist/minimal-permission-proxy-<version>/，并打印产物清单供人工核对。
 // 可复现性：产物内容完全由文件清单决定，清单与 manifest.version 进 git，任何人在
 //   任意机器上对同一提交执行本脚本都得到逐字节相同的产物（纯复制，无构建步骤）。
 //   【M-1·审计修复】这句此前是假的：仓库当时没有 .gitattributes，工作树行尾只能依赖
@@ -60,7 +60,7 @@ function missingFromManifest(manifest, files) {
 }
 
 // 【B-3·上线准入修复】与 tests/mutation-check.js 的哨兵互斥。
-//   事故背景：dist/easy-proxy-by-ds4-2.10.0/popup.js 曾被写入 M22 的变异体
+//   事故背景：dist/minimal-permission-proxy-2.10.0/popup.js 曾被写入 M22 的变异体
 //   （activeEditableId 被改成恒返回 null，即「焦点保护失效」）—— 打包动作
 //   发生在变异运行期间，把故意破坏的代码复制进了发布产物。若当时上传商店，
 //   用户拿到的就是被破坏的版本。本脚本是发布产物的唯一来源，必须自己拦住它。
@@ -102,7 +102,7 @@ function assertNoMutationInProgress(destRoot, opts) {
   );
 }
 
-// 打包到 <destRoot>/easy-proxy-by-ds4-<version>/，返回 { dest, version, copied }。
+// 打包到 <destRoot>/minimal-permission-proxy-<version>/，返回 { dest, version, copied }。
 // 纯复制，无构建步骤；发现清单缺失或源文件不存在时抛错（由调用方决定如何呈现）。
 // opts.selfCheck=true 仅供测试自检使用，且仅在 destRoot 位于系统临时目录时生效
 // （见 assertNoMutationInProgress 的说明）；发布路径永远不传它。
@@ -120,7 +120,7 @@ function pack(destRoot, opts) {
   if (missing.length) {
     throw new Error("manifest 引用的文件未包含在打包清单中：" + missing.join(", "));
   }
-  const dest = path.join(destRoot, "easy-proxy-by-ds4-" + version);
+  const dest = path.join(destRoot, "minimal-permission-proxy-" + version);
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(dest, { recursive: true });
   const copied = [];
@@ -151,17 +151,17 @@ function pack(destRoot, opts) {
 }
 
 // 【L-2·工作区报告修复】清理同前缀的旧版产物目录。
-//   背景：dist/ 下曾长期并存 easy-proxy-by-ds4-2.11.0 与 …-2.13.0，而源码已推进到更高版本
+//   背景：dist/ 下曾长期并存 minimal-permission-proxy-2.11.0 与 …-2.13.0，而源码已推进到更高版本
 //   —— 使用者按习惯直接加载 / 上传 dist/ 下的目录时会选中旧版本。「旧产物还在那儿」本身
 //   就是诱因（README 的警示只能提醒，不能消除诱因）。
 //   三条约束（均由 tests/manifest.test.js 断言把守）：
 //     ① 只在【打包成功之后】由 runCli 调用 —— 打包失败时不得动任何既有产物，
 //        否则会把「上一次可用的产物」也毁掉，越修越坏；
 //     ② 不删刚生成的 keepDir；且只删【同前缀 + 版本号形态】的目录 ——
-//        避免误伤 `easy-proxy-by-ds4-backup` 这类同名但非版本的目录；
+//        避免误伤 `minimal-permission-proxy-backup` 这类同名但非版本的目录；
 //     ③ 位于 pack() 之外 —— pack() 的产物字节是发布契约（有逐字节断言把守），
 //        目录级清理是 CLI 的副作用，不该混进产物生成逻辑。
-const VERSION_DIR_RE = /^easy-proxy-by-ds4-\d+\.\d+\.\d+/;
+const VERSION_DIR_RE = /^minimal-permission-proxy-\d+\.\d+\.\d+/;
 
 // 返回被删除的目录名数组（纯副作用函数，失败不抛错 —— 清理失败不该影响打包结果）。
 function cleanStaleArtifacts(destRoot, keepDir) {
@@ -204,7 +204,7 @@ function runCli(opts) {
   const logErr = o.logErr || console.error;
   try {
     const { dest, version, copied } = pack(destRoot, packOpts);
-    log("打包 easy-proxy-by-ds4 v" + version + " -> " + path.relative(srcRoot, dest));
+    log("打包 minimal-permission-proxy v" + version + " -> " + path.relative(srcRoot, dest));
     for (const f of copied) {
       log("  + " + f + "  (" + fs.statSync(path.join(srcRoot, f)).size + " B)");
     }

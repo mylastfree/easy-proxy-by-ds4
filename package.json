@@ -1,12 +1,12 @@
 {
-  "name": "easy-proxy-by-ds4",
-  "version": "2.15.4",
+  "name": "minimal-permission-proxy",
+  "version": "2.16.0",
   "private": true,
   "description": "一键让 Chrome 走本地代理（SOCKS5 / HTTPS），局域网默认直连，并用出口检测验证代理是否真的生效。",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mylastfree/easy-proxy-by-ds4.git"
+    "url": "https://github.com/mylastfree/minimal-permission-proxy.git"
   },
   "scripts": {
     "test": "node tests/run-all.js",
