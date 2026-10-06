@@ -127,6 +127,23 @@ t("帮助面板中的 <local> 写成转义形式", helpPre.includes("&lt;local&g
 t("popup.html 全文不含未转义的 <local>（会被解析为未知元素）", !/<local[\s>]/.test(html));
 t("帮助面板中的 .local / .lan 仍是字面量（未被过度转义）",
   helpPre.includes(".local") && helpPre.includes(".lan") && !helpPre.includes("&amp;lt;"));
+// 【L-1·工作区报告修复·对齐断言】转义会把该行**源码列数**撑大 5 列，而 <pre> 的对齐是按
+//   **解码后**的列计算的（`&lt;local&gt;` 只占 7 列）—— 二者混为一谈正是本修复第一版的错误：
+//   第一版按源码列数把行尾补空格从 12 个减到 7 个，看起来「保持了对齐」，实测解码后
+//   该行说明文字落在第 19 列、其余写法行落在第 20 列，视觉上是错的。
+//   这条断言把「以解码后的列为准」固化成机器判据 —— 否则 padding 又可被静默改回。
+//   刻意只比对「本行 vs 相邻写法行」的说明列，不做全表启发式：新增示例行不该让本组变红。
+const preLines = helpPre.split(/\r?\n/);
+const descCol = (needle, anchor) => {
+  const line = preLines.filter(l => l.indexOf(needle) >= 0)[0];
+  if (!line) return -1;
+  return line.replace(/&lt;/g, "<").replace(/&gt;/g, ">").indexOf(anchor);
+};
+const colLocal = descCol("不含点的主机名", "不含点的主机名");
+const colNeighbor = descCol("以该后缀结尾", "以该后缀结尾");
+t("帮助面板里 <local> 那一行的说明列与相邻写法行一致（对齐按解码后列算，不是源码列）",
+  colLocal > 0 && colLocal === colNeighbor,
+  "<local> 行说明列=" + colLocal + "；相邻行=" + colNeighbor);
 
 const bg = read("background.js");
 const imports = [...bg.matchAll(/importScripts\(\s*["']([^"']+)["']\s*\)/g)].map(m => m[1]);
