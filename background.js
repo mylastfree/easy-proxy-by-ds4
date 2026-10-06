@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.15.3]
+// background.js —— MV3 Service Worker  [v2.15.4]
 // 【L-06·审计修复】补上全局严格模式：本文件是 classic service worker（非 module），
 //   默认处于非严格模式，隐式全局赋值、静默失败的写入、`this` 装箱等都无法被
 //   静态规则拦住。settings.js 早已声明（在 IIFE 内），此处与 popup.js 补齐一致。

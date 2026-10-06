@@ -176,7 +176,7 @@ $env:E2E_CHROME_PATH="C:\path\to\chrome.exe"; npm run e2e   # 指定浏览器
 
 退出码：`0` 全部通过；`1` 有断言失败（真实缺陷）；`2` 环境未就绪（缺可选依赖 / 缺 Chromium / 变异哨兵在位）——`2` **不计为失败**，按提示补齐环境后重跑即可。
 
-发布前还须完成 [docs/E2E-SMOKE.md](docs/E2E-SMOKE.md) 的**人工**冒烟残余项：自动化已覆盖三条主干（含三条主干的状态回读与控制权归属），但真实代理链路（连通性、出口 IP 是否变化、绕过列表是否真的直连）、安装升级路径、隐身窗口与存储配额仍只有人工清单能兜底。
+发布前还须完成 [docs/E2E-SMOKE.md](docs/E2E-SMOKE.md) 的**人工**冒烟残余项：自动化已覆盖**六条主干**（含状态回读、控制权归属、明文 HTTP 链路的真实流量归属、存储配额降级、含下划线主机名），但**真实外网出口 IP 与 HTTPS/CONNECT 隧道**、**安装/升级路径**、**隐身窗口**仍只有人工清单能兜底。
 
 这些测试在 CI 上自动运行（Node 20 / 22 / 24 三个版本），见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
@@ -190,7 +190,7 @@ $env:E2E_CHROME_PATH="C:\path\to\chrome.exe"; npm run e2e   # 指定浏览器
 
 ## 版本历史
 
-详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.15.3`。
+详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.15.4`。
 
 ## 安全
 
