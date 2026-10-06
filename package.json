@@ -1,6 +1,6 @@
 {
   "name": "easy-proxy-by-ds4",
-  "version": "2.15.1",
+  "version": "2.15.2",
   "private": true,
   "description": "一键让 Chrome 走本地代理（SOCKS5 / HTTPS），局域网默认直连，内置出口检测",
   "license": "MIT",

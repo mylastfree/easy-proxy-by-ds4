@@ -423,9 +423,13 @@ async function identifyWorkers(ctx, nameA, nameB, timeoutMs) {
     console.log("== 加载与自检 ==");
     const found = await identifyWorkers(ctx, repoManifest.name, fixtureManifest.name, WAIT_MS);
     if (!found.own || !found.inter) {
-      t("两个扩展都已在浏览器中启用", false,
-        "已识别：" + JSON.stringify(found.all.map((e) => e[1].name)));
-      throw new Error("扩展未能加载，后续断言无法进行");
+      // 【断言计数契约】这里刻意**不**写 `t(...)`，而是直接把诊断塞进抛出的错误：
+      //   本文件的断言总数被 tests/manifest.test.js 的静态扫描门禁把守（E2E 不进
+      //   G1 的运行期自检范围，只能靠静态计数）。放在 if 里的断言在健康路径上不执行，
+      //   会让「静态计数 = 运行时计数」这条等式失效（实测：静态 42 / 运行时 41）。
+      //   保持全部断言**行首无条件调用**，是那条门禁成立的前提。
+      throw new Error("扩展未能加载，后续断言无法进行；已识别：" +
+        JSON.stringify(found.all.map((e) => e[1].name)));
     }
     t("被测扩展已在浏览器中启用（SW 可达）", !!found.own, found.own && found.own.id);
     t("夹具扩展已在浏览器中启用（用于模拟外部接管）", !!found.inter, found.inter && found.inter.id);

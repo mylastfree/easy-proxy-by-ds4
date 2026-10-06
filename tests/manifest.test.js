@@ -757,6 +757,50 @@ console.log("== 文档声明一致性扩展（M-2/M-3：出口端点清单与 de
 }
 
 console.log("");
+console.log("== E2E 断言数一致性（E2E 不在 G1 守卫范围内，必须自己把守）==");
+{
+  // 【为什么需要这一组】`tests/e2e-smoke.js` **不进** G1 的运行期自检：G1 靠各套件
+  //   结尾比对 README 声明的「本套件通过数」，而 E2E 是 opt-in 的（要 playwright-core
+  //   与 Chromium 二进制），不可能在 `npm test` 里跑起来。于是它的断言数原先只散落在
+  //   四处文档里（README / CONTRIBUTING / ARCHITECTURE / docs/E2E-SMOKE.md），
+  //   **没有任何机制把守** —— 22 → 41 那次就是四处人工同步，漏改不会变红。
+  //   这一组用**静态扫描**补上：E2E 的断言全部是行首无条件调用 `t(`（见下方第一条
+  //   自证断言），因此「源文件里 `t(` 的行首计数」就等于「运行时通过数」。
+  //
+  //   已经踩过的坑：原先 `if (!found.own || !found.inter) { t(...); throw ... }` 里
+  //   藏着一条**只在失败路径执行**的断言，把静态计数变成 42 而运行时是 41 ——
+  //   这类「有条件执行」的断言会让静态门禁永远算不准，因此该处已改为把诊断塞进
+  //   抛出的 Error（见 e2e-smoke.js 里的「断言计数契约」注释）。
+  const e2e = read("tests/e2e-smoke.js");
+  const lineLeading = (e2e.match(/^\s*t\(/gm) || []).length;
+  const inline = (e2e.match(/[;)}][ \t]*t\(/g) || []).length;
+
+  // 自证一：断言必须行首调用。写成 `if (x) t(...)` 这类同行调用会让扫描器漏数，
+  //   门禁会给出误导性的「文档数 ≠ 实际数」——因此先把这条前提本身钉住。
+  t("E2E 的断言全部行首无条件调用（同行调用会让本组扫描器漏数）",
+    inline === 0, "同行调用 = " + inline);
+  // 自证二：扫描器确实命中足量断言。防「正则被改坏 ⇒ 计数为 0 ⇒ 与文档比对必然失败」
+  //   之外的更隐蔽形态：若扫描结果为 0 而文档也被写成 0，就恒真了。
+  //   这是本项目反复踩过的「断言恒真」假绿，故显式设下限。
+  t("E2E 断言扫描确实命中足量断言（防止正则失效使本组恒真）",
+    lineLeading >= 30, "扫描到 " + lineLeading + " 条");
+
+  const e2eDocs = [
+    ["README.md", /共 (\d+) 项断言/, "跑通五条主干，共 N 项断言"],
+    ["CONTRIBUTING.md", /真实浏览器冒烟（opt-in，(\d+) 项/, "真实浏览器冒烟（opt-in，N 项"],
+    ["ARCHITECTURE.md", /真实浏览器 E2E 冒烟（(\d+) 项断言/, "真实浏览器 E2E 冒烟（N 项断言"],
+    ["docs/E2E-SMOKE.md", /五条主干脚本化（(\d+) 项断言/, "五条主干脚本化（N 项断言"]
+  ];
+  for (const row of e2eDocs) {
+    const file = row[0], re = row[1], hint = row[2];
+    const m = read(file).match(re);
+    t(file + " 声明的 E2E 断言数 = 实际断言数（" + hint + "）",
+      !!m && Number(m[1]) === lineLeading,
+      "声明=" + (m ? m[1] : "未匹配到声明行") + " / 实际=" + lineLeading);
+  }
+}
+
+console.log("");
 // 【G1】文档一致性自检：README 声明的本套件断言数必须与实际通过数一致
 {
   const g1 = require("./g1-consistency.js").g1ConsistencyCheck("tests/manifest.test.js", pass);
