@@ -3,7 +3,7 @@
 [![CI](https://github.com/mylastfree/easy-proxy-by-ds4/actions/workflows/ci.yml/badge.svg)](https://github.com/mylastfree/easy-proxy-by-ds4/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-一个「装上即用」的 Chrome 代理切换扩展：一键让浏览器走本地代理，局域网自动直连，并内置**出口检测**来验证代理是否真的生效。
+一个「装上即用」的 Chrome 代理切换扩展：一键让浏览器走本地代理，局域网默认直连，并内置**出口检测**来验证代理是否真的生效。
 
 ## 特性
 
@@ -18,7 +18,7 @@
 
 1. 打开 `chrome://extensions`，右上角开启「开发者模式」。
 2. 点击「加载已解压的扩展程序」，选择本项目目录。
-3. （注意）本机存在 Chrome Beta 与稳定版两个通道，请确认当前操作的是你要用的那个。
+3. 若你同时安装了 Chrome 的多个通道（稳定版 / Beta / Dev），请确认加载到你要用的那一个 —— 每个通道的扩展列表是各自独立的。
 
 ## 默认设置
 
@@ -130,7 +130,7 @@
 | `tests/fix-safety.test.js` | 修复安全性：暂停标志必然复位、串行队列不累积、收紧判定未误伤合法输入（19 项） |
 | `tests/concurrency.test.js` | 并发护栏（N1/N2）：暂停计数不泄漏、测试互斥生效（40 项） |
 | `tests/ownership.test.js` | 所有权护栏：断言实际生效配置而非存储值，外部接管不夺权也不丢配置；对比窗口恢复意图持久化与取样一致性复核；禁用路径遗留作用域清理、onProxyError 透传、onStartup 对齐、出口检测多端点容错与超时语义、状态写入失败降级标记；第 4 条审计修复的 background 侧护栏（clear() ≠ 强制直连：回读实际模式与回读失败均不得谎称直连）与第 5 条（状态写入代次：旧状态重试不得覆盖新状态、失败标记按【键】管理）；工作区报告 L-4（error 路径也必须落 `pendingResubmit`，否则「暂停期间待下发」这一事实只剩内存、SW 回收即丢）（310 项） |
-| `tests/popup.test.js` | popup 交互：异常时按钮必须复位、通道失败如实呈现、遮蔽现场数据保全，且如实显示失败原因；表单重绘焦点保护、escapeHtml 转义契约与 XSS 回归；审计修复第 1/2/3/4/6 条的前台侧护栏（内容不变的保存必须显式下发、local 清理失败如实上报、超长列表"先落地→确证→再切换引用"、带 systemProxy 的禁用态不得宣称直连、收尾被接管不得落到"代理确实生效"、禁用态「回读失败」档不得宣称直连、恢复默认的阶段分辨与下发结果消费、恢复被中断档不得渲染为代理异常）；测试结论判定（`classifyTestResult` 的 20 组 verdict/kind 组合）、状态条严重度符号（L-7）；诊断导出（L-08）的渲染、脱敏（不含出口 IP）、读取失败如实、后台无响应/通道异常如实、按文本渲染与按钮复位（216 项） |
+| `tests/popup.test.js` | popup 交互：异常时按钮必须复位、通道失败如实呈现、遮蔽现场数据保全，且如实显示失败原因；表单重绘焦点保护、escapeHtml 转义契约与 XSS 回归；审计修复第 1/2/3/4/6 条的前台侧护栏（内容不变的保存必须显式下发、local 清理失败如实上报、超长列表「先落地→确证→再切换引用」、带 systemProxy 的禁用态不得宣称直连、收尾被接管不得落到「代理确实生效」、禁用态「回读失败」档不得宣称直连、恢复默认的阶段分辨与下发结果消费、恢复被中断档不得渲染为代理异常）；测试结论判定（`classifyTestResult` 的 20 组 verdict/kind 组合）、状态条严重度符号（L-7）；诊断导出（L-08）的渲染、脱敏（不含出口 IP）、读取失败如实、后台无响应/通道异常如实、按文本渲染与按钮复位（216 项） |
 | `tests/mutation-check.js` | 变异测试：故意破坏每个修复点，确认护栏测试真的会失败（34 项变异） |
 
 七套功能测试合计 **865 项断言**。
@@ -168,7 +168,7 @@ node tests\mutation-check.js   # 变异门禁：运行后会自动还原被变�
 它是**刻意 opt-in** 的，不并入 `npm test`、也不进 CI 门禁：它需要可选依赖 `playwright-core` 与一个 Chromium 二进制，二者都不属于本扩展的运行时契约（扩展本身仍是**零运行时依赖、零构建**），且需要真实进程环境——并入门禁会让「测试必须环境无关」这条硬约束失效。
 
 ```powershell
-npm i                       # 可选依赖 playwright-core 已列入 devDependencies，npm ci 即可
+npm i                       # 安装 devDependencies（含 opt-in 的 playwright-core）；CI 侧用 npm ci 严格按 lock 复现
 npm run e2e                 # 有头模式（兼容性最好）；自动复用本机已缓存的 Chromium
 $env:E2E_HEADLESS=1; npm run e2e          # 无头模式
 $env:E2E_CHROME_PATH="C:\path\to\chrome.exe"; npm run e2e   # 指定浏览器

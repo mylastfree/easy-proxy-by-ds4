@@ -67,7 +67,7 @@ readSettings/readBypassText ──失败──▶ error(reason:"read_failed")   
 | 前台确认门（`isLegacyShadowPair`） | 逐字符相等 + 「默认列表+编辑」形态 | 放宽（只触发一次确认，不写数据） | `loadedShadowed=true`：保存走遮蔽分支（不写 local）+ 行内二次确认 |
 | 纵深防御（`clearLocalBypassIfAny`） | 保存值=默认列表 **或** `formWasShadowed` | 双条件任一命中即拒写 | 不产生任何 local 写入 |
 
-两个判据刻意**不同名、不同文件、语义各自写清**（见 `settings.js` 注释）——不要把它们"统一"成一份而把保守侧悄悄放宽。
+两个判据刻意**不同名、不同文件、语义各自写清**（见 `settings.js` 注释）——不要把它们「统一」成一份而把保守侧悄悄放宽。
 
 ## 6. 测试与门禁的对应关系
 
@@ -77,7 +77,7 @@ readSettings/readBypassText ──失败──▶ error(reason:"read_failed")   
 | 真实浏览器 E2E 冒烟（45 项断言，opt-in `npm run e2e`；Playwright 驱动真实 Chromium 加载**打包产物**，覆盖六条主干：「启用 → applied」「禁用 → 未残留 + 回到基线」「外部接管 → overridden 且不夺权」「**真实流量归属**（测试内自起最小 SOCKS5 + 本地源站，判据是正文由谁返回 + 两个计数器）」「**存储配额降级**（~11.9 KB 绕过列表 → local，且核实降级后整份列表被 `chrome.proxy.settings` 采用）」「**含下划线主机名**（L-13：保存前放行 → 下发 applied → 回读 host 逐字一致）」。刻意与 `npm test` / CI 门禁解耦：需要可选依赖 `playwright-core` 与 Chromium 二进制，属于发布前人工门禁而非零依赖门禁；其断言数由 `tests/manifest.test.js` 的静态扫描门禁把守（E2E 不进 G1 运行期自检）。明文 HTTP 链路已自动化；**HTTPS/CONNECT 隧道与真实外网出口 IP 仍为人工项**） | `tests/e2e-smoke.js` + `tests/e2e/fixtures/interloper/` |
 | 变异门禁（34 项：每个修复点被故意破坏后护栏必须变红；S-1 加固后任何退出路径（含信号与未捕获异常）均幂等还原源文件，并以运行前后工作区快照比对判定污染；B-3 起改写源文件前落哨兵 `.mutation-in-progress`，`tools/package.js` 见到即拒绝打包 —— 例外仅在「显式 `selfCheck` + 目标位于系统临时目录」两条件同时满足时生效，发布 CLI 永不满足） | `tests/mutation-check.js` |
 | 文档一致性（断言数/变异数声明 vs 实际） | `tests/g1-consistency.js` + `tests/manifest.test.js` |
-| CI（lint → 7 套测试 → 变异 → 工作区洁净核验） | `.github/workflows/ci.yml` |
+| CI（lint → 依赖漏洞审计 `npm audit --audit-level=high` → `node --check` 语法校验 → 7 套测试逐个跑 → 打包自检（`npm run package`）→ 覆盖率（c8，**仅 Node 22**）→ 变异 → 核验变异后工作区未被污染；**tag 触发时**另跑一步「发布 tag 与版本一致性校验」，`main` 上不跑） | `.github/workflows/ci.yml` |
 
 ## 7. 缺陷 / 修复编号索引（L-6）
 

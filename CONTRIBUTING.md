@@ -15,7 +15,17 @@
 | 修缺陷，不新增可观察契约、不改存储键 | patch | 2.7.1 |
 | 新增/改变可观察契约（新状态、新 session 键、新提示档、清单字段） | **minor** | 2.8.0 |
 
-版本号必须四处同步：`manifest.json`、三个源文件头（`[vX.Y.Z]`）、`README.md`、`CHANGELOG.md` 首条 —— `tests/manifest.test.js` 与各文件的 G1 自检会拦截不一致。
+版本号必须**六处**同步：`manifest.json`、`package.json`、`package-lock.json`（顶层 `version` 与 `packages[""] .version` 各一处）、三个源文件头（`[vX.Y.Z]`）、`README.md` 的「当前版本」、`CHANGELOG.md` 首条。
+
+> ⚠️ **这六处并非都有门禁，升版时必须逐处核对，不要假设漏掉会变红。**
+>
+> - **有断言把守**：`manifest.version` ↔ `CHANGELOG.md` 首条、三个源文件头 ↔ `manifest.version`
+>   —— 均由 `tests/manifest.test.js` 的发布一致性断言直接拦截，漏改即 `npm test` 变红。
+> - **无断言把守**：`package.json`、`package-lock.json`、`README.md` 的「当前版本」。
+>   实测确认过：`tests/` 里读 `package.json` 的地方**只取 `devDependencies`**，
+>   没有任何测试读这三个位置（搜索 `当前版本` 命中的两处只是断言名里含这四个字）。
+>   这是**如实留白**：补门禁会改变断言数，连带需要同步 README 表格与「合计」/
+>   CONTRIBUTING / ARCHITECTURE / CHANGELOG 四处文档，故留作一次独立改动。
 
 ## 门禁约定（硬性）
 
@@ -34,6 +44,7 @@
 npm run lint        # ESLint（CI 首个失败点）
 npm test            # 七套功能测试（865 项断言，tests/run-all.js 统一入口）
 npm run coverage    # 可选：c8 覆盖率报告
+npm audit --audit-level=high   # 依赖漏洞门禁（CI 有此步，阈值 high；新增高危及以上 CVE 即变红）
 npm run mutation    # 变异门禁（34 项，本机约 36 分钟）
 npm run package     # 可选：验证打包清单（成功后自动清理 dist/ 里同前缀的旧版产物，失败时一个字节都不动）
 npm run e2e         # 发布前必跑：真实浏览器冒烟（opt-in，45 项；退出码 2 = 环境未就绪，不计失败）
@@ -56,6 +67,13 @@ npm run e2e         # 发布前必跑：真实浏览器冒烟（opt-in，45 项�
 > git checkout -- background.js settings.js popup.js
 > rm -f .mutation-in-progress
 > ```
+>
+> ⚠️ **`git checkout --` 会把这三个文件里所有未提交的改动一并丢弃**，不只是变异体。
+> 若你当时手头有**未提交的修复**（变异门禁常在「改完还没提交」时跑），请先确认
+> `git stash push -m before-recover -- background.js settings.js popup.js` 或先提交，
+> 再用上面的命令；否则恢复动作本身会变成数据丢失。
+> 若只想丢掉变异体、保留自己的改动，可**按变异项的 `from` / `to` 串反向替换**——
+> 变异体是确定性注入的，反替换可精确复原（`tests/mutation-check.js` 的每项都写了 `from` 与 `to`）。
 >
 > 打包动作同样被哨兵拦住（`tools/package.js` 见到哨兵即拒绝），因此被中断时**不会**产出
 > 含变异体的发布包。若不慎把污染代码提交了出去，CI 的「工作区洁净核验」与

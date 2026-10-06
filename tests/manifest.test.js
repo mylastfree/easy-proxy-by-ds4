@@ -52,13 +52,17 @@ console.log("== 发布一致性：manifest.version 与 CHANGELOG 首条必须对
 console.log("");
 console.log("== 发布一致性：三个源文件头 [vX.Y.Z] 必须与 manifest.version 对齐 ==");
 {
-  // 【B-2·审计修复】CONTRIBUTING.md 声明「版本号必须四处同步：manifest.json、
-  //   三个源文件头（[vX.Y.Z]）、README.md、CHANGELOG.md 首条 —— tests/manifest.test.js
-  //   与各文件的 G1 自检会拦截不一致」。
-  //   但实测这条断言此前【根本不存在】：2.10.0 提交里 background.js / popup.js /
+  // 【B-2·审计修复】CONTRIBUTING.md 曾声明「版本号必须四处同步：manifest.json、
+  //   三个源文件头（[vX.Y.Z]）、README.md、CHANGELOG.md 首条」，但实测这条断言此前
+  //   【根本不存在】：2.10.0 提交里 background.js / popup.js /
   //   settings.js 的文件头仍停留在 [v2.9.0]（提交改了 background.js 50 行、
   //   popup.js 28 行，唯独第 1 行版本号没碰），CI 却一路全绿 ——
   //   文档承诺的门禁是【假的】。这里补上，让声明变成事实。
+  //
+  //   【2026-10-06 文档合规检查】该声明本身也已修正：实际需同步的是**六处**
+  //   （多了 package.json 与 package-lock.json），且其中只有下面这两组有断言把守 ——
+  //   `package.json` / `package-lock.json` / README 的「当前版本」三处**仍无门禁**，
+  //   CONTRIBUTING 已就此如实留白。**不要**因为「文档写了必须同步」就以为漏改会变红。
   //
   //   额外一条「正则必须匹配到每个文件」是必需的：若只做逐文件比对，
   //   一旦文件头格式漂移（例如去掉 [vX.Y.Z] 标记），match 返回 null，
