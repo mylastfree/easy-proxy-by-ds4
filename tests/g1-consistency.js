@@ -14,14 +14,20 @@ const path = require("node:path");
  * 核对 README 中 testFileName 所在表格行声明的断言数。
  * @param {string} testFileName 形如 "tests/settings.test.js"（与 README 表格首列一致）
  * @param {number} passCount 本套件本次运行实际通过的断言数
+ * @param {{readmePath?: string}} [opts] 【L-14】只供测试注入的 README 路径；
+ *   不传时仍读仓库根的 README.md（生产路径逐字不变）。存在这个参数是因为本函数有
+ *   两条 skip 分支（文件不可读 / 缺声明行）此前从未被执行过 —— 它们恰恰是「自检
+ *   静默失效」的入口：README 一旦被改名或路径写错，G1 会安静地全部跳过，文档漂移
+ *   重新变成不可拦截。把路径抽成可注入，这两条分支才能被断言钉住。
  * @returns {{skipped: boolean, declared: number|null}}
  *   skipped=true 表示 README 缺失该行或不可读（自检跳过，不阻塞功能测试结论）；
  *   skipped=false 且 declared !== passCount 时，调用方应 fail++ 并打印说明。
  */
-function g1ConsistencyCheck(testFileName, passCount) {
+function g1ConsistencyCheck(testFileName, passCount, opts) {
+  const readmePath = (opts && opts.readmePath) || path.join(__dirname, "..", "README.md");
   let readme;
   try {
-    readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
+    readme = fs.readFileSync(readmePath, "utf8");
   } catch (e) {
     console.log("  WARN  G1 自检跳过：README.md 不可读（" + (e && e.message) + "）");
     return { skipped: true, declared: null };

@@ -121,6 +121,21 @@ M6_ALLOW.forEach(function (h) {
   t("M-6 防误伤：" + h, errs.length === 0, JSON.stringify(errs));
 });
 
+console.log("== L-13：下划线主机名 —— 实测 Chrome 接受，故「不得拒绝」 ==");
+// 该项曾被审计列为「白名单含 `_`，而 DNS 主机名不允许 `_`，Chrome 是否接受未实测」：
+//   **若** set 会拒绝，白名单含 `_` 就复现了 M-6 那条误导排障路径。
+// 2026-10-06 在真实 Chromium 1243 里实测（只 set + 回读，不动仓库文件）：
+//   a_b.com / my_proxy.local / _proxy.com 与 bypassList 里的 a_b.com 全部被接受，
+//   回读 host 原样保留 —— Chrome 只做字符串透传，不校验 DNS 可解析性。
+// 故此处钉住「不得因下划线而拒绝」。把 `_` 移出白名单虽然会让本组变红，
+//   但那是**过度拒绝**（收敛过头），属于回归而不是收紧 —— 断言语义已写明。
+const L13_ALLOW = ["a_b.com", "_proxy.com", "a_b.c_d.com"];
+L13_ALLOW.forEach(function (h) {
+  const errs = S.validateSettings(Object.assign({}, ok, { proxyHost: h }));
+  t("L-13 含下划线的 host 不得被拒（实测 Chrome 接受；删掉白名单里的 _ 才是回归）：" + h,
+    errs.length === 0, JSON.stringify(errs));
+});
+
 console.log("== M-7：方括号用法与主机形态收口（M-6 的残留面）==");
 // M-6 把 [ 与 ] 无条件列入合法字符白名单，而 isIpV6Shape 只在 host 含冒号时触发 ——
 // 于是「无冒号的方括号」整类漏放（探针实测：修复前以下写法全部通过保存前校验），

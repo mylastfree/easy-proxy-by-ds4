@@ -73,8 +73,8 @@ readSettings/readBypassText ──失败──▶ error(reason:"read_failed")   
 
 | 护栏 | 文件 |
 | --- | --- |
-| 7 套功能测试（858 项断言，`tests/run-all.js` 统一入口，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
-| 真实浏览器 E2E 冒烟（41 项断言，opt-in `npm run e2e`；Playwright 驱动真实 Chromium 加载**打包产物**，覆盖五条主干：「启用 → applied」「禁用 → 未残留 + 回到基线」「外部接管 → overridden 且不夺权」「**真实流量归属**（测试内自起最小 SOCKS5 + 本地源站，判据是正文由谁返回 + 两个计数器）」「**存储配额降级**（~11.9 KB 绕过列表 → local，且核实降级后整份列表被 `chrome.proxy.settings` 采用）」。刻意与 `npm test` / CI 门禁解耦：需要可选依赖 `playwright-core` 与 Chromium 二进制，属于发布前人工门禁而非零依赖门禁。明文 HTTP 链路已自动化；**HTTPS/CONNECT 隧道与真实外网出口 IP 仍为人工项**） | `tests/e2e-smoke.js` + `tests/e2e/fixtures/interloper/` |
+| 7 套功能测试（865 项断言，`tests/run-all.js` 统一入口，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
+| 真实浏览器 E2E 冒烟（45 项断言，opt-in `npm run e2e`；Playwright 驱动真实 Chromium 加载**打包产物**，覆盖六条主干：「启用 → applied」「禁用 → 未残留 + 回到基线」「外部接管 → overridden 且不夺权」「**真实流量归属**（测试内自起最小 SOCKS5 + 本地源站，判据是正文由谁返回 + 两个计数器）」「**存储配额降级**（~11.9 KB 绕过列表 → local，且核实降级后整份列表被 `chrome.proxy.settings` 采用）」「**含下划线主机名**（L-13：保存前放行 → 下发 applied → 回读 host 逐字一致）」。刻意与 `npm test` / CI 门禁解耦：需要可选依赖 `playwright-core` 与 Chromium 二进制，属于发布前人工门禁而非零依赖门禁；其断言数由 `tests/manifest.test.js` 的静态扫描门禁把守（E2E 不进 G1 运行期自检）。明文 HTTP 链路已自动化；**HTTPS/CONNECT 隧道与真实外网出口 IP 仍为人工项**） | `tests/e2e-smoke.js` + `tests/e2e/fixtures/interloper/` |
 | 变异门禁（34 项：每个修复点被故意破坏后护栏必须变红；S-1 加固后任何退出路径（含信号与未捕获异常）均幂等还原源文件，并以运行前后工作区快照比对判定污染；B-3 起改写源文件前落哨兵 `.mutation-in-progress`，`tools/package.js` 见到即拒绝打包 —— 例外仅在「显式 `selfCheck` + 目标位于系统临时目录」两条件同时满足时生效，发布 CLI 永不满足） | `tests/mutation-check.js` |
 | 文档一致性（断言数/变异数声明 vs 实际） | `tests/g1-consistency.js` + `tests/manifest.test.js` |
 | CI（lint → 7 套测试 → 变异 → 工作区洁净核验） | `.github/workflows/ci.yml` |

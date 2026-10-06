@@ -9,7 +9,7 @@
 //       显现 —— 桩测试永远返回 direct，真实浏览器返回 system；
 //     · 外部扩展接管后 levelOfControl 变成 controlled_by_other_extensions，
 //       而桩测试里这个取值只有我们手写时才会出现。
-//   本文件在真实 Chromium 里加载【打包产物】，覆盖五条主干：
+//   本文件在真实 Chromium 里加载【打包产物】，覆盖六条主干：
 //     ① 启用 → 回读 levelOfControl === controlled_by_this_extension 且
 //        activeMode === fixed_servers（且 singleProxy 与我方设置逐字段一致）；
 //     ② 禁用 → 回读确认未残留本扩展的 fixed_servers，且状态回到测试前基线；
@@ -22,7 +22,11 @@
 //        （Chrome 对 localhost 有隐式绕过，用 127.0.0.1 会被绕过而测不到）；
 //     ⑤ 存储配额降级：从 popup 表单真实保存一份超过 8192 字节的绕过列表，断言
 //        `sync` 只留空串占位、`local` 持有全量、界面如实提示，并核实**降级后的整份
-//        列表确实被 `chrome.proxy.settings` 采用**（只改存储不算修好）。
+//        列表确实被 `chrome.proxy.settings` 采用**（只改存储不算修好）；
+//     ⑥ 含下划线的主机名（L-13）：走真实表单保存 `my_proxy.local`（下划线）并在
+//        bypassList 里放 `a_b.com`，断言保存前校验放行、下发落 `applied`、回读 host
+//        与所填**逐字一致**。这条正是「保存通过 → 下发失败 → 归因为代理异常」（M-6
+//        的原始动机）在真实 Chrome 上的反证 —— 该写法曾是审计里的「未实测」项。
 //
 // 【为什么 ④ 只用 SOCKS5 与明文 HTTP】扩展只允许 socks5 / https 两种代理类型（见
 //   settings.js 的 PROXY_TYPES），而 SOCKS5 是默认值、用户实际最常用的那条；HTTPS
@@ -245,16 +249,20 @@ function readLastState(page) {
   });
 }
 
-// 回读「代理规则」的完整形状，重点是 bypassList —— ⑤ 要证实降级后的整份列表
-//   确实被 chrome.proxy.settings 采用，而不只是躺在存储里。
+// 回读「代理规则」的完整形状 —— ⑤ 要证实降级后的整份列表确实被
+//   chrome.proxy.settings 采用（而不只是躺在存储里）；⑥ 要证实含下划线的 host
+//   被 Chrome 原样接收（Chrome 若拒绝或私自改写，host 字段会最先暴露）。
 function readProxyRules(page) {
   return page.evaluate(() => new Promise((resolve) => {
     chrome.proxy.settings.get({ incognito: false }, (d) => {
       void chrome.runtime.lastError;
       const v = (d && d.value) || {};
+      const sp = (v.rules && v.rules.singleProxy) || null;
       resolve({
         level: (d && d.levelOfControl) || null,
         mode: v.mode || null,
+        host: sp ? sp.host : null,
+        port: sp ? sp.port : null,
         bypass: (v.rules && v.rules.bypassList) || []
       });
     });
@@ -559,6 +567,40 @@ async function identifyWorkers(ctx, nameA, nameB, timeoutMs) {
     t("④ 绕过列表命中时未使用代理（该目标在测试代理上的命中数不增）",
       hitsForDest(proxy.state, destKey) === socksPre3,
       "该目标命中 " + socksPre3 + " → " + hitsForDest(proxy.state, destKey));
+
+    /* ---- 主干⑥ 含下划线的主机名（L-13）：保存前放行 → 下发 applied → 回读逐字一致 ---- */
+    // 这一条的动机是 M-6 的原始动机在真实 Chrome 上的反证：白名单含 `_`，而 DNS 主机名
+    //   不允许 `_`。如果 Chrome 的 set 会拒绝，就会出现「保存通过 → 下发失败 → 被归因为
+    //   代理异常」的误导排障路径。此处从**真实表单**走一遍，断言三件事同时成立：
+    //   校验放行、下发落 applied、回读 host 逐字一致。
+    //   位置选在 ④ 之后：此时扩展处于「已启用」态（表单的启用勾选框是选中的），
+    //   点保存即是启用态保存，无需额外恢复动作；⑤ 随后会重填表单，不受本段影响。
+    console.log("");
+    console.log("== 主干⑥ 含下划线的主机名（L-13）：Chrome 是否接受，以及「保存通过 ≠ 下发成功」是否成立 ==");
+    const U_HOST = "my_proxy.local";
+    const U_BYPASS = "a_b.com";
+    const uForm = await fillForm(own, {
+      host: U_HOST, port: String(proxy.port), type: "socks5", bypass: U_BYPASS
+    });
+    t("⑥ 含下划线的 host 通过保存前校验（表单值未被判非法而清空）",
+      uForm.host === U_HOST && uForm.port === String(proxy.port),
+      "host=" + uForm.host + " port=" + uForm.port);
+    // 先取保存【前】的状态：谓词里要求时间戳前进，否则本断言会被 ④ 遗留的
+    //   `applied` 状态满足 —— 那正是「保存其实被拒、却读了上一段的状态」这种假绿。
+    const uPre = await readLastState(own);
+    await own.click("#saveButton");
+    const wU = await waitFor(() => readLastState(own),
+      (s) => s && s.status === "applied" && (!uPre || !uPre.at || s.at > uPre.at),
+      "含下划线 host 未能下发到 applied");
+    t("⑥ 真实下发落 applied（Chrome 未拒绝含下划线的 host —— 这就是 L-13 的待实测点）",
+      wU.ok, "pre=" + JSON.stringify(uPre) + " post=" + JSON.stringify(wU.value || {}));
+    const uRules = await readProxyRules(own);
+    t("⑥ 回读 singleProxy.host 与所填逐字一致（Chrome 未拒绝、未改写、未截断）",
+      uRules.host === U_HOST && String(uRules.port) === String(proxy.port),
+      "回读 host=" + uRules.host + " port=" + uRules.port);
+    t("⑥ bypassList 里含下划线的域名同样被采用（代理侧与绕过侧判据一致，不出现「一边能存一边不能」）",
+      Array.isArray(uRules.bypass) && uRules.bypass.indexOf(U_BYPASS) >= 0,
+      JSON.stringify(uRules.bypass));
 
     /* ---- 主干⑤ 存储配额：超长绕过列表降级到 local，且在真实浏览器里生效 ---- */
     console.log("");

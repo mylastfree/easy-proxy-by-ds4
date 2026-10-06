@@ -786,10 +786,13 @@ console.log("== E2E 断言数一致性（E2E 不在 G1 守卫范围内，必须�
     lineLeading >= 30, "扫描到 " + lineLeading + " 条");
 
   const e2eDocs = [
-    ["README.md", /共 (\d+) 项断言/, "跑通五条主干，共 N 项断言"],
+    ["README.md", /共 (\d+) 项断言/, "跑通六条主干，共 N 项断言"],
     ["CONTRIBUTING.md", /真实浏览器冒烟（opt-in，(\d+) 项/, "真实浏览器冒烟（opt-in，N 项"],
     ["ARCHITECTURE.md", /真实浏览器 E2E 冒烟（(\d+) 项断言/, "真实浏览器 E2E 冒烟（N 项断言"],
-    ["docs/E2E-SMOKE.md", /五条主干脚本化（(\d+) 项断言/, "五条主干脚本化（N 项断言"]
+    // 刻意不把序数词写进正则：本门禁把守的是**数字**，文档里的主干条数
+    //   会随覆盖范围增长（三 → 五 → 六 …），若把「五条」也钉进正则，
+    //   则每次扩充主干都会先因「声明行失配」而红，掩盖掉真正要报的数字漂移。
+    ["docs/E2E-SMOKE.md", /主干脚本化（(\d+) 项断言/, "主干脚本化（N 项断言"]
   ];
   for (const row of e2eDocs) {
     const file = row[0], re = row[1], hint = row[2];
@@ -798,6 +801,52 @@ console.log("== E2E 断言数一致性（E2E 不在 G1 守卫范围内，必须�
       !!m && Number(m[1]) === lineLeading,
       "声明=" + (m ? m[1] : "未匹配到声明行") + " / 实际=" + lineLeading);
   }
+}
+
+console.log("");
+console.log("== G1 自检自身的失败面（L-14：两条 skip 分支此前从未被执行）==");
+{
+  // 【为什么需要这一组】tests/g1-consistency.js 有两条 skip 分支：README 不可读、
+  //   README 里找不到该套件的声明行。两条都刻意**静默**（只打 WARN，不 fail++）——
+  //   自检不该反过来搞红功能测试。但代价是：README 一旦被改名、路径写错、或表格行
+  //   措辞被改，G1 会安静地整体失效，文档漂移（本仓库已漂移过一次：README 写 534、
+  //   实测 577）重新变成不可拦截。此前这两条分支没有任何断言执行过。
+  //   这里用临时目录夹具把两条分支各钉一次；并配一条正向夹具，否则「两条都是
+  //   skipped」也能全绿 —— 那正是本项目反复踩过的「断言恒真」假绿。
+  const osL14 = require("node:os");
+  const { g1ConsistencyCheck } = require("./g1-consistency.js");
+  const dG1 = fs.mkdtempSync(path.join(osL14.tmpdir(), "easy-proxy-g1-"));
+  try {
+    // 正向夹具：夹具本身能命中 ⇒ 后面两条「未命中」的结论才有意义
+    const okReadme = path.join(dG1, "OK.md");
+    fs.writeFileSync(okReadme, "| `tests/x.test.js` | 说明 | （7 项） |\n", "utf8");
+    const rOk = g1ConsistencyCheck("tests/x.test.js", 7, { readmePath: okReadme });
+    t("G1 夹具有效：能正确解析出声明的断言数（否则本组其余断言恒真）",
+      rOk.skipped === false && rOk.declared === 7, JSON.stringify(rOk));
+
+    // 分支一：README 里没有该套件的声明行
+    const missReadme = path.join(dG1, "MISS.md");
+    fs.writeFileSync(missReadme, "| `tests/other.test.js` | 说明 | （1 项） |\n", "utf8");
+    const rMiss = g1ConsistencyCheck("tests/x.test.js", 7, { readmePath: missReadme });
+    t("G1 skip 分支：README 缺该声明行时返回 skipped 且不抛错（跳过不得反过来搞红功能测试）",
+      rMiss.skipped === true && rMiss.declared === null, JSON.stringify(rMiss));
+
+    // 分支二：README 不可读（路径不存在）
+    let rNo = null, threw = null;
+    try {
+      rNo = g1ConsistencyCheck("tests/x.test.js", 7, { readmePath: path.join(dG1, "no-such.md") });
+    } catch (e) { threw = (e && e.message) || String(e); }
+    t("G1 skip 分支：README 不可读时返回 skipped 且不抛错（读失败不得冒泡成崩溃）",
+      threw === null && !!rNo && rNo.skipped === true && rNo.declared === null,
+      "threw=" + threw + " r=" + JSON.stringify(rNo));
+  } finally {
+    try { fs.rmSync(dG1, { recursive: true, force: true }); } catch (e) { /* 临时目录 */ }
+  }
+
+  // 生产路径自证：G1 默认读的就是仓库根的 README.md。这条断言防的正是本组要防的
+  //   最坏形态 —— 「默认路径写错 ⇒ 走上面那条不可读分支 ⇒ 真实运行时静默整体跳过」。
+  t("G1 默认读取的 README.md 确实存在于仓库根（默认路径写错会让自检在真实运行中静默跳过）",
+    fs.existsSync(path.join(rootDir, "README.md")));
 }
 
 console.log("");

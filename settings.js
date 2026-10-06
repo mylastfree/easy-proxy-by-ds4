@@ -1,4 +1,4 @@
-// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.15.2]
+// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.15.3]
 // 刻意不依赖任何 chrome.* API，使 popup 与 Service Worker 可共用同一套逻辑。
 (function (root) {
   'use strict';
@@ -228,6 +228,20 @@
   //   IPv6 字面量额外允许冒号与方括号（见 isIpV6Shape 的独立判定）。
   //   此前 user:pass@host、a,b.com 这类 Chrome 必然拒绝的写法能通过保存前校验，
   //   错误被推迟到 set 阶段并归因为「代理异常」，误导排障方向 —— 现在提前拦截。
+  //
+  // 【L-13】下划线曾被列为「待实测」：DNS 主机名不允许 `_`，**若** Chrome 的
+  //   chrome.proxy.settings.set 拒绝它，那么白名单含 `_` 就会复现 M-6 那条
+  //   「保存通过 → 下发失败 → 归因为代理异常」的误导路径。2026-10-06 在真实
+  //   Chromium 1243 里逐项测定（探针只调 set 再回读，不改仓库任何文件），
+  //   结论是 **Chrome 全部接受**，且回读原样保留 host：
+  //     a_b.com / my_proxy.local / _proxy.com / 10.0.0.1（对照）
+  //     bypassList 里的 a_b.com 同样被接受
+  //   —— 8 项探针无一被拒。原因是 Chrome 的代理 host 字段只做字符串透传，
+  //   不做 DNS 可解析性校验（net::ProxyServer 只在含 scheme/port 时做 URI 解析）。
+  //   故【保留 `_` 是正确行为】：删掉它反而成为**过度拒绝**（my_proxy.local 这类
+  //   内网/NAS 命名是真实用法，会被挡在保存之前——正是 M-6 想消除的那类误伤）。
+  //   该结论由两侧把守：tests/settings.test.js 钉「不误拒」，tests/e2e-smoke.js
+  //   的第 ⑥ 条主干钉「保存通过 → 下发 applied → 回读逐字一致」。
   function hasInvalidHostChar(s) {
     for (var i = 0; i < s.length; i++) {
       var c = s.charAt(i);
