@@ -151,13 +151,18 @@ node tests\mutation-check.js   # 变异门禁：运行后会自动还原被变�
 
 `npm test` 的 852 项断言**全部跑在 Node 里的 `chrome.*` 替身之上**——它们能证明「我们的逻辑按预期处理了给定的回读结果」，但证明不了「Chrome 会给出我们所假设的回读结果」。两者之间的差距恰好是本项目缺陷密度最高的地方：`chrome.proxy.settings.clear()` 只清**调用方槽位**（下层系统/策略代理会重新显现，桩测试永远返回 `direct`，真机返回 `system`），外部扩展接管后的 `levelOfControl` 在桩测试里只有手写才会出现。
 
-`tests/e2e-smoke.js` 用 Playwright 驱动真实 Chromium，加载**打包产物**跑通三条主干，共 22 项断言：
+`tests/e2e-smoke.js` 用 Playwright 驱动真实 Chromium，加载**打包产物**跑通五条主干，共 41 项断言：
 
 | 主干 | 验收要点 |
 | --- | --- |
 | ① 启用 | 回读 `levelOfControl === controlled_by_this_extension` 且 `mode === fixed_servers`，`singleProxy` 与设置逐字段一致，`lastState.status === applied` |
 | ② 禁用 | 回读确认**未**残留本扩展的 `fixed_servers`，且签名完全回到测试前基线；`lastState.status === direct`；实际模式非 `direct` 时如实上报 `systemProxy`（不谎称直连） |
 | ③ 外部接管 | 第二个扩展（`tests/e2e/fixtures/interloper/`）写入自己的 `fixed_servers` 后，状态落 **`overridden` 而非 `applied`**，且本扩展**不夺权**（生效配置仍是接管者的 `127.0.0.1:19999`，不是本扩展的 `10808`） |
+| ④ 真实流量归属 | 测试内自起一个**最小 SOCKS5 代理**与一个**本地源站**（均不联网），用 `--host-resolver-rules` 造出非 localhost 的本地目标（Chrome 对 localhost 有隐式绕过，用 `127.0.0.1` 会绕过代理而测不到）。判据是「页面正文由谁返回」+ 两个计数器：启用 → 正文来自代理且**源站零命中**；禁用 → 不再经本扩展下发的代理；**绕过列表命中 → 正文来自源站、源站命中数增加、代理未被使用**（真直连） |
+| ⑤ 存储配额降级 | 从 popup 表单真实保存一份 ~11.9 KB 的绕过列表（超过 `sync` 单键 8192 字节上限）：`local` 持有全量、`sync` 只留空串占位、界面如实提示「已存于本地（不跨设备同步）」，并核实**降级后的整份列表（≥601 条）确实被 `chrome.proxy.settings` 采用**——只改存储不算修好 |
+
+> ④ 的实测价值：把下发的端口换成一个**没有监听者**的端口时，扩展状态照样宣称 `applied`，而 ④ 会转红并给出 `net::ERR_PROXY_CONNECTION_FAILED` —— 这正是一二三条主干**结构性看不到**的缺陷类别（状态结论正确 ≠ 流量真的经代理）。
+> ④ 只覆盖**明文 HTTP** 链路（扩展只允许 `socks5` / `https` 两种代理类型，HTTPS 代理需要自签证书与 `--ignore-certificate-errors`，等于把「证书信任被关闭」写进测试）；**HTTPS/CONNECT 隧道与真实外网出口 IP 仍是人工项**。
 
 它是**刻意 opt-in** 的，不并入 `npm test`、也不进 CI 门禁：它需要可选依赖 `playwright-core` 与一个 Chromium 二进制，二者都不属于本扩展的运行时契约（扩展本身仍是**零运行时依赖、零构建**），且需要真实进程环境——并入门禁会让「测试必须环境无关」这条硬约束失效。
 
@@ -184,7 +189,7 @@ $env:E2E_CHROME_PATH="C:\path\to\chrome.exe"; npm run e2e   # 指定浏览器
 
 ## 版本历史
 
-详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.15.0`。
+详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.15.1`。
 
 ## 安全
 

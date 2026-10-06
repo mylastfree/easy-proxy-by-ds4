@@ -1,4 +1,4 @@
-// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.15.0]
+// popup.js —— 只负责渲染、校验与读写存储；下发决策在 background  [v2.15.1]
 // 【L-06·审计修复】补上全局严格模式（理由同 background.js：classic script 默认非严格）。
 'use strict';
 var S = window.EasyProxy;

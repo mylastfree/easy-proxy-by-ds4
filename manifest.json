@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Easy Proxy by DS4",
-  "version": "2.15.0",
+  "version": "2.15.1",
   "author": "mylastfree",
   "homepage_url": "https://github.com/mylastfree/easy-proxy-by-ds4",
   "description": "一键让 Chrome 走本地代理（SOCKS5 / HTTPS），局域网默认直连，内置出口检测",

@@ -1,4 +1,4 @@
-// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.15.0]
+// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.15.1]
 // 刻意不依赖任何 chrome.* API，使 popup 与 Service Worker 可共用同一套逻辑。
 (function (root) {
   'use strict';
