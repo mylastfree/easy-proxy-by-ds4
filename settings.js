@@ -1,4 +1,4 @@
-// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.14.0]
+// settings.js —— 默认值、归一化、校验、纯函数工具  [v2.15.0]
 // 刻意不依赖任何 chrome.* API，使 popup 与 Service Worker 可共用同一套逻辑。
 (function (root) {
   'use strict';
@@ -36,7 +36,12 @@
 
   var MAX_SYNC_BYTES_PER_ITEM = 8192;
 
-  // 出口检测端点：必须支持 CORS，否则 popup 读取不到结果。
+  // 出口检测端点：必须支持 CORS —— 请求由 MV3 Service Worker 发起（见 background.js 的
+  //   fetchExit）。SW 在未申请任何 host 权限时，跨源 fetch 同样受 CORS 约束：端点若不返回
+  //   Access-Control-Allow-Origin，后台就拿不到响应，前台最终也拿不到出口检测结果。
+  //   【L-3·工作区报告修复】此前这句写作「否则 popup 读取不到结果」，把机制归给了 popup ——
+  //   全库 fetch 只出现在 background.js，popup 不发请求。后果描述是对的，归因是错的；
+  //   本项目以「文档-实现一致」为质量前提，归因错的注释比没有注释更危险（会把人引向错处排查）。
   // 【C-3】此前单点依赖 ipinfo.io：该端点不可用（区域阻断 / 故障 / 政策变更）时
   //   出口检测整体失效，用户会得到「出口检测失败」却无从判断是代理问题还是检测端点问题。
   //   现改为【有序端点列表】：主端点失败（HTTP 错误 / 响应 schema 不符 / 网络拒绝）时

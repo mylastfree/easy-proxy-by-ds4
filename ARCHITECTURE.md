@@ -73,7 +73,7 @@ readSettings/readBypassText ──失败──▶ error(reason:"read_failed")   
 
 | 护栏 | 文件 |
 | --- | --- |
-| 7 套功能测试（839 项断言，`tests/run-all.js` 统一入口，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
+| 7 套功能测试（851 项断言，`tests/run-all.js` 统一入口，README 数值有 G1 运行期自检守卫） | `tests/*.test.js` |
 | 真实浏览器 E2E 冒烟（22 项断言，opt-in `npm run e2e`；Playwright 驱动真实 Chromium 加载**打包产物**，覆盖「启用 → applied」「禁用 → 未残留 + 回到基线」「外部接管 → overridden 且不夺权」三条主干。刻意与 `npm test` / CI 门禁解耦：需要可选依赖 `playwright-core` 与 Chromium 二进制，属于发布前人工门禁而非零依赖门禁） | `tests/e2e-smoke.js` + `tests/e2e/fixtures/interloper/` |
 | 变异门禁（34 项：每个修复点被故意破坏后护栏必须变红；S-1 加固后任何退出路径（含信号与未捕获异常）均幂等还原源文件，并以运行前后工作区快照比对判定污染；B-3 起改写源文件前落哨兵 `.mutation-in-progress`，`tools/package.js` 见到即拒绝打包 —— 例外仅在「显式 `selfCheck` + 目标位于系统临时目录」两条件同时满足时生效，发布 CLI 永不满足） | `tests/mutation-check.js` |
 | 文档一致性（断言数/变异数声明 vs 实际） | `tests/g1-consistency.js` + `tests/manifest.test.js` |
@@ -85,7 +85,7 @@ readSettings/readBypassText ──失败──▶ error(reason:"read_failed")   
 
 **编号规则（重要）**：编号是**分轮次（审计批次）作用域的，不跨轮唯一**。同一个符号在不同轮次完全可能指不同的缺陷 —— 例如 `M-1` 在 v2.10.0 一轮指「表单重绘丢失焦点」，在 v2.13.0 一轮指「缺 `.gitattributes` 导致产物不可复现」。因此：
 
-- 解读编号必须**连轮次一起读**；本仓库的约定是在标注里带 `·审计修复` / `·上线准入修复` 等来源后缀，本轮（v2.13.0 审计）修复统一使用 `·审计修复`。
+- 解读编号必须**连轮次一起读**；本仓库的约定是在标注里带来源后缀。已用过的后缀：`·审计修复`（v2.13.0 一轮的 `M-1…M-3` / `L-1…L-8`）、`·工作区报告修复`（v2.15.0 一轮的 `L-1…L-4`，来源是**工作区级**审计报告，其 `H-1` / `M-1` 两项发现落在**仓库之外**、因此代码里没有对应标注）。同一个 `L-1` 在这两轮分别指「`estimateBytes` 的不可达 `catch`」与「`popup.html` 里未转义的 `<local>`」—— 字面同号、含义无关。
 - **`M` 族与变异编号同符号但不同域**：`tests/mutation-check.js` 的变异体名叫 `M1`…`M34`（裸写，不带 `【】`），而 `【M-1】`…`【M-7】` 是审计「中」级缺陷编号。二者语义无关，勿混。
 
 编号族（机械校验用，勿删）：A · B · C · G · L · M · R · S · V · W

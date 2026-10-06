@@ -150,6 +150,44 @@ function pack(destRoot, opts) {
   return { dest, version, copied };
 }
 
+// 【L-2·工作区报告修复】清理同前缀的旧版产物目录。
+//   背景：dist/ 下曾长期并存 easy-proxy-by-ds4-2.11.0 与 …-2.13.0，而源码已推进到更高版本
+//   —— 使用者按习惯直接加载 / 上传 dist/ 下的目录时会选中旧版本。「旧产物还在那儿」本身
+//   就是诱因（README 的警示只能提醒，不能消除诱因）。
+//   三条约束（均由 tests/manifest.test.js 断言把守）：
+//     ① 只在【打包成功之后】由 runCli 调用 —— 打包失败时不得动任何既有产物，
+//        否则会把「上一次可用的产物」也毁掉，越修越坏；
+//     ② 不删刚生成的 keepDir；且只删【同前缀 + 版本号形态】的目录 ——
+//        避免误伤 `easy-proxy-by-ds4-backup` 这类同名但非版本的目录；
+//     ③ 位于 pack() 之外 —— pack() 的产物字节是发布契约（有逐字节断言把守），
+//        目录级清理是 CLI 的副作用，不该混进产物生成逻辑。
+const VERSION_DIR_RE = /^easy-proxy-by-ds4-\d+\.\d+\.\d+/;
+
+// 返回被删除的目录名数组（纯副作用函数，失败不抛错 —— 清理失败不该影响打包结果）。
+function cleanStaleArtifacts(destRoot, keepDir) {
+  const removed = [];
+  let names;
+  try {
+    names = fs.readdirSync(destRoot);
+  } catch (e) {
+    return removed; // destRoot 不存在等：无可清理
+  }
+  for (const n of names) {
+    if (!VERSION_DIR_RE.test(n)) continue;
+    const full = path.join(destRoot, n);
+    if (path.resolve(full) === path.resolve(keepDir)) continue;
+    try {
+      if (fs.statSync(full).isDirectory()) {
+        fs.rmSync(full, { recursive: true, force: true });
+        removed.push(n);
+      }
+    } catch (e) {
+      /* 尽力而为 */
+    }
+  }
+  return removed;
+}
+
 // CLI 入口的可注入实现（【L-2·审计修复】）。
 //   此前这些逻辑直接写在 main() 里并调用 process.exit，而 .c8rc.json 又把 tools/**
 //   整个排除在覆盖率统计之外 —— 结果是「发布产物的唯一来源」这个脚本自身零覆盖，
@@ -172,6 +210,9 @@ function runCli(opts) {
     }
     log("");
     log("已排除非运行文件：tests/、.github/、docs、元文件与依赖目录。");
+    // 【L-2·工作区报告修复】打包成功后才清理旧版产物（约束 ①：失败时不动既有产物）。
+    const stale = cleanStaleArtifacts(destRoot, dest);
+    if (stale.length) log("已清理旧版产物：" + stale.join("、"));
     log("产物就绪：" + path.relative(srcRoot, dest));
     return 0;
   } catch (e) {
@@ -182,4 +223,4 @@ function runCli(opts) {
 
 if (require.main === module) process.exit(runCli());
 
-module.exports = { RUNTIME_FILES, missingFromManifest, pack, runCli };
+module.exports = { RUNTIME_FILES, missingFromManifest, pack, runCli, cleanStaleArtifacts };

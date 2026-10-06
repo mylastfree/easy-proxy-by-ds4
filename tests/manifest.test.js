@@ -116,6 +116,18 @@ for (const s of scripts) t("popup.html 引用的 " + s + " 存在", exists(s));
 t("popup.html 设置了 lang 属性", /<html[^>]*lang="[^"]+"/.test(html));
 t("popup.html 设置了 charset", /charset=["']?utf-8/i.test(html));
 
+// 【L-1·工作区报告修复】帮助面板用 <pre> 展示「支持哪些写法」，其中 <local> 是**字面量**而非标签。
+//   未转义时 HTML 解析器把它当成未知元素，那一行的写法示例直接不显示 —— 用户看不到
+//   「不含点的主机名」怎么写，而这一行正是该写法唯一的说明。
+//   反向错误同样要拦：把同段的 .local / .lan 一并「顺手转义」会让用户看到 &lt; 之类的乱码，
+//   所以这里同时钉住「该转义的转了」与「不该动的没动」。
+const helpPre = (html.match(/<pre>([\s\S]*?)<\/pre>/) || [])[1] || "";
+t("popup.html 帮助面板可定位且非空（防止本组断言恒真）", helpPre.length > 0);
+t("帮助面板中的 <local> 写成转义形式", helpPre.includes("&lt;local&gt;"));
+t("popup.html 全文不含未转义的 <local>（会被解析为未知元素）", !/<local[\s>]/.test(html));
+t("帮助面板中的 .local / .lan 仍是字面量（未被过度转义）",
+  helpPre.includes(".local") && helpPre.includes(".lan") && !helpPre.includes("&amp;lt;"));
+
 const bg = read("background.js");
 const imports = [...bg.matchAll(/importScripts\(\s*["']([^"']+)["']\s*\)/g)].map(m => m[1]);
 t("background.js 至少 importScripts 一个文件", imports.length > 0);
@@ -532,6 +544,112 @@ console.log("== 打包脚本 CLI 入口（L-2：发布产物唯一来源的退�
       !fs.existsSync(corruptDest));
   } finally {
     fs.rmSync(corruptTmp, { recursive: true, force: true });
+  }
+}
+
+console.log("");
+console.log("== 打包后清理旧版产物（L-2：dist/ 里并存旧版本会让使用者选中旧代码）==");
+{
+  // 【L-2·工作区报告修复】dist/ 下曾长期并存 easy-proxy-by-ds4-2.11.0 与 …-2.13.0，
+  //   而源码已推进到更高版本 —— 使用者按习惯直接加载 / 上传 dist/ 下的目录时会选中旧版本。
+  //   README 的警示只能提醒，消除不了诱因（旧产物还在那儿）。
+  //   清理放在 runCli 里、且只在 pack 成功之后，因此本组断言同时钉住四件事：
+  //     ① 成功后才清 —— 失败时保住上一次可用产物，不许越修越坏；
+  //     ② 只清「同前缀 + 版本号形态」的目录 —— 不误伤 easy-proxy-by-ds4-backup 这类同名目录；
+  //     ③ 幂等 —— 连续两次打包不能把上一次的发布包删掉；
+  //     ④ 清理不进 pack() —— 产物生成逻辑必须保持「只写自己那一个目录」的纯粹性。
+  const os3 = require("node:os");
+  const { runCli: runCliPkg, pack: packPkg, cleanStaleArtifacts } = require("../tools/package.js");
+  const pkgVersion = JSON.parse(read("manifest.json")).version;
+  const curDir = "easy-proxy-by-ds4-" + pkgVersion;
+
+  const dTmp = fs.mkdtempSync(path.join(os3.tmpdir(), "easy-proxy-dist-"));
+  try {
+    // 四种干扰：两个旧版产物 + 一个同名非版本目录 + 一个无关目录
+    fs.mkdirSync(path.join(dTmp, "easy-proxy-by-ds4-1.0.0"));
+    fs.mkdirSync(path.join(dTmp, "easy-proxy-by-ds4-2.0.0"));
+    fs.mkdirSync(path.join(dTmp, "easy-proxy-by-ds4-backup"));
+    fs.mkdirSync(path.join(dTmp, "unrelated"));
+    runCliPkg({ destRoot: dTmp, packOpts: { selfCheck: true }, log: () => {}, logErr: () => {} });
+    t("打包成功后清理同前缀旧版产物目录",
+      !fs.existsSync(path.join(dTmp, "easy-proxy-by-ds4-1.0.0")) &&
+      !fs.existsSync(path.join(dTmp, "easy-proxy-by-ds4-2.0.0")),
+      fs.readdirSync(dTmp).join(", "));
+    t("只清「同前缀 + 版本号形态」：当前版本 / 同名非版本 / 无关目录一律保留",
+      fs.existsSync(path.join(dTmp, curDir)) &&
+      fs.existsSync(path.join(dTmp, "easy-proxy-by-ds4-backup")) &&
+      fs.existsSync(path.join(dTmp, "unrelated")),
+      fs.readdirSync(dTmp).join(", "));
+    runCliPkg({ destRoot: dTmp, packOpts: { selfCheck: true }, log: () => {}, logErr: () => {} });
+    t("连续两次打包幂等（当前版本产物不会自我删除）",
+      fs.existsSync(path.join(dTmp, curDir)), fs.readdirSync(dTmp).join(", "));
+  } finally {
+    fs.rmSync(dTmp, { recursive: true, force: true });
+  }
+
+  // 失败路径：夹具让 pack 必然抛错（manifest 引用了不存在的源文件），
+  //   此时既有旧产物必须原样保留 —— 这是约束 ① 的机器证明。
+  const dTmp2 = fs.mkdtempSync(path.join(os3.tmpdir(), "easy-proxy-distfail-"));
+  const dFix = fs.mkdtempSync(path.join(os3.tmpdir(), "easy-proxy-distfix-"));
+  try {
+    fs.writeFileSync(path.join(dFix, "manifest.json"), JSON.stringify({
+      manifest_version: 3, name: "fixture", version: "9.9.9",
+      background: { service_worker: "background.js" },
+      action: { default_popup: "popup.html" },
+      icons: { "16": "icon-red-16.png" } // 全部在清单内，但夹具里没有这些文件
+    }));
+    fs.mkdirSync(path.join(dTmp2, "easy-proxy-by-ds4-1.0.0"));
+    const codeFail = runCliPkg({
+      destRoot: dTmp2, packOpts: { root: dFix, selfCheck: true },
+      log: () => {}, logErr: () => {}
+    });
+    t("打包失败时不清理任何旧产物（不得毁掉上一次可用产物）",
+      codeFail === 1 && fs.existsSync(path.join(dTmp2, "easy-proxy-by-ds4-1.0.0")),
+      "code=" + codeFail + " 剩余=" + fs.readdirSync(dTmp2).join(", "));
+
+    let packThrew = false;
+    try { packPkg(dTmp2, { root: dFix, selfCheck: true }); } catch (e) { packThrew = true; }
+    t("直接调用 pack() 不清理任何目录（清理归属 CLI 层，不进产物生成逻辑）",
+      packThrew && fs.existsSync(path.join(dTmp2, "easy-proxy-by-ds4-1.0.0")),
+      "抛错=" + packThrew + " 剩余=" + fs.readdirSync(dTmp2).join(", "));
+
+    t("cleanStaleArtifacts 对不存在的 destRoot 返回空数组且不抛错",
+      Array.isArray(cleanStaleArtifacts(path.join(dTmp2, "no-such-dir"), "")));
+  } finally {
+    fs.rmSync(dTmp2, { recursive: true, force: true });
+    fs.rmSync(dFix, { recursive: true, force: true });
+  }
+
+  // 【L-2·工作区报告修复】最后一条分支：单个旧产物处理失败时必须「尽力而为」。
+  //   理由是这条 catch 不是装饰 —— 清理属于**便利性**而非正确性前提：某个旧目录
+  //   可能正被占用（Windows 下目录被资源管理器/杀软持有）或权限不足，此时正确行为是
+  //   「跳过它、继续清其余、并让整次打包照常成功」，而不是抛错把已经成功的发布搞成失败。
+  //   用**故障注入**（临时替换 fs.statSync，让某一个旧目录抛错）而不是伪造权限：
+  //   伪造权限无法稳定复现，且在不同 CI runner 上表现不一致。
+  const dTmp3 = fs.mkdtempSync(path.join(os3.tmpdir(), "easy-proxy-distbusy-"));
+  const busy = "easy-proxy-by-ds4-3.0.0";
+  const free = "easy-proxy-by-ds4-4.0.0";
+  let removedDebris = null;
+  try {
+    fs.mkdirSync(path.join(dTmp3, busy));
+    fs.mkdirSync(path.join(dTmp3, free));
+    const origStatSync = fs.statSync;
+    try {
+      fs.statSync = function (p, ...rest) {
+        if (String(p).indexOf(busy) >= 0) throw new Error("injected stat failure");
+        return origStatSync.call(fs, p, ...rest);
+      };
+      removedDebris = cleanStaleArtifacts(dTmp3, path.join(dTmp3, curDir));
+    } finally {
+      fs.statSync = origStatSync;
+    }
+    t("单个旧产物处理失败时不抛错、其余旧产物照常清理（清理是尽力而为，不得反过来搞坏打包）",
+      Array.isArray(removedDebris) && removedDebris.indexOf(free) >= 0 && removedDebris.indexOf(busy) < 0 &&
+      fs.existsSync(path.join(dTmp3, busy)) && !fs.existsSync(path.join(dTmp3, free)) &&
+      fs.statSync === origStatSync,
+      "removed=" + JSON.stringify(removedDebris) + " 剩余=" + fs.readdirSync(dTmp3).join(", "));
+  } finally {
+    fs.rmSync(dTmp3, { recursive: true, force: true });
   }
 }
 

@@ -1115,6 +1115,15 @@ function t(name, cond, extra) {
     t("收尾真实 set 失败时末次图标为红色（不是绿色）",
       env.iconCalls[env.iconCalls.length - 1] === "icon-red-16.png",
       "icon=" + env.iconCalls[env.iconCalls.length - 1]);
+    // 【L-4·工作区报告修复】本用例已同时具备两个前提：窗口内保存过新端口（记脏，
+    //   见上面的 onClearDuringDirect）与收尾真实失败（脏标记得以保留）。因此
+    //   「还有配置待下发」这一事实此时必须**落进状态**，而不是只留在内存的 suspendDirty。
+    //   此前只有 overridden 路径落 pendingResubmit，两处 error 路径都漏 —— 于是同一个
+    //   语义「前台能否看到待下发」取决于失败的具体形态，且 SW 一旦被回收事实即消失。
+    //   这条断言在修复前为 undefined（红），修复后为 true（绿）。
+    t("收尾真实 set 失败时状态显式记录「有配置变更待下发」（L-4：error 路径也必须落 pendingResubmit）",
+      st.pendingResubmit === true,
+      "pendingResubmit=" + st.pendingResubmit + "；lastState=" + JSON.stringify(st));
   }
 
   console.log("");

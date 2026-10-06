@@ -1,4 +1,4 @@
-// background.js —— MV3 Service Worker  [v2.14.0]
+// background.js —— MV3 Service Worker  [v2.15.0]
 // 【L-06·审计修复】补上全局严格模式：本文件是 classic service worker（非 module），
 //   默认处于非严格模式，隐式全局赋值、静默失败的写入、`this` 装箱等都无法被
 //   静态规则拦住。settings.js 早已声明（在 IIFE 内），此处与 popup.js 补齐一致。
@@ -659,7 +659,15 @@ async function applyEnabledSettings(settings) {
   } catch (err) {
     var msg = (err && err.message) || String(err);
     updateIcon("error");
-    writeState({ status: "error", message: msg, at: Date.now() });
+    // 【L-4·工作区报告修复】这里是**真正生效**的一处：applyProxyCore 被「第四步兜底重放」
+    //   再次调用，而重放发生在收尾（windowFinalizeCommit）写状态**之后** —— 于是重放
+    //   内部的这条写入会覆盖掉收尾那条更完整的状态。此前这里不落 pendingResubmit，
+    //   结果正是：收尾刚如实写下的「还有配置待下发」被重放抹掉，状态与事实重新脱节
+    //   （只有 overridden 路径不受影响，因为它不经过重放的这次写入）。
+    //   实测证据：tests/ownership.test.js 的 R6-01 用例中，只改收尾两条 error 路径时
+    //   末次状态仍是 {"status":"error","message":"set failed ..."}，pendingResubmit 为
+    //   undefined —— 断言红；补上这一处才转绿。故【承重的是这一处】。
+    writeState({ status: "error", message: msg, pendingResubmit: suspendDirty, at: Date.now() });
     return { ok: false, status: "error", errors: [msg] };
   }
 
@@ -1091,7 +1099,17 @@ async function windowFinalizeCommit(result) {
       result.restoreFailed = true;
       var rmsg = (restoreErr && restoreErr.message) || String(restoreErr);
       console.warn("对比后按最新设置提交失败:", rmsg);
-      writeState({ status: "error", message: "对比后恢复代理设置失败：" + rmsg, at: Date.now() });
+      writeState({
+        status: "error",
+        message: "对比后恢复代理设置失败：" + rmsg,
+        // 【L-4·工作区报告修复】error 路径此前不落此字段（只有 overridden 路径落）——
+        //   于是「暂停期间的配置还有待下发」这一事实只剩内存里的 suspendDirty，
+        //   而 SW 随时可能在任意 await 点被回收，事实随之消失（R3-01 逃逸面的另一半）。
+        //   与 overridden 路径对齐：与「读不到 ≠ 没有」同源，事实必须立刻落到
+        //   可被前台观测的状态里，而不是押注「后面还会有事件来驱动补发」。
+        pendingResubmit: suspendDirty,
+        at: Date.now()
+      });
       updateIcon("error");
     }
 
@@ -1128,7 +1146,17 @@ async function windowFinalizeCommit(result) {
       result.restoreFailed = true;
       var cmsg2 = (core && core.errors && core.errors[0]) || (core && core.status) || "未知原因";
       console.warn("对比后按最新设置提交未达成功终态:", cmsg2);
-      writeState({ status: "error", message: "对比后恢复代理设置未生效：" + cmsg2, at: Date.now() });
+      writeState({
+        status: "error",
+        message: "对比后恢复代理设置未生效：" + cmsg2,
+        // 【L-4·工作区报告修复】与上面「抛异常」路径同款：error 也必须把「待下发」
+        //   事实落进状态。此前两处 error 都不落、只有 overridden 落，导致
+        //   「前台能否看到待下发」取决于失败的具体形态 —— 同一语义两种呈现，
+        //   正是本项目反复吃过亏的「判据漂移」。现在三处（抛异常 / 未达终态 /
+        //   overridden）写法一致。
+        pendingResubmit: suspendDirty,
+        at: Date.now()
+      });
       updateIcon("error");
     }
 

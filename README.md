@@ -124,16 +124,16 @@
 
 | 测试 | 覆盖内容 |
 | --- | --- |
-| `tests/manifest.test.js` | 清单完整性：版本格式、权限最小化、引用文件存在、HTML/JS 元素 ID 一致、源文件头与 manifest 版本对齐、打包哨兵互斥与自检例外边界、打包 CLI 退出码与 pack 各失败分支、跨平台产物字节一致性（`.gitattributes`）、缺陷编号族登记、文档声明数（含出口端点清单、devDependencies 白名单、覆盖率门禁开关与行/分支覆盖双披露、status/reason 取值双向一致）一致性（98 项） |
+| `tests/manifest.test.js` | 清单完整性：版本格式、权限最小化、引用文件存在、HTML/JS 元素 ID 一致、源文件头与 manifest 版本对齐、打包哨兵互斥与自检例外边界、打包 CLI 退出码与 pack 各失败分支、打包后清理 `dist/` 旧版产物（含单目录失败时「尽力而为」）、跨平台产物字节一致性（`.gitattributes`）、帮助面板字面量转义（`<local>` 不得被解析为标签）、缺陷编号族登记、文档声明数（含出口端点清单、devDependencies 白名单、覆盖率门禁开关与行/分支覆盖双披露、status/reason 取值双向一致）一致性（109 项） |
 | `tests/settings.test.js` | 纯函数：默认值、类型收敛、绕过列表解析、输入校验（含 host:port 必拒写法提前拦截、方括号用法与主机形态收口）、容量估算（含循环引用退化为上限值）、主机名 ASCII 判定、出口检测端点容错配置、出口 IP 形态校验（`isIpLiteral`）（111 项） |
 | `tests/background.test.js` | 异步逻辑：并发下发的最终一致性、测试期暂停机制、取值一致性、CIDR 判定、`applyProxyCore` 三条失败分支（回读为空 / 缺 `levelOfControl` / 被外部接管）与两处「读取失败即跳过」保守分支的正向用例（46 项） |
 | `tests/fix-safety.test.js` | 修复安全性：暂停标志必然复位、串行队列不累积、收紧判定未误伤合法输入（19 项） |
 | `tests/concurrency.test.js` | 并发护栏（N1/N2）：暂停计数不泄漏、测试互斥生效（40 项） |
-| `tests/ownership.test.js` | 所有权护栏：断言实际生效配置而非存储值，外部接管不夺权也不丢配置；对比窗口恢复意图持久化与取样一致性复核；禁用路径遗留作用域清理、onProxyError 透传、onStartup 对齐、出口检测多端点容错与超时语义、状态写入失败降级标记；第 4 条审计修复的 background 侧护栏（clear() ≠ 强制直连：回读实际模式与回读失败均不得谎称直连）与第 5 条（状态写入代次：旧状态重试不得覆盖新状态、失败标记按【键】管理）（309 项） |
+| `tests/ownership.test.js` | 所有权护栏：断言实际生效配置而非存储值，外部接管不夺权也不丢配置；对比窗口恢复意图持久化与取样一致性复核；禁用路径遗留作用域清理、onProxyError 透传、onStartup 对齐、出口检测多端点容错与超时语义、状态写入失败降级标记；第 4 条审计修复的 background 侧护栏（clear() ≠ 强制直连：回读实际模式与回读失败均不得谎称直连）与第 5 条（状态写入代次：旧状态重试不得覆盖新状态、失败标记按【键】管理）；工作区报告 L-4（error 路径也必须落 `pendingResubmit`，否则「暂停期间待下发」这一事实只剩内存、SW 回收即丢）（310 项） |
 | `tests/popup.test.js` | popup 交互：异常时按钮必须复位、通道失败如实呈现、遮蔽现场数据保全，且如实显示失败原因；表单重绘焦点保护、escapeHtml 转义契约与 XSS 回归；审计修复第 1/2/3/4/6 条的前台侧护栏（内容不变的保存必须显式下发、local 清理失败如实上报、超长列表"先落地→确证→再切换引用"、带 systemProxy 的禁用态不得宣称直连、收尾被接管不得落到"代理确实生效"、禁用态「回读失败」档不得宣称直连、恢复默认的阶段分辨与下发结果消费、恢复被中断档不得渲染为代理异常）；测试结论判定（`classifyTestResult` 的 20 组 verdict/kind 组合）、状态条严重度符号（L-7）；诊断导出（L-08）的渲染、脱敏（不含出口 IP）、读取失败如实、后台无响应/通道异常如实、按文本渲染与按钮复位（216 项） |
 | `tests/mutation-check.js` | 变异测试：故意破坏每个修复点，确认护栏测试真的会失败（34 项变异） |
 
-七套功能测试合计 **839 项断言**。
+七套功能测试合计 **851 项断言**。
 
 ```powershell
 npm test                       # 全部七套（tests/run-all.js 统一入口，任一失败即停）
@@ -149,7 +149,7 @@ node tests\mutation-check.js   # 变异门禁：运行后会自动还原被变�
 
 ### 发布前必须执行：真实浏览器 E2E 冒烟（`npm run e2e`）
 
-`npm test` 的 839 项断言**全部跑在 Node 里的 `chrome.*` 替身之上**——它们能证明「我们的逻辑按预期处理了给定的回读结果」，但证明不了「Chrome 会给出我们所假设的回读结果」。两者之间的差距恰好是本项目缺陷密度最高的地方：`chrome.proxy.settings.clear()` 只清**调用方槽位**（下层系统/策略代理会重新显现，桩测试永远返回 `direct`，真机返回 `system`），外部扩展接管后的 `levelOfControl` 在桩测试里只有手写才会出现。
+`npm test` 的 851 项断言**全部跑在 Node 里的 `chrome.*` 替身之上**——它们能证明「我们的逻辑按预期处理了给定的回读结果」，但证明不了「Chrome 会给出我们所假设的回读结果」。两者之间的差距恰好是本项目缺陷密度最高的地方：`chrome.proxy.settings.clear()` 只清**调用方槽位**（下层系统/策略代理会重新显现，桩测试永远返回 `direct`，真机返回 `system`），外部扩展接管后的 `levelOfControl` 在桩测试里只有手写才会出现。
 
 `tests/e2e-smoke.js` 用 Playwright 驱动真实 Chromium，加载**打包产物**跑通三条主干，共 22 项断言：
 
@@ -184,7 +184,7 @@ $env:E2E_CHROME_PATH="C:\path\to\chrome.exe"; npm run e2e   # 指定浏览器
 
 ## 版本历史
 
-详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.14.0`。
+详见 [CHANGELOG.md](CHANGELOG.md)。当前版本 `2.15.0`。
 
 ## 安全
 
