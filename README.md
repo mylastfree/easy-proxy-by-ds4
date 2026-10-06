@@ -139,7 +139,7 @@
 npm test                       # 全部七套（tests/run-all.js 统一入口，任一失败即停）
 npm run coverage               # c8 覆盖率 + 门禁（低于 .c8rc.json 的门槛直接失败，覆盖率只可升不可降）
                                #   行覆盖  background 97.2% / settings 100% / popup 96.3% / tools/package.js 100%
-                               #   分支覆盖 background 86.0% / settings 95.7% / popup 84.3% / tools/package.js 76.8%
+                               #   分支覆盖 background 86.0% / settings 95.7% / popup 84.4% / tools/package.js 76.8%
                                #   函数覆盖 100%；合计行覆盖 97.5% / 分支覆盖 87.1%
                                #   （门禁阈值：行/语句 85、函数 95、分支 74；仅 Node 22 节点运行）
 npm run e2e                    # 真实浏览器冒烟（opt-in，见下）
